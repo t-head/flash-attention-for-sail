@@ -34,14 +34,22 @@ struct Alibi {
         // tensor has shape (nrow=(2, MMA_M), ncol=(2, MMA_N))
         static_assert(Layout::rank == 2, "Only support 2D Tensor");
         const int lane_id = threadIdx.x % 32;
+#if defined USE_PPU && ACOMPUTE_VERSION==10000
+        const int col_idx_offset = col_idx_offset_ + (lane_id % 4);
+#else
         const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+#endif
         if constexpr (Is_causal) {  // Simpler, we add the same bias vector to all rows
             #pragma unroll
             for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
                 const int col_idx_base = col_idx_offset + nj * 8;
                 #pragma unroll
                 for (int j = 0; j < size<1, 0>(tensor); ++j) {
+#if defined USE_PPU && ACOMPUTE_VERSION==10000
+                    const int col_idx = col_idx_base + j * 4;
+#else
                     const int col_idx = col_idx_base + j;
+#endif
                     #pragma unroll
                     for (int mi = 0; mi < size<0>(tensor); ++mi) {
                         tensor(mi, make_coord(j, nj)) += alibi_slope * col_idx;
@@ -60,7 +68,11 @@ struct Alibi {
                         const int col_idx_base = col_idx_offset + nj * 8;
                         #pragma unroll
                         for (int j = 0; j < size<1, 0>(tensor); ++j) {
+#if defined USE_PPU && ACOMPUTE_VERSION==10000
+                            const int col_idx = col_idx_base + j * 4;
+#else
                             const int col_idx = col_idx_base + j;
+#endif
                             tensor(make_coord(i, mi), make_coord(j, nj)) -= alibi_slope * abs(row_idx + max_seqlen_k - max_seqlen_q - col_idx);
                         }
                     }

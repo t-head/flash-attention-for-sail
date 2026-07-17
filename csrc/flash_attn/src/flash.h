@@ -1,13 +1,17 @@
 /******************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
  * Copyright (c) 2023, Tri Dao.
  ******************************************************************************/
 
 #pragma once
 
-#include <cuda.h>
+#ifdef __HGGCCC__
+#include <hggc_runtime.h>
+#else
+typedef struct HGstream_st* hggcStream_t;
+#endif
 #include <vector>
-
-#include <ATen/cuda/CUDAGeneratorImpl.h> // For at::Generator and at::PhiloxCudaState
+#include <ATen/cuda/CUDAGeneratorImpl.h>  // cuda-free PyTorch provides this
 
 constexpr int TOTAL_DIM = 0;
 constexpr int H_DIM = 1;
@@ -38,6 +42,7 @@ struct Qkv_params {
     // In the case of multi-query and grouped-query attention (MQA/GQA), nheads_k could be
     // different from nheads (query).
     int h_h_k_ratio; // precompute h / h_k,
+    bool seqlenq_ngroups_swapped;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -183,7 +188,7 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
-template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream);
+template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_(Flash_fwd_params &params, hggcStream_t stream);
+template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, hggcStream_t stream);
 
-template<typename T, int Headdim, bool Is_causal> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
+template<typename T, int Headdim, bool Is_causal> void run_mha_bwd_(Flash_bwd_params &params, hggcStream_t stream);

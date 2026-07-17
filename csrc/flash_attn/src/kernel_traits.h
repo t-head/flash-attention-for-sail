@@ -1,4 +1,5 @@
 /******************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
@@ -10,12 +11,25 @@
 #include "cutlass/layout/layout.h"
 #include <cutlass/numeric_types.h>
 
+// for performance propose, enable PPU1.0 m16n16k16 mma instruction adaptation.
+// if disable this macro, use ppu compiler compatibility m16n8k16 mma version.
+// #define USE_PPU
+
+#ifdef USE_PPU
+#include "ppu/ppu_include.hpp"
+#endif
+
+#if !USE_AIU
+#define make_mix_tensor make_tensor
+#define make_mix_tensor_like(x)  x
+#endif
+
 using namespace cute;
 
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::half_t>
 struct Flash_kernel_traits {
 
-#if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800
+#if defined(__HGGC_ARCH__) &&  __HGGC_ARCH__ >= 100
     using Element = elem_type;
     static constexpr bool Has_cp_async = true;
 #else
@@ -26,19 +40,44 @@ struct Flash_kernel_traits {
     using ElementAccum = float;
     using index_t = int64_t;
 
-#if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800
+#if defined(__HGGC_ARCH__) &&  __HGGC_ARCH__ >= 100
     using MMA_Atom_Arch = std::conditional_t<
         std::is_same_v<elem_type, cutlass::half_t>,
-        MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
-        MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>
+#if defined USE_PPU && ACOMPUTE_VERSION==10000
+        MMA_Atom<PPU_16x16x16_F32F16F16F32_TN>,
+        MMA_Atom<PPU_16x16x16_F32BF16BF16F32_TN>
+#elif defined USE_PPU && ACOMPUTE_VERSION > 10000
+        MMA_Atom<PPU0015_16x16x16_F32F16F16F32_TN>,
+        MMA_Atom<PPU0015_16x16x16_F32BF16BF16F32_TN>
+#else
+        MMA_Atom<PPU_16x8x16_F32F16F16F32_TN>,
+        MMA_Atom<PPU_16x8x16_F32BF16BF16F32_TN>
+#endif
     >;
 #else
-    using MMA_Atom_Arch = MMA_Atom<SM75_16x8x8_F32F16F16F32_TN>;
+    using MMA_Atom_Arch = MMA_Atom<PPU_16x8x8_F32F16F16F32_TN>;
 #endif
 
-#if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 750
-    using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;
-    using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, elem_type>;
+#if defined(__HGGC_ARCH__) &&  __HGGC_ARCH__ >= 100
+    using SmemCopyAtom = Copy_Atom<PPU_U32x4_LDSM_N, elem_type>;
+    using SmemCopyAtomTransposed = Copy_Atom<PPU_U16x8_LDSM_T, elem_type>;
+#if USE_AIU
+    static constexpr int kBlockKSmem = kHeadDim_ % 64 == 0 ? 64 : 32;
+    using SmemCopyOpQ = PPU_TSM_LD_SWZL<elem_type, kBlockM_, kBlockKSmem, false, false, 1>;
+    using SmemCopyAtomQ = Copy_Atom<SmemCopyOpQ, elem_type>;
+    using SmemCopyOpQt = PPU_TSM_LD_SWZL<elem_type, kBlockM_, kBlockKSmem, true, true, 1>;
+    using SmemCopyAtomQt = Copy_Atom<SmemCopyOpQt, elem_type>;
+    using SmemCopyOpK = PPU_TSM_LD_SWZL<elem_type, kBlockN_, kBlockKSmem, true, false, 1>;
+    using SmemCopyAtomK = Copy_Atom<SmemCopyOpK, elem_type>;
+    using SmemCopyOpKVt = PPU_TSM_LD_SWZL<elem_type, kBlockN_, kBlockKSmem, true, true, 1>;
+    using SmemCopyAtomKVt = Copy_Atom<SmemCopyOpKVt, elem_type>;
+
+#else
+    using SmemCopyAtomQ = SmemCopyAtom;
+    using SmemCopyAtomQt = SmemCopyAtomTransposed;
+    using SmemCopyAtomK = SmemCopyAtom;
+    using SmemCopyAtomKVt = SmemCopyAtomTransposed;
+#endif
 #else
     using SmemCopyAtom = Copy_Atom<DefaultCopy, elem_type>;
     using SmemCopyAtomTransposed = Copy_Atom<DefaultCopy, elem_type>;
@@ -76,11 +115,15 @@ struct Flash_fwd_kernel_traits : public Base {
         Layout<Shape<Int<kNWarps>,_1,_1>>,  // 4x1x1 or 8x1x1 thread group
         Tile<Int<16 * kNWarps>, _16, _16>>;
 
+#if USE_AIU
+    using SmemLayoutAtomQ = Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>;
+#else
     using SmemLayoutAtomQ = decltype(
         composition(Swizzle<kSwizzle, 3, 3>{},
                     // This has to be kBlockKSmem, using kHeadDim gives wrong results for d=128
                     Layout<Shape<_8, Int<kBlockKSmem>>,
                            Stride<Int<kBlockKSmem>, _1>>{}));
+#endif
     using SmemLayoutQ = decltype(tile_to_shape(
         SmemLayoutAtomQ{},
         Shape<Int<kBlockM>, Int<kHeadDim>>{}));
@@ -124,13 +167,36 @@ struct Flash_fwd_kernel_traits : public Base {
     // from the same address by the same threadblock. This is slightly faster.
     using Gmem_copy_struct = std::conditional_t<
         Has_cp_async,
-        SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>,
+        PPU_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>,
         AutoVectorizingCopyWithAssumedAlignment<128>
     >;
     using GmemTiledCopyQKV = decltype(
         make_tiled_copy(Copy_Atom<Gmem_copy_struct, Element>{},
                         GmemLayoutAtom{},
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
+#if USE_AIU
+    // static_assert(Block_K{} * sizeof(Element) % 32 == 0, "aiu_no_trans: block_k must be multiple of 32B");
+    static constexpr int bits_per_aiu_Q = kBlockM * kBlockKSmem * sizeof(Element) * 8;
+    using Gmem_copy_struct_Q = PPU_AIU_LOAD<cute::C<bits_per_aiu_Q>, Element, false, kBlockM, kBlockKSmem>;
+
+    static constexpr int bits_per_aiu_KV = kBlockN * kBlockKSmem * sizeof(Element) * 8;
+    using Gmem_copy_struct_KV = PPU_AIU_LOAD<cute::C<bits_per_aiu_KV>, Element, false, kBlockN, kBlockKSmem>;
+
+    using GmemTiledCopyQ = decltype(
+        make_tiled_copy(Copy_Atom<Gmem_copy_struct_Q, Element>{},
+                    Layout<Shape <_1,_1>,
+                           Stride<_1,_1>>{},
+                    Layout<Shape <Int<kBlockM>, Int<kBlockKSmem>>>{}));
+    using GmemTiledCopyKV = decltype(
+        make_tiled_copy(Copy_Atom<Gmem_copy_struct_KV, Element>{},
+                    Layout<Shape <_1,_1>,
+                           Stride<_1,_1>>{},
+                    Layout<Shape <Int<kBlockN>, Int<kBlockKSmem>>>{}));
+#else
+    using GmemTiledCopyQ = GmemTiledCopyQKV;
+    using GmemTiledCopyKV = GmemTiledCopyQKV;
+#endif
+
     using GmemTiledCopyO = decltype(
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
                         GmemLayoutAtom{},
@@ -138,10 +204,17 @@ struct Flash_fwd_kernel_traits : public Base {
 
     using GmemLayoutAtomOaccum = std::conditional_t<
         kBlockKSmem == 32,
+#ifndef USE_PPU
         Layout<Shape <_16, _8>,  // Thread layout, 8 threads per row
                Stride< _8, _1>>,
         Layout<Shape <_8, _16>,  // Thread layout, 16 threads per row
                Stride< _16, _1>>
+#else
+        Layout<Shape <Int<kNThreads / 8>, _8>,  // Thread layout, 8 threads per row
+               Stride< _8, _1>>,
+        Layout<Shape <Int<kNThreads / 16>, _16>,  // Thread layout, 16 threads per row
+               Stride< _16, _1>>
+#endif
     >;
     using GmemTiledCopyOaccum = decltype(
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
@@ -207,18 +280,28 @@ struct Flash_bwd_kernel_traits : public Base {
         Layout<Shape<Int<AtomLayoutMdQ>, Int<kNWarps / AtomLayoutMdQ>, _1>>,  // 2x4x1 or 4x2x1 thread group
         Tile<Int<16 * AtomLayoutMdQ>, Int<16 * kNWarps / AtomLayoutMdQ>, _16>>;
 
+#if USE_AIU
+    using SmemLayoutAtomQdO = Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>;
+#else
     using SmemLayoutAtomQdO = decltype(
         composition(Swizzle<kSwizzle, 3, 3>{},
                     Layout<Shape<_8, Int<kBlockKSmem>>,
                            Stride<Int<kBlockKSmem>, _1>>{}));
+#endif
     using SmemLayoutQdO = decltype(tile_to_shape(
         SmemLayoutAtomQdO{},
         make_shape(Int<kBlockM>{}, Int<kHeadDim>{})));
 
+#if USE_AIU
+    using SmemLayoutAtomKV =
+                    Layout<Shape<Int<kBlockM / kNWarps>, Int<kBlockKSmem>>,
+                           Stride<Int<kBlockKSmem>, _1>>;
+#else
     using SmemLayoutAtomKV = decltype(
         composition(Swizzle<kSwizzle, 3, 3>{},
                     Layout<Shape<Int<kBlockM / kNWarps>, Int<kBlockKSmem>>,
                            Stride<Int<kBlockKSmem>, _1>>{}));
+#endif
     using SmemLayoutKV = decltype(tile_to_shape(
         // SmemLayoutAtomQdO{},
         SmemLayoutAtomKV{},
@@ -302,13 +385,35 @@ struct Flash_bwd_kernel_traits : public Base {
     // from the same address by the same threadblock. This is slightly faster.
     using Gmem_copy_struct = std::conditional_t<
         Has_cp_async,
-        SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>,
+        PPU_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>,
         AutoVectorizingCopyWithAssumedAlignment<128>
     >;
+#if USE_AIU
+    // static_assert(Block_K{} * sizeof(Element) % 32 == 0, "aiu_no_trans: block_k must be multiple of 32B");
+    static constexpr int bits_per_aiu_Q = kBlockM * kBlockKSmem * sizeof(Element) * 8;
+    using Gmem_copy_struct_Q = PPU_AIU_LOAD<cute::C<bits_per_aiu_Q>, Element, false, kBlockM, kBlockKSmem>;
+
+    static constexpr int bits_per_aiu_KV = kBlockN * kBlockKSmem * sizeof(Element) * 8;
+    using Gmem_copy_struct_KV = PPU_AIU_LOAD<cute::C<bits_per_aiu_KV>, Element, false, kBlockN, kBlockKSmem>;
+
+    using GmemTiledCopyQ = decltype(
+        make_tiled_copy(Copy_Atom<Gmem_copy_struct_Q, Element>{},
+                    Layout<Shape <_1,_1>,
+                           Stride<_1,_1>>{},
+                    Layout<Shape <Int<kBlockM>, Int<kBlockKSmem>>>{}));
+    using GmemTiledCopyKV = decltype(
+        make_tiled_copy(Copy_Atom<Gmem_copy_struct_KV, Element>{},
+                    Layout<Shape <_1,_1>,
+                           Stride<_1,_1>>{},
+                    Layout<Shape <Int<kBlockN>, Int<kBlockKSmem>>>{}));
+#else
     using GmemTiledCopyQKV = decltype(
         make_tiled_copy(Copy_Atom<Gmem_copy_struct, elem_type>{},
                         GmemLayoutAtom{},
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
+    using GmemTiledCopyQ = GmemTiledCopyQKV;
+    using GmemTiledCopyKV = GmemTiledCopyQKV;
+#endif
     using GmemTiledCopydO = decltype(
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, elem_type>{},
                         GmemLayoutAtom{},
@@ -323,10 +428,17 @@ struct Flash_bwd_kernel_traits : public Base {
                         Layout<Shape < _1, _8>>{}));  // Val layout, 8 vals per store
     using GmemLayoutAtomdQaccum = std::conditional_t<
         kBlockKSmem == 32,
+#ifndef USE_PPU
         Layout<Shape <_32, _8>,  // Thread layout, 8 threads per row
                Stride< _8, _1>>,
         Layout<Shape <_16, _16>,  // Thread layout, 16 threads per row
                Stride< _16, _1>>
+#else
+        Layout<Shape <Int<kNThreads / 8>, _8>,  // Thread layout, 8 threads per row
+               Stride< _8, _1>>,
+        Layout<Shape <Int<kNThreads / 16>, _16>,  // Thread layout, 16 threads per row
+               Stride< _16, _1>>
+#endif
     >;
     using GmemTiledCopydQaccum = decltype(
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
@@ -335,8 +447,13 @@ struct Flash_bwd_kernel_traits : public Base {
 
     using GmemTiledCopydQaccumAtomicAdd = decltype(
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
+#ifndef USE_PPU
                         Layout<Shape <_8, _32>,  // Thread layout, 8 threads per row
                                Stride<_32, _1>>{},
+#else
+                        Layout<Shape <_8, Int<kNThreads / 8>>,  // Thread layout, 8 threads per row
+                               Stride<Int<kNThreads / 8>, _1>>{},
+#endif
                         Layout<Shape < _1, _1>>{}));  // Val layout, 1 val per store
 
 };

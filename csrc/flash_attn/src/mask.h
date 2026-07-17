@@ -1,4 +1,5 @@
 /******************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
@@ -16,13 +17,22 @@ __forceinline__ __device__ void apply_mask(Tensor<Engine, Layout> &tensor, const
     // tensor has shape (nrow=(2, MMA_M), ncol=(2, MMA_N))
     static_assert(Layout::rank == 2, "Only support 2D Tensor");
     const int lane_id = threadIdx.x % 32;
+#if defined USE_PPU && ACOMPUTE_VERSION==10000
+    const int col_idx_offset = col_idx_offset_ + (lane_id % 4);
+#else
     const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+#endif
+
     #pragma unroll
     for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
         const int col_idx_base = col_idx_offset + nj * 8;
         #pragma unroll
         for (int j = 0; j < size<1, 0>(tensor); ++j) {
+#if defined USE_PPU && ACOMPUTE_VERSION==10000
+            const int col_idx = col_idx_base + j * 4;
+#else
             const int col_idx = col_idx_base + j;
+#endif
             if (col_idx >= max_seqlen_k) {
                 // Without the "make_coord" we get wrong results
                 #pragma unroll
@@ -42,7 +52,11 @@ __forceinline__ __device__ void apply_mask_local(Tensor<Engine, Layout> &tensor,
     // tensor has shape (nrow=(2, MMA_M), ncol=(2, MMA_N))
     static_assert(Layout::rank == 2, "Only support 2D Tensor");
     const int lane_id = threadIdx.x % 32;
+#if defined USE_PPU && ACOMPUTE_VERSION==10000
+    const int col_idx_offset = col_idx_offset_ + (lane_id % 4);
+#else
     const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+#endif
     #pragma unroll
     for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
         const int row_idx_base = row_idx_offset + mi * warp_row_stride;
@@ -56,7 +70,11 @@ __forceinline__ __device__ void apply_mask_local(Tensor<Engine, Layout> &tensor,
                 const int col_idx_base = col_idx_offset + nj * 8;
                 #pragma unroll
                 for (int j = 0; j < size<1, 0>(tensor); ++j) {
+#if defined USE_PPU && ACOMPUTE_VERSION==10000
+                    const int col_idx = col_idx_base + j * 4;
+#else
                     const int col_idx = col_idx_base + j;
+#endif
                     if (col_idx >= col_idx_limit_right || (HasWSLeft && col_idx < col_idx_limit_left)) {
                         tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
                     }
@@ -132,23 +150,36 @@ struct Mask {
                                                const int warp_row_stride) {
         static_assert(!(Causal_mask && Is_local), "Cannot be both causal and local");
         static_assert(Layout::rank == 3, "Only support 3D Tensor");
+#ifdef USE_PPU
+        static_assert(decltype(size<0>(tensor_))::value == 8, "First dimension must be 8");
+#else
         static_assert(decltype(size<0>(tensor_))::value == 4, "First dimension must be 4");
+#endif
         static constexpr bool Need_masking = Has_alibi || Causal_mask || Is_local || !Is_even_MN;
         // if (cute::thread0()) { printf("Has_alibi = %d, Causal_mask=%d, Is_local=%d, Is_even_MN = %d, Need_masking = %d\n", Has_alibi, Causal_mask, Is_local, Is_even_MN, Need_masking); }
         if constexpr (Need_masking) {
             // Reshape tensor_ from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
+            // PPU: Reshape tensor_ from (MMA=8, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, (2, MMA_N)))
             Tensor tensor = make_tensor(tensor_.data(), flash::convert_layout_acc_rowcol(tensor_.layout()));
             // Do we need both row and column indices, or just column incides?
             static constexpr bool Col_idx_only = !(Has_alibi && !Is_causal) && !Is_local && !Causal_mask;
             const int lane_id = threadIdx.x % 32;
+#if defined USE_PPU && ACOMPUTE_VERSION==10000
+            const int col_idx_offset = col_idx_offset_ + (lane_id % 4);
+#else
             const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+#endif
             if constexpr (Col_idx_only) {
                 #pragma unroll
                 for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
                     const int col_idx_base = col_idx_offset + nj * 8;
                     #pragma unroll
                     for (int j = 0; j < size<1, 0>(tensor); ++j) {
+#if defined USE_PPU && ACOMPUTE_VERSION==10000
+                        const int col_idx = col_idx_base + j * 4;
+#else
                         const int col_idx = col_idx_base + j;
+#endif
                         #pragma unroll
                         for (int mi = 0; mi < size<0>(tensor); ++mi) {
                             // No causal, no local
@@ -175,7 +206,11 @@ struct Mask {
                             const int col_idx_base = col_idx_offset + nj * 8;
                             #pragma unroll
                             for (int j = 0; j < size<1, 0>(tensor); ++j) {
+#if defined USE_PPU && ACOMPUTE_VERSION==10000
+                                const int col_idx = col_idx_base + j * 4;
+#else
                                 const int col_idx = col_idx_base + j;
+#endif
                                 if constexpr (Has_alibi) {
                                     if constexpr (Is_causal) {
                                         tensor(make_coord(i, mi), make_coord(j, nj)) += alibi_slope * col_idx;

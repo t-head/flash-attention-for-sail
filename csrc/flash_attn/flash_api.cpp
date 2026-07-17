@@ -1,20 +1,34 @@
 /******************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
 // Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
+#ifdef USE_PYTORCH_SDPA
+#include <torch/torch.h>
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAGraphsUtils.cuh>
+#else
 #include <torch/python.h>
 #include <torch/nn/functional.h>
+#endif
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <ATen/cuda/CUDAGeneratorImpl.h>  // For at::Generator and at::PhiloxCudaState
+#if !defined(USE_PYTORCH_SDPA)
 #include "philox_unpack.cuh"  // For at::cuda::philox::unpack
+#endif
 
 #include <cutlass/numeric_types.h>
 
 #include "hardware_info.h"
 #include "flash.h"
 #include "static_switch.h"
+#include "fmha_profiling_interface.hpp"
+
+#ifdef USE_PYTORCH_SDPA
+namespace FLASH_NAMESPACE {
+#endif
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
@@ -238,7 +252,7 @@ void set_params_dgrad(Flash_bwd_params &params,
     params.deterministic = deterministic;
 }
 
-void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
+void run_mha_fwd(Flash_fwd_params &params, hggcStream_t stream, bool force_split_kernel=false) {
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
@@ -298,7 +312,6 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
     const int num_heads, const int head_size, const int max_seqlen_k, const int max_seqlen_q,
     const int head_size_rounded, const float p_dropout,
     const int num_splits, const int num_sm, struct c10::TensorOptions opts) {
-
     // This needs to match with run_mha_fwd_splitkv_dispatch
     const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
     const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
@@ -345,6 +358,22 @@ void set_params_alibi(Flash_fwd_params &params, c10::optional<at::Tensor> &alibi
 #endif
 }
 
+#ifdef USE_PYTORCH_SDPA
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+mha_fwd(const at::Tensor &q_,         // batch_size x seqlen_q x num_heads x head_size
+        const at::Tensor &k_,         // batch_size x seqlen_k x num_heads_k x head_size
+        const at::Tensor &v_,         // batch_size x seqlen_k x num_heads_k x head_size
+        std::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
+        std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
+        const float p_dropout,
+        const float softmax_scale,
+        bool is_causal,
+        int window_size_left,
+        int window_size_right,
+        const float softcap,
+        const bool return_softmax,
+        std::optional<at::Generator> gen_) {
+#else
 std::vector<at::Tensor>
 mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
         const at::Tensor &k,         // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
@@ -359,7 +388,12 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         const float softcap,
         const bool return_softmax,
         c10::optional<at::Generator> gen_) {
-
+#endif
+#ifdef USE_PYTORCH_SDPA
+    at::Tensor q = q_;
+    at::Tensor k = k_;
+    at::Tensor v = v_;
+#endif
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
 
@@ -499,8 +533,26 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
 
+    // export PPU_LIB_SHOW_PARAMS=1
+    ppu::fmha::FmhaProfParam fmha_prof_params;
+    if (ppu::fmha::ProfilingInterface::Instance().get_op_info()){
+        fmha_prof_params.set_flash_attn_params(
+            true/*dir*/, params.is_bf16/*data_type*/,
+            params.is_causal/*custom_mask*/, params.b/*batch_size*/,
+            params.h/*num_heads*/, params.h_k/*num_heads_k*/,
+            params.d/*head_dim*/, params.d/*head_dim_value*/,
+            params.seqlen_q/*seqlen_q*/, params.seqlen_k/*seqlen_k*/,
+            params.p_dropout/*dropout*/, params.scale_softmax/*scale*/,
+            params.window_size_left, /*window_size_left*/
+            params.window_size_right,/*window_size_right*/
+            true/*is_fixed_seqs**/,
+            params.alibi_slopes_ptr != nullptr/*alibi*/
+        );
+    }
+    ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
+
     if (seqlen_k > 0) {
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        hggcStream_t stream = (hggcStream_t)at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream);
     } else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
@@ -508,14 +560,43 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
 
+    ppu::fmha::ProfilingInterface::Instance().instrument(false, fmha_prof_params);
     if (seqlenq_ngroups_swapped) {
         out = out.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size});
         q = q.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size});
         softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
     }
+#ifdef USE_PYTORCH_SDPA
+    auto _unused = torch::empty({}, options.dtype(torch::kInt64));
+    return {out, q, k, v, softmax_lse, rng_state, _unused, p};
+#else
     return {out, softmax_lse, p, rng_state};
+#endif
 }
 
+#ifdef USE_PYTORCH_SDPA
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+mha_varlen_fwd(const at::Tensor &q_,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+               const at::Tensor &k_,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
+               const at::Tensor &v_,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
+               std::optional<at::Tensor> &out_, // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
+               const at::Tensor &cu_seqlens_q,  // b+1
+               const at::Tensor &cu_seqlens_k,  // b+1
+               std::optional<at::Tensor> &seqused_k, // b. If given, only this many elements of each batch element's keys are used.
+               std::optional<at::Tensor> &block_table_, // batch_size x max_num_blocks_per_seq
+               std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
+               int max_seqlen_q,
+               const int max_seqlen_k,
+               const float p_dropout,
+               const float softmax_scale,
+               const bool zero_tensors,
+               bool is_causal,
+               int window_size_left,
+               int window_size_right,
+               const float softcap,
+               const bool return_softmax,
+               std::optional<at::Generator> gen_) {
+#else
 std::vector<at::Tensor>
 mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
                const at::Tensor &k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
@@ -538,6 +619,12 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                const float softcap,
                const bool return_softmax,
                c10::optional<at::Generator> gen_) {
+#endif
+#ifdef USE_PYTORCH_SDPA
+    at::Tensor q = q_;
+    at::Tensor k = k_;
+    at::Tensor v = v_;
+#endif
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
@@ -717,6 +804,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                                p_dropout, /*num_splits*/ 0, get_num_sm(get_current_device()), opts);
     }
 
+#ifdef USE_PYTORCH_SDPA
+    c10::optional<at::Tensor> leftpad_k_ = c10::nullopt;
+#endif
     if (leftpad_k_.has_value()) {
         auto leftpad_k = leftpad_k_.value();
         TORCH_CHECK(!paged_KV, "We don't support Paged KV and leftpad_k running at the same time yet");
@@ -746,14 +836,37 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
 
+    // export PPU_LIB_SHOW_PARAMS=1
+    ppu::fmha::FmhaProfParam fmha_prof_params;
+    if (ppu::fmha::ProfilingInterface::Instance().get_op_info()){
+        bool is_fixed_seqs = (total_q == batch_size * max_seqlen_q
+                            && k.size(0) == batch_size * max_seqlen_k);
+
+        fmha_prof_params.set_flash_attn_params(
+            true/*dir*/, params.is_bf16/*data_type*/,
+            params.is_causal/*custom_mask*/, params.b/*batch_size*/,
+            params.h/*num_heads*/, params.h_k/*num_heads_k*/,
+            params.d/*head_dim*/, params.d/*head_dim_value*/,
+            params.seqlen_q/*seqlen_q*/, params.seqlen_k/*seqlen_k*/,
+            params.p_dropout/*dropout*/, params.scale_softmax/*scale*/,
+            params.window_size_left, /*window_size_left*/
+            params.window_size_right,/*window_size_right*/
+            is_fixed_seqs/*is_fixed_seqs**/,
+            params.alibi_slopes_ptr != nullptr/*alibi*/
+        );
+    }
+    ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
+
     if (max_seqlen_k > 0) {
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        hggcStream_t stream = (hggcStream_t)at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream, paged_KV);
     } else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
         out.zero_();
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
+
+    ppu::fmha::ProfilingInterface::Instance().instrument(false, fmha_prof_params);
 
     if (seqlenq_ngroups_swapped) {
         int64_t size_before[] = {batch_size, max_seqlen_q, num_heads_k, head_size};
@@ -763,10 +876,15 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         softmax_lse = softmax_lse.reshape({num_heads * max_seqlen_q, batch_size});
     }
 
+#ifdef USE_PYTORCH_SDPA
+    auto _unused = torch::empty({}, options.dtype(torch::kInt64));
+    return {out, q, k, v, softmax_lse, rng_state, _unused, p};
+#else
     return {out, softmax_lse, p, rng_state};
+#endif
 }
 
-void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
+void run_mha_bwd(Flash_bwd_params &params, hggcStream_t stream) {
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
@@ -776,6 +894,28 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     });
 }
 
+#ifdef USE_PYTORCH_SDPA
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x head_size_og
+        const at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_size
+        const at::Tensor &k,   // batch_size x seqlen_k x num_heads_k x head_size
+        const at::Tensor &v,   // batch_size x seqlen_k x num_heads_k x head_size
+        const at::Tensor &out,   // batch_size x seqlen_q x num_heads x head_size
+        const at::Tensor &softmax_lse,     // b x h x seqlen_q
+        std::optional<at::Tensor> &dq_,   // batch_size x seqlen_q x num_heads x head_size
+        std::optional<at::Tensor> &dk_,   // batch_size x seqlen_k x num_heads_k x head_size
+        std::optional<at::Tensor> &dv_,   // batch_size x seqlen_k x num_heads_k x head_size
+        std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
+        const float p_dropout,         // probability to drop
+        const float softmax_scale,
+        const bool is_causal,
+        int window_size_left,
+        int window_size_right,
+        const float softcap,
+        const bool deterministic,
+        const at::Tensor philox_seed,
+        const at::Tensor philox_offset) {
+#else
 std::vector<at::Tensor>
 mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multiple_of(head_size_og, 8)
         const at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_size
@@ -796,6 +936,12 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
         const bool deterministic,
         c10::optional<at::Generator> gen_,
         c10::optional<at::Tensor> &rng_state) {
+#endif
+
+#ifdef USE_PYTORCH_SDPA
+    c10::optional<at::Generator> gen_ = c10::nullopt;
+    c10::optional<at::Tensor> rng_state = philox_seed;
+#endif
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
         TORCH_CHECK(false, "This flash attention build does not support backward.");
@@ -815,7 +961,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     // TORCH_CHECK(is_sm90 || is_sm8x || is_sm75, "FlashAttention only supports Turing GPUs or newer.");
 
     bool is_dropout = p_dropout > 0.0;
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    hggcStream_t stream = (hggcStream_t)at::cuda::getCurrentCUDAStream().stream();
 
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -975,6 +1121,24 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
 
+    // export PPU_LIB_SHOW_PARAMS=1
+    ppu::fmha::FmhaProfParam fmha_prof_params;
+    if (ppu::fmha::ProfilingInterface::Instance().get_op_info()){
+        fmha_prof_params.set_flash_attn_params(
+            false/*dir*/, params.is_bf16/*data_type*/,
+            params.is_causal/*custom_mask*/, params.b/*batch_size*/,
+            params.h/*num_heads*/, params.h_k/*num_heads_k*/,
+            params.d/*head_dim*/, params.d/*head_dim_value*/,
+            params.seqlen_q/*seqlen_q*/, params.seqlen_k/*seqlen_k*/,
+            params.p_dropout/*dropout*/, params.scale_softmax/*scale*/,
+            params.window_size_left, /*window_size_left*/
+            params.window_size_right,/*window_size_right*/
+            true/*is_fixed_seqs**/,
+            params.alibi_slopes_ptr != nullptr/*alibi*/
+        );
+    }
+    ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
+
     if (seqlen_q > 0) {
         launch(params, stream);
     } else {
@@ -983,6 +1147,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
         dv_expanded.zero_();
         softmax_d.zero_();
     }
+
+    ppu::fmha::ProfilingInterface::Instance().instrument(false, fmha_prof_params);
 
     // For MQA/GQA we need to sum dK and dV across the groups
     if (num_heads_k != num_heads) {
@@ -993,6 +1159,33 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     return { dq, dk, dv, softmax_d };
 }
 
+#ifdef USE_PYTORCH_SDPA
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
+               const at::Tensor &q,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+               const at::Tensor &k,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
+               const at::Tensor &v,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
+               const at::Tensor &out,   // total_q x num_heads x head_size
+               const at::Tensor &softmax_lse,     // b x h x s   softmax logsumexp
+               std::optional<at::Tensor> &dq_,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+               std::optional<at::Tensor> &dk_,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
+               std::optional<at::Tensor> &dv_,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
+               const at::Tensor &cu_seqlens_q,  // b+1
+               const at::Tensor &cu_seqlens_k,  // b+1
+               std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
+               const int max_seqlen_q,
+               const int max_seqlen_k,          // max sequence length to choose the kernel
+               const float p_dropout,         // probability to drop
+               const float softmax_scale,
+               const bool zero_tensors,
+               const bool is_causal,
+               int window_size_left,
+               int window_size_right,
+               const float softcap,
+               const bool deterministic,
+               const at::Tensor philox_seed,
+               const at::Tensor philox_offset) {
+#else
 std::vector<at::Tensor>
 mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                const at::Tensor &q,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
@@ -1018,6 +1211,11 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                const bool deterministic,
                c10::optional<at::Generator> gen_,
                c10::optional<at::Tensor> &rng_state) {
+#endif
+#ifdef USE_PYTORCH_SDPA
+    c10::optional<at::Generator> gen_ = c10::nullopt;
+    c10::optional<at::Tensor> rng_state = philox_seed;
+#endif
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
         TORCH_CHECK(false, "This flash attention build does not support backward.");
@@ -1036,7 +1234,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     // We will support Turing in the near future
     // TORCH_CHECK(is_sm90 || is_sm8x || is_sm75, "FlashAttention only supports Turing GPUs or newer.");
     bool is_dropout = p_dropout > 0.0;
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    hggcStream_t stream = (hggcStream_t)at::cuda::getCurrentCUDAStream().stream();
 
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -1214,6 +1412,27 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
 
+    // export PPU_LIB_SHOW_PARAMS=1
+    ppu::fmha::FmhaProfParam fmha_prof_params;
+    if (ppu::fmha::ProfilingInterface::Instance().get_op_info()){
+        bool is_fixed_seqs = (total_q == batch_size * max_seqlen_q
+                           && total_k == batch_size * max_seqlen_k);
+
+        fmha_prof_params.set_flash_attn_params(
+            false/*dir*/, params.is_bf16/*data_type*/,
+            params.is_causal/*custom_mask*/, params.b/*batch_size*/,
+            params.h/*num_heads*/, params.h_k/*num_heads_k*/,
+            params.d/*head_dim*/, params.d/*head_dim_value*/,
+            params.seqlen_q/*seqlen_q*/, params.seqlen_k/*seqlen_k*/,
+            params.p_dropout/*dropout*/, params.scale_softmax/*scale*/,
+            params.window_size_left, /*window_size_left*/
+            params.window_size_right,/*window_size_right*/
+            is_fixed_seqs/*is_fixed_seqs**/,
+            params.alibi_slopes_ptr != nullptr/*alibi*/
+        );
+    }
+    ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
+
     if (max_seqlen_q > 0) {
         launch(params, stream);
     } else {
@@ -1222,6 +1441,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         dv_expanded.zero_();
         softmax_d.zero_();
     }
+
+    ppu::fmha::ProfilingInterface::Instance().instrument(false, fmha_prof_params);
 
     // For MQA/GQA we need to sum dK and dV across the groups
     if (num_heads_k != num_heads) {
@@ -1482,6 +1703,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         params, batch_size, num_heads, head_size, seqlen_k, seqlen_q,
         head_size_rounded, /*dropout*/ 0.f, num_splits, get_num_sm(get_current_device()), opts);
 
+    params.seqlenq_ngroups_swapped = seqlenq_ngroups_swapped;
+
     if (paged_KV) {
         params.block_table = block_table.data_ptr<int>();
         params.block_table_batch_stride = block_table.stride(0);
@@ -1491,10 +1714,30 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
 
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    // export PPU_LIB_SHOW_PARAMS=1
+    ppu::fmha::FmhaProfParam fmha_prof_params;
+    if (ppu::fmha::ProfilingInterface::Instance().get_op_info()){
+        fmha_prof_params.set_flash_attn_params(
+            true/*dir*/, params.is_bf16/*data_type*/,
+            params.is_causal/*custom_mask*/, params.b/*batch_size*/,
+            params.h/*num_heads*/, params.h_k/*num_heads_k*/,
+            params.d/*head_dim*/, params.d/*head_dim_value*/,
+            params.seqlen_q/*seqlen_q*/, params.seqlen_k/*seqlen_k*/,
+            params.p_dropout/*dropout*/, params.scale_softmax/*scale*/,
+            params.window_size_left, /*window_size_left*/
+            params.window_size_right,/*window_size_right*/
+            true/*is_fixed_seqs**/,
+            params.alibi_slopes_ptr != nullptr/*alibi*/
+        );
+    }
+    ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
+
+    hggcStream_t stream = (hggcStream_t)at::cuda::getCurrentCUDAStream().stream();
     // Only split kernel supports appending to KV cache, or indexing to the cache with cache_batch_idx,
     // or paged KV cache
     run_mha_fwd(params, stream, /*force_split_kernel=*/k_.has_value() || cache_batch_idx_.has_value() || paged_KV);
+
+    ppu::fmha::ProfilingInterface::Instance().instrument(false, fmha_prof_params);
 
     if (head_size_og % 8 != 0) {
         out = out.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
@@ -1513,7 +1756,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     }
     return {out, softmax_lse};
 }
-
+#ifdef USE_PYTORCH_SDPA
+} // namespace FLASH_NAMESPACE
+#else
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashAttention";
     m.def("fwd", &mha_fwd, "Forward pass");
@@ -1522,3 +1767,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("varlen_bwd", &mha_varlen_bwd, "Backward pass (variable length)");
     m.def("fwd_kvcache", &mha_fwd_kvcache, "Forward pass, with KV-cache");
 }
+#endif

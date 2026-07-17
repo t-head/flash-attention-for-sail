@@ -38,6 +38,7 @@ __forceinline__ __device__ uint4 philox(unsigned long long seed,
     ull2 *tmp = reinterpret_cast<ull2*>(&counter);
     tmp->x = offset;
     tmp->y = subsequence;
+// #if ACOMPUTE_VERSION==10000
     #pragma unroll
     for (int i = 0; i < 6; i++) {
         counter = philox_single_round(counter, key);
@@ -46,6 +47,16 @@ __forceinline__ __device__ uint4 philox(unsigned long long seed,
     }
     uint4 output = philox_single_round(counter, key);
     return output;
+// #else
+//     #pragma unroll
+//     for (int i = 0; i < 7; i++) {
+//         counter = philox_single_round(counter, key);
+//         key.x += (kPhilox10A);
+//         key.y += (kPhilox10B);
+//     }
+//     // uint4 output = philox_single_round(counter, key);
+//     return counter;
+// #endif
 }
 
 } // namespace flash

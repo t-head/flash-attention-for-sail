@@ -1,17 +1,18 @@
 /******************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
  * Copyright (c) 2023, Tri Dao.
  ******************************************************************************/
 
 #pragma once
-#include <c10/cuda/CUDAException.h>  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK
-
+#include <c10/cuda/CUDAException.h>
+#include <ATen/cuda/CUDAContext.h>
 #include "static_switch.h"
 #include "hardware_info.h"
 #include "flash.h"
 #include "flash_fwd_kernel.h"
 
 // Determine if the architecture supports FLASH and define a macro to handle parameter modifiers
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 100
 #define ARCH_SUPPORTS_FLASH
 #define KERNEL_PARAM_MODIFIER __grid_constant__
 #else
@@ -49,7 +50,7 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_combine_kernel, int kBlockM, int L
 }
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
-void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
     // printf("smem_size = %d\n", smem_size);
 
@@ -74,15 +75,15 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                             // If head dim > 128, set IsEvenMNConst to false to reduce number of templates
                             // If Is_local, set Is_causal to false
                             auto kernel = &flash_fwd_kernel<Kernel_traits, Is_dropout && !Is_softcap, Is_causal, Is_local && !Is_causal, Has_alibi, IsEvenMNConst && IsEvenKConst && !Is_local && !ReturnSoftmaxConst && Kernel_traits::kHeadDim <= 128, IsEvenKConst, Is_softcap, ReturnSoftmaxConst && Is_dropout && !Is_softcap>;
-                            // auto kernel = &flash_fwd_kernel<Kernel_traits, false, Is_causal, false, false, true, true, false>;
+                            // auto kernel = &flash_fwd_kernel<Kernel_traits, false, false, false, false, false, false, false>;
                             // printf("IsEvenMNConst = %d, IsEvenKConst = %d, Is_local = %d, Is_causal = %d, ReturnSoftmaxConst = %d, Is_dropout = %d\n", int(IsEvenMNConst), int(IsEvenKConst), int(Is_local), int(Is_causal), int(ReturnSoftmaxConst), int(Is_dropout));
                             // auto kernel = &flash_fwd_kernel<Kernel_traits, false, Is_causal, false, true, true, false>;
                             if (smem_size >= 48 * 1024) {
-                                C10_CUDA_CHECK(cudaFuncSetAttribute(
-                                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+                                hggcFuncSetAttribute(
+                                    kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size);
                             }
                             // int ctas_per_sm;
-                            // cudaError status_ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                            // hggcError_t status_ = hggcOccupancyMaxActiveBlocksPerMultiprocessor(
                             //     &ctas_per_sm, kernel, Kernel_traits::kNThreads, smem_size);
                             // printf("smem_size = %d, CTAs per SM = %d\n", int(smem_size), ctas_per_sm);
                             kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
@@ -96,7 +97,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 template<typename Kernel_traits, bool Is_causal>
-void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+void run_flash_splitkv_fwd(Flash_fwd_params &params, hggcStream_t stream) {
     static_assert(!Kernel_traits::Is_Q_in_regs, "SplitKV implementation does not support Is_Q_in_regs");
     static_assert(!Kernel_traits::Share_Q_K_smem, "SplitKV implementation does not support Share_Q_K_smem");
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
@@ -118,8 +119,8 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, true, Split, Append_KV>;
                                 // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, IsEvenKConst>;
                                 if (smem_size >= 48 * 1024) {
-                                    C10_CUDA_CHECK(cudaFuncSetAttribute(
-                                        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+                                    hggcFuncSetAttribute(
+                                        kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size);
                                 }
                                 kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
                                 C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -136,21 +137,22 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         // If headdim is divisible by 64, then we set kBlockM = 8, etc.
         constexpr static int kBlockM = Kernel_traits::kHeadDim % 128 == 0 ? 4 : (Kernel_traits::kHeadDim % 64 == 0 ? 8 : 16);
         dim3 grid_combine((params.b * params.h * params.seqlen_q + kBlockM - 1) / kBlockM);
+        constexpr static int kNThreads = 128;
         EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
             if (params.num_splits <= 2) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 1, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+            flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 1, IsEvenKConst><<<grid_combine, kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 4) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 2, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 2, IsEvenKConst><<<grid_combine, kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 8) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 3, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 3, IsEvenKConst><<<grid_combine, kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 16) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 4, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 4, IsEvenKConst><<<grid_combine, kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 32) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 5, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 5, IsEvenKConst><<<grid_combine, kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 64) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 6, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 6, IsEvenKConst><<<grid_combine, kNThreads, 0, stream>>>(params);
             } else if (params.num_splits <= 128) {
-                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 7, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+                flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 7, IsEvenKConst><<<grid_combine, kNThreads, 0, stream>>>(params);
             }
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         });
@@ -158,17 +160,30 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, int Headdim, bool Is_causal>
-void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, hggcStream_t stream) {
     constexpr static int kBlockM = 64;  // Fixed for all head dimensions
     // TD [2023-08-28]: nvcc segfaults for headdim 96 with block size 64 x 256,
     // and for headdim 192 with block size 64 x 128.
     // Also for headdim 160 with block size 64 x 128 after the rotary addition.
     constexpr static int kBlockN = Headdim <= 64 ? 256 : (Headdim <= 128 ? 128 : 64);
-    run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, Is_causal>(params, stream);
+#ifdef USE_PPU
+    const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_k % 128 == 0 && params.seqlen_q % kBlockM == 0;
+    BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
+        // constexpr static int kBlockN = Headdim <= 64 ? 256 : (Headdim <= 128 ? 128 : 64);
+        constexpr static int kBlockN = (Headdim >=128 || IsEvenMNConst) ? 64 : Headdim >= 128 ? 128 : 256;
+        if (params.seqlenq_ngroups_swapped)
+            run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, 16, 64, 1, false, false, T>, Is_causal>(params, stream);
+            // run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, 16, 16, 1, false, false, T>, Is_causal>(params, stream);
+        else
+            run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, 64, kBlockN, 4, false, false, T>, Is_causal>(params, stream);
+    });
+#else
+    run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, 64, kBlockN, 4, false, false, T>, Is_causal>(params, stream);
+#endif
 }
 
 template<typename T, bool Is_causal>
-void run_mha_fwd_hdim32(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd_hdim32(Flash_fwd_params &params, hggcStream_t stream) {
     constexpr static int Headdim = 32;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
@@ -176,18 +191,24 @@ void run_mha_fwd_hdim32(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, bool Is_causal>
-void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd_hdim64(Flash_fwd_params &params, hggcStream_t stream) {
     constexpr static int Headdim = 64;
+    int _num_sm = get_num_sm(get_current_device()); (void)_num_sm;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         if constexpr(!Is_dropout) {
             // Using 8 warps is 18% slower for seqlen=2k, 2 warps is 5% slower
             // Using block size (64 x 256) is 27% slower for seqlen=2k
             // Using block size (256 x 64) is 85% slower for seqlen=2k, because of register spilling
-            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            int blocks = params.b * params.h * ((params.seqlen_q + 128 - 1) / 128);
+            if (float(blocks / _num_sm) < 4.0f) {
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            } else {
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            }
             // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
             // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, true, T>, Is_dropout, Is_causal>(params, stream);
         } else {
-            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
             // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, true, T>, Is_dropout, Is_causal>(params, stream);
             // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
             // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
@@ -196,8 +217,9 @@ void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, bool Is_causal>
-void run_mha_fwd_hdim96(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd_hdim96(Flash_fwd_params &params, hggcStream_t stream) {
     constexpr static int Headdim = 96;
+    int _num_sm = get_num_sm(get_current_device()); (void)_num_sm;
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x = cc_major == 8 && cc_minor > 0;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
@@ -209,7 +231,16 @@ void run_mha_fwd_hdim96(Flash_fwd_params &params, cudaStream_t stream) {
                 run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
             }
         } else {
-            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            if constexpr(!Is_dropout) {
+                int blocks = params.b * params.h * ((params.seqlen_q + 128 - 1) / 128);
+                if (float(blocks / _num_sm) < 4.0f) {
+                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                } else {
+                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                }
+                } else {
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            }
         }
         // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
         // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, true, T>, Is_dropout, Is_causal>(params, stream);
@@ -220,8 +251,9 @@ void run_mha_fwd_hdim96(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, bool Is_causal>
-void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd_hdim128(Flash_fwd_params &params, hggcStream_t stream) {
     constexpr static int Headdim = 128;
+    int _num_sm = get_num_sm(get_current_device()); (void)_num_sm;
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x = cc_major == 8 && cc_minor > 0;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
@@ -235,7 +267,12 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
                     run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
                 }
             } else {
-                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                int blocks = params.b * params.h * ((params.seqlen_q + 128 - 1) / 128);
+                if (float(blocks / _num_sm) < 3.0f) {
+                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
+                } else {
+                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                }
             }
             // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
             // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, true, T>, Is_dropout, Is_causal>(params, stream);
@@ -255,8 +292,9 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, bool Is_causal>
-void run_mha_fwd_hdim160(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd_hdim160(Flash_fwd_params &params, hggcStream_t stream) {
     constexpr static int Headdim = 160;
+    int _num_sm = get_num_sm(get_current_device()); (void)_num_sm;
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x = cc_major == 8 && cc_minor > 0;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
@@ -270,7 +308,16 @@ void run_mha_fwd_hdim160(Flash_fwd_params &params, cudaStream_t stream) {
                 run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
             }
         } else {
-            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            if constexpr(!Is_dropout) {
+                int blocks = params.b * params.h * ((params.seqlen_q + 128 - 1) / 128);
+                if (float(blocks / _num_sm) < 3.0f) {
+                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
+                } else {
+                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                }
+            } else {
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            }
         }
         // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, true, T>, Is_dropout, Is_causal>(params, stream);
         // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
@@ -283,7 +330,7 @@ void run_mha_fwd_hdim160(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, bool Is_causal>
-void run_mha_fwd_hdim192(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd_hdim192(Flash_fwd_params &params, hggcStream_t stream) {
     constexpr static int Headdim = 192;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         if constexpr(!Is_dropout) {
@@ -300,23 +347,25 @@ void run_mha_fwd_hdim192(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, bool Is_causal>
-void run_mha_fwd_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd_hdim256(Flash_fwd_params &params, hggcStream_t stream) {
     constexpr static int Headdim = 256;
     int device;
-    cudaGetDevice(&device);
+    hggcGetDevice(&device);
     int max_smem_per_sm, max_smem_per_block;
-    cudaError status_ = cudaDeviceGetAttribute(
-        &max_smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
-    status_ = cudaDeviceGetAttribute(
-        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    if (status_ != cudaSuccess) {
+    hggcError_t status_ = hggcDeviceGetAttribute(
+        &max_smem_per_sm, hggcDevAttrMaxSharedMemoryPerMultiprocessor, device);
+    status_ = hggcDeviceGetAttribute(
+        &max_smem_per_block, hggcDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (status_ != hggcSuccess) {
       C10_CUDA_CHECK(status_);
     }
     // printf("max_smem_per_sm = %d, max_smem_per_block = %d\n", max_smem_per_sm, max_smem_per_block);
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         // For A100, we want to run with 128 x 64 (128KB smem).
         // For H100 we want to run with 64 x 64 (96KB smem) since then we can get 2 CTAs per SM.
-        if (max_smem_per_block >= 2 * Headdim * (128 + 2 * 64) && max_smem_per_sm < 4 * Headdim * (64 + 2 * 64)) {
+        //FIXME:: ppu smem is 164 per CU, always need to use 128 x 64
+        // if (max_smem_per_block >= 2 * Headdim * (128 + 2 * 64) && max_smem_per_sm < 4 * Headdim * (64 + 2 * 64)) {
+        if (1) {
             run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_dropout, Is_causal>(params, stream);
         } else {
             run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
