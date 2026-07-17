@@ -1,4 +1,5 @@
 /******************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  ******************************************************************************/
 
@@ -76,11 +77,15 @@ public:
                                                make_stride(Int<get<0>(TileShape_MK{})>{}, _1{}))));
 
     using SmemCopyAtomdQ = Copy_Atom<
+#ifndef FLASHATTENTION_DISABLE_SM90
         std::conditional_t<
             IsSm90,
             std::conditional_t<!dQ_swapAB, cute::SM90_U32x4_STSM_N, cute::SM90_U16x8_STSM_T>,
             AutoVectorizingCopyWithAssumedAlignment<128>
         >,
+#else
+        AutoVectorizingCopyWithAssumedAlignment<128>,
+#endif
         Element>;
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
@@ -94,10 +99,12 @@ public:
                         GmemLayoutAtom{},
                         Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per load
 
-    struct SharedStorage : cute::aligned_struct<128> {
+    struct CUTE_ALIGNAS(128) SharedStorage {
         cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutdQaccum>> smem_dqacc;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutdQ>> smem_dq;
+#ifndef FLASHATTENTION_DISABLE_SM90
         alignas(16) cutlass::arch::ClusterTransactionBarrier barrier_dQaccum;
+#endif
     };
 
     static constexpr int SharedStorageSize = sizeof(SharedStorage);
@@ -175,6 +182,7 @@ public:
         Tensor mdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum const*>(params.ptr_dQaccum)),
                                       params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !is_varlen ? bidb : 0);
         Tensor gdQaccum = local_tile(domain_offset(make_coord(seqlen_info.offset_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(m_block));  // (M * K)
+#ifndef FLASHATTENTION_DISABLE_SM90
         if constexpr (IsSm90) {  // Use BulkCopy
             static constexpr uint32_t TmaTransactionBytesdQaccum = static_cast<uint32_t>(size(SmemLayoutdQaccumFlat{}) * cute::sizeof_bits_v<ElementAccum> / 8);
             auto bulk_copy = Copy_Traits<SM90_BULK_COPY_AUTO>{};
@@ -194,6 +202,14 @@ public:
             cute::copy(g2s_tiled_copy_dQaccum, tdQgdQaccumg2s, tdQsdQaccumg2s);
             __syncthreads();
         }
+#else
+        G2STiledCopydQaccum g2s_tiled_copy_dQaccum;
+        auto g2s_thr_copy_dQaccum = g2s_tiled_copy_dQaccum.get_thread_slice(thread_idx);
+        Tensor tdQgdQaccumg2s = g2s_thr_copy_dQaccum.partition_S(gdQaccum);
+        Tensor tdQsdQaccumg2s = g2s_thr_copy_dQaccum.partition_D(sdQaccum);
+        cute::copy(g2s_tiled_copy_dQaccum, tdQgdQaccumg2s, tdQsdQaccumg2s);
+        __syncthreads();
+#endif
 
         // __syncthreads(); if (cute::thread0()) { print_tensor(sdQaccum); }
 

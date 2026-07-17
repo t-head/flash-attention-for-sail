@@ -7,7 +7,10 @@ import torch
 import torch.nn.functional as F
 
 from einops import rearrange, repeat
-from flash_attn.layers.rotary import apply_rotary_emb
+try:
+    from flash_attn.layers.rotary import apply_rotary_emb
+except ImportError:
+    from layers.rotary import apply_rotary_emb
 
 from padding import pad_input, unpad_input
 from test_util import (
@@ -949,30 +952,35 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, causal, dtype):
     dummy = torch.empty(70 * 1024 ** 3, dtype=torch.uint8, device=device)
     batch_size = 60  # Sometimes we need large batch size for the race conditions to trigger
     nheads = 4
-    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
-    k = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
-    v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
-    torch.random.manual_seed(42)
-    out0, lse0 = flash_attn_func(q, k, v, causal=causal)
-    g = torch.randn_like(out0)
-    dq0, dk0, dv0 = torch.autograd.grad(out0, (q, k, v), g)
-    # Numerical error if we just do any arithmetic on dq
-    dq_atol = 2 * ((dq0 + 0.3 - 0.3) - dq0).abs().max().item()
-
-    for i in range(1000):
+    try:
+        q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
+        k = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
+        v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
         torch.random.manual_seed(42)
-        out, lse = flash_attn_func(q, k, v, causal=causal)
-        assert torch.equal(out, out0)
-        assert torch.equal(lse, lse0)
+        out0, lse0 = flash_attn_func(q, k, v, causal=causal)
+        g = torch.randn_like(out0)
+        dq0, dk0, dv0 = torch.autograd.grad(out0, (q, k, v), g)
+        # Numerical error if we just do any arithmetic on dq
+        dq_atol = 2 * ((dq0 + 0.3 - 0.3) - dq0).abs().max().item()
 
-        dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
-        dq_equal = torch.allclose(dq, dq0, atol=dq_atol)
-        if not dq_equal:
-            print(f"Iter {i}, {dq_atol = }, dQ max diff: {(dq - dq0).abs().max().item()}")
-            # breakpoint()
-        assert torch.equal(dv, dv0)
-        assert torch.equal(dk, dk0)
-        assert dq_equal
+        for i in range(1000):
+            torch.random.manual_seed(42)
+            out, lse = flash_attn_func(q, k, v, causal=causal)
+            assert torch.equal(out, out0)
+            assert torch.equal(lse, lse0)
+
+            dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
+            dq_equal = torch.allclose(dq, dq0, atol=dq_atol)
+            if not dq_equal:
+                print(f"Iter {i}, {dq_atol = }, dQ max diff: {(dq - dq0).abs().max().item()}")
+                # breakpoint()
+            assert torch.equal(dv, dv0)
+            assert torch.equal(dk, dk0)
+            assert dq_equal
+    finally:
+        del dummy, q, k, v
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
 
 def attention_combine_ref(out_partial, lse_partial):

@@ -1,6 +1,9 @@
 /******************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  ******************************************************************************/
+
+#include <Python.h>
 
 // Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
 #include <torch/python.h>
@@ -15,6 +18,9 @@
 #include "static_switch.h"
 #include "tile_size.h"
 #include "heuristics.h"
+#ifdef USE_PPU
+#include "fmha_profiling_interface.hpp"
+#endif
 
 // Copied from https://github.com/pytorch/pytorch/commit/7931eee5c5ebcdf468bff4d308510b03355cd909
 // This is so that we can pass in torch.dtype as a parameter to the function.
@@ -166,7 +172,13 @@ void set_params_fprop(Flash_fwd_params &params,
     params.window_size_right = window_size_right;
 
     params.arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
+#ifdef USE_PPU
+    params.num_sm = (std::string(at::cuda::getCurrentDeviceProperties()->name).find("810E") != std::string::npos) ?
+        (20 - sm_margin) :
+        (at::cuda::getCurrentDeviceProperties()->multiProcessorCount - sm_margin);
+#else
     params.num_sm = at::cuda::getCurrentDeviceProperties()->multiProcessorCount - sm_margin;
+#endif
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
         TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
@@ -256,7 +268,7 @@ void set_params_dgrad(Flash_bwd_params &params,
     params.deterministic = deterministic;
 }
 
-void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd(Flash_fwd_params &params, hggcStream_t stream) {
     // HEADDIM_SWITCH(params.d, [&] {
     //     run_mha_fwd_<cutlass::half_t, kHeadSize>(params, stream);
     // });
@@ -265,8 +277,12 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         SPLIT_SWITCH(params.num_splits > 1, Split, [&] {
             PAGEDKV_SWITCH(params.page_table, PagedKV, [&] {
                 PACKGQA_SWITCH(params.pack_gqa, PackGQA_, [&] {
+#if defined(USE_PPU) && USE_AIU
+                    static constexpr bool PackGQA = PackGQA_ || PagedKV || Split;
+#else
                     // Always enable PackGQA for Sm8x or PagedKV or Split to reduce compilation
                     static constexpr bool PackGQA = PackGQA_ || Arch < 90 || PagedKV || Split;
+#endif
                     SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
                         if (!params.is_e4m3) {
                             if (params.is_bf16) {
@@ -334,7 +350,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     });
 }
 
-void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd_combine(Flash_fwd_params &params, hggcStream_t stream) {
     #ifndef FLASHATTENTION_DISABLE_SPLIT
     // If hdim is 96 or 192, it's faster to round them to 128 or 256 respectively
     // so that kBlockM is smaller and we have more parallelism.
@@ -369,18 +385,37 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 inline bool get_pack_gqa(Flash_fwd_params const& params) {
+#if defined(USE_PPU) && USE_AIU
+    if (params.page_table || params.num_splits > 1) { return true; }
+#else
     // Always enable PackGQA for Sm8x or PagedKV or Split to reduce compilation and binary size.
     // Has little effect on speed.
     if (params.arch < 90 || params.page_table || params.num_splits > 1) { return true; }
+#endif
     #ifdef FLASHATTENTION_DISABLE_PACKGQA
     return false;
     #else
     // params.page_table must already be set
     if (params.h == params.h_k) { return false; }
+#ifdef USE_PPU
+    bool varlen = params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k;
+    auto kBlockMN_kernel_args_sm8x_wo_PackGQA = tile_size_fwd_ppu(params.arch, params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/,
+        params.page_table, varlen, false /*split*/, params.softcap > 0.f, params.knew_ptr, false /*pack_gqa*/,
+        (params.is_varlen_q && 1.0f * params.total_q / params.b > 64) || (!params.is_varlen_q && params.b * params.h * ((params.seqlen_q + 127) / 128) / params.num_sm >= 8.0f) /*kBlockM_128*/,
+        params.use_kblockm_16);
+    int const kBlockM_wo_PackGQA = std::get<0>(kBlockMN_kernel_args_sm8x_wo_PackGQA);
+    auto kBlockMN_kernel_args_sm8x_w_PackGQA = tile_size_fwd_ppu(params.arch, params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/,
+        params.page_table, varlen, false /*split*/, params.softcap > 0.f, params.knew_ptr, true /*pack_gqa*/,
+        (params.is_varlen_q && 1.0f * params.total_q / params.b > 64) || (!params.is_varlen_q && params.b * params.h_k * ((params.seqlen_q * params.h / params.h_k + 127) / 128) / params.num_sm >= 8.0f) /*kBlockM_128*/,
+        params.use_kblockm_16);
+    int const kBlockM_w_PackGQA = std::get<0>(kBlockMN_kernel_args_sm8x_w_PackGQA);
+    return should_pack_gqa(params.cu_seqlens_q || params.seqused_q, params.seqlen_q, params.h / params.h_k, kBlockM_wo_PackGQA, kBlockM_w_PackGQA);
+#else
     // This needs to match the kernel configs
     auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table, params.softcap > 0.f);
     int const kBlockM = std::get<0>(kBlockMN_kernel_args_sm90);
     return should_pack_gqa(params.cu_seqlens_q || params.seqused_q, params.seqlen_q, params.h / params.h_k, kBlockM);
+#endif
     #endif
 }
 
@@ -388,6 +423,9 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     #ifdef FLASHATTENTION_DISABLE_SPLIT
     return 1;
     #else
+#ifdef USE_PPU
+    if (!params.use_kblockm_16) { return 1; }
+#endif
     // Always enable PackGQA for Split
     // params.page_table must already be set
     // This needs to match the kernel configs
@@ -395,17 +433,34 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table, params.softcap > 0.f);
     // Strictly speaking we need to pass in (varlen && params.num_splits > 1) but num_splits
     // has not been set here. It's OK though because we might just underestimate kBlockN a bit
+#ifdef USE_PPU
+    auto kBlockMN_kernel_args_sm8x = tile_size_fwd_ppu(params.arch, params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/,
+        params.page_table, varlen, true /*split*/, params.softcap > 0.f, params.knew_ptr, true /*pack_gqa*/,
+        params.use_kblockm_128, params.use_kblockm_16);
+#else
     auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, varlen, params.softcap > 0.f, params.knew_ptr);
+#endif
     int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
     int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
+#ifdef USE_PPU
+    int seqlen_q_packgqa = params.total_q / params.b * (params.h / params.h_k);
+#else
     int seqlen_q_packgqa = params.seqlen_q * (params.h / params.h_k);
+#endif
     // If is_local, we're not going to load all of seqlen_k
     int const seqlen_k_loaded = !params.is_local
         ? params.seqlen_k
         : std::max(0, std::min(params.seqlen_k, params.window_size_right + params.window_size_left + 1 + kBlockM));
     int const num_n_blocks = (seqlen_k_loaded + kBlockN - 1) / kBlockN;
     int const num_m_blocks = (seqlen_q_packgqa + kBlockM - 1) / kBlockM;
+#ifdef USE_PPU
+    int const kNWarps = std::get<2>(kBlockMN_kernel_args_sm8x);
+    // we actually can't get occ here, but we almost always use all the vregs in a thread, resulting in 16 / kNWarps blocks in one SM limited by regs.
+    int const occ = 16 / kNWarps;
+    return num_splits_heuristic(params.b * params.h_k * num_m_blocks, params.num_sm * occ, num_n_blocks, 128);
+#else
     return num_splits_heuristic(params.b * (!params.pack_gqa ? params.h : params.h_k) * num_m_blocks, params.num_sm, num_n_blocks, 128);
+#endif
     // return num_splits_heuristic(params.b * params.h_k * num_m_blocks, params.b * params.h_k,
     //                             params.num_sm, num_n_blocks, 128, params.d_rounded);
     #endif
@@ -675,8 +730,19 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     params.page_size = page_size;
     params.num_pages = num_pages;
 
+#ifdef USE_PPU
+    params.is_varlen_q = (params.total_q / params.b != params.seqlen_q);
+    params.use_kblockm_16 = (params.is_varlen_q && ((params.seqlen_q < 256 && 1.0f * params.total_q / params.b < 32) || (params.seqlen_q >= 256 && 1.0f * params.total_q / params.b * params.h / params.h_k <= (params.arch == 80 ? 64 : 16)))) ||
+        params.seqlen_q == 1 ||
+        params.seqlen_q * params.h / params.h_k <= 16;
+#endif
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
+    // printf("params.num_splits: %d\n", params.num_splits);
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
+#ifdef USE_PPU
+    params.use_kblockm_128 = (params.is_varlen_q && 1.0f * params.total_q / params.b > 64) ||
+        (!params.is_varlen_q && params.b * (params.pack_gqa ? params.h_k : params.h) * ((params.seqlen_q * (params.pack_gqa ? params.h / params.h_k : 1) + 127) / 128) / params.num_sm >= 8.0f);
+#endif
 
     if (k_new_.has_value()) {
         at::Tensor k_new, v_new;
@@ -759,6 +825,10 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     } else {
         params.rotary_dim = 0;
     }
+#if defined(USE_PPU) && USE_AIU
+    // Apply rotary to Q conflicts with AIU, resulting in using PackGQA=true routine (using cp.aync), which has impact on tiling (concerning vreg amount).
+    params.pack_gqa = params.pack_gqa || (params.rotary_dim > 0);
+#endif
 
     if (kv_batch_idx_.has_value()) {
         auto kv_batch_idx = kv_batch_idx_.value();
@@ -791,10 +861,15 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     }
 
     at::Tensor tile_count_semaphore;
+#ifdef USE_PPU
+    // only dynamic persistent scheduler needs tile_count_semaphore
+    bool const persistent_scheduler = is_varlen || (!is_varlen && params.is_causal);
+#else
     // We don't use the persistent scheduler if Split and not Varlen
     bool const persistent_scheduler = params.arch >= 90
         ? (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen)
         : ((params.is_causal && !is_varlen) || (is_varlen && params.num_splits > 1));
+#endif
     if (persistent_scheduler) {
         tile_count_semaphore = torch::zeros({1}, opts.dtype(torch::kInt32));
         params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
@@ -854,8 +929,32 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     TORCH_CHECK(!k_new_.has_value(), "This flash attention build does not support appending KV.");
     #endif
 
+#ifdef USE_PPU
+    // we can dump UT cases by export PPU_LIB_SHOW_PARAMS=1
+    ppu::fmha::FmhaProfParam fmha_prof_params;
+    if (ppu::fmha::ProfilingInterface::Instance().get_op_info()){
+        bool is_fixed_seqs = (total_q == batch_size * seqlen_q && k.size(0) == batch_size * seqlen_k);
+        fmha_prof_params.set_flash_attn_params(
+            true/*dir*/, params.is_bf16/*data_type*/,
+            params.is_causal/*custom_mask*/, params.b/*batch_size*/,
+            num_heads, /* new_heads_q*/
+            num_heads_k,
+            params.d/*head_dim*/, params.d/*head_dim_value*/,
+            seqlen_q, /* seqlen_q */
+            params.seqlen_k/*seqlen_k*/,
+            params.p_dropout/*dropout*/, params.scale_softmax/*scale*/,
+            params.window_size_left, /*window_size_left*/
+            params.window_size_right,/*window_size_right*/
+            is_fixed_seqs/*is_fixed_seqs**/,
+            false/*alibi*/,
+            params.softcap, paged_KV, num_pages, page_size,
+            cu_seqlens_q_, cu_seqlens_k_, seqused_k_
+        );
+    }
+    ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
+#endif
     if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        hggcStream_t stream = (hggcStream_t)at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream);
         if (params.num_splits > 1) {
             if (out_type == at::ScalarType::BFloat16) {
@@ -877,11 +976,14 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
 
+#ifdef USE_PPU
+    ppu::fmha::ProfilingInterface::Instance().instrument(false, fmha_prof_params);
+#endif
     // return {out, softmax_lse};
     return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
 
-void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
+void run_mha_bwd(Flash_bwd_params &params, hggcStream_t stream) {
     #ifndef FLASHATTENTION_DISABLE_BACKWARD
         // FP16_SWITCH(!params.is_bf16, [&] {
         //     HEADDIM_SWITCH(params.d, [&] {
@@ -1035,6 +1137,11 @@ std::vector<at::Tensor> mha_bwd(
 
     int const arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
     int const head_size_rounded = round_up_headdim(head_size);
+#ifdef USE_PPU
+    // Very important that these match the kernel configs
+    int const kBlockM = head_size_rounded <= 64 ? 128 : 64;
+    int const kBlockN = head_size_rounded <= 128 ? 128 : (head_size_rounded <= 192 ? 80 : 64);
+#else
     // Very important that these match the kernel configs
     bool const is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
     int const kBlockM_sm90 = head_size_rounded <= 64 ? (is_causal && softcap > 0.0 ? 96 : 128)
@@ -1055,6 +1162,7 @@ std::vector<at::Tensor> mha_bwd(
            : (head_size_rounded <= 128 ? 96
               : (head_size_rounded <= 192 ? 64 : 64)));
     int const kBlockN = arch >= 90 ? kBlockN_sm90 : (arch == 86 || arch == 89 ? kBlockN_sm86 : kBlockN_sm80);
+#endif
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     int const seqlen_q_rounded = round_multiple(seqlen_q, kBlockM);
     int const seqlen_k_rounded = round_multiple(seqlen_k, kBlockN);
@@ -1216,7 +1324,7 @@ std::vector<at::Tensor> mha_bwd(
     #endif
 
     if (total_q > 0 && total_k > 0 && num_heads_k > 0) {
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        hggcStream_t stream = (hggcStream_t)at::cuda::getCurrentCUDAStream().stream();
         run_mha_bwd(params, stream);
     } else if (total_k > 0 && num_heads_k > 0) {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
@@ -1321,7 +1429,7 @@ mha_combine(const at::Tensor &out_partial,         // num_splits x batch_size x 
     params.o_batch_stride = out.stride(0);
 
     if (seqlen > 0 && batch_size > 0) {
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        hggcStream_t stream = (hggcStream_t)at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd_combine(params, stream);
     }
 

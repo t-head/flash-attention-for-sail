@@ -1,4 +1,5 @@
 /******************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  ******************************************************************************/
 
@@ -49,7 +50,7 @@ public:
     static_assert(MaxThreadsPerBlock % kGmemThreadsPerRow == 0, "MaxThreadsPerBlock must be a multiple of kGmemThreadsPerRow");
     using GmemCopyAtom = std::conditional_t<
         Has_cp_async,
-        cute::Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, ElementPartial>,
+        cute::Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL<uint128_t>, ElementPartial>,
         cute::Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementPartial>
     >;
     using GmemLayoutAtom = Layout<Shape <Int<MaxThreadsPerBlock / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
@@ -76,7 +77,7 @@ public:
     static_assert(kMaxSplits % CUTE_STATIC_V(shape<0>(GmemLayoutAtomLSE{})) == 0);
     using GmemCopyAtomLSE = std::conditional_t<
         Has_cp_async,
-        cute::Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<AlignmentTypeLSE>, float>,
+        cute::Copy_Atom<PPU_CP_ASYNC_CACHEALWAYS<AlignmentTypeLSE>, float>,
         cute::Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<AlignmentLSE * sizeof(float) * 8>, float>
     >;
     using GmemTiledCopyLSE = decltype(
@@ -120,7 +121,7 @@ public:
     using ShapeLSE = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen, head, batch)
     using StrideLSE = cute::Stride<_1, int64_t, int64_t>;  // (seqlen, head, batch)
 
-    struct SharedStorage : cute::aligned_struct<128> {
+    struct CUTE_ALIGNAS(128) SharedStorage {
         cute::array_aligned<float, cute::cosize_v<SmemLayoutLSE>> smem_lse_partial;
         cute::array_aligned<int, kBlockM> smem_max_valid_split;
         cute::array_aligned<ElementPartial, cute::cosize_v<SmemLayoutO>> smem_o_partial;

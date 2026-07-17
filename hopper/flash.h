@@ -1,10 +1,11 @@
 /******************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
  * Copyright (c) 2023, Tri Dao.
  ******************************************************************************/
 
 #pragma once
 
-#include <cuda.h>
+#include <hggc_runtime.h>
 #include <vector>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -147,6 +148,12 @@ struct Flash_fwd_params : public Qkv_params {
 
     int arch;
     int num_sm;
+
+#ifdef USE_PPU
+    bool is_varlen_q;
+    bool use_kblockm_16;
+    bool use_kblockm_128;
+#endif
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -198,8 +205,8 @@ struct Flash_bwd_params : public Flash_fwd_params {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int Arch, typename T, int Headdim, bool Split, bool PagedKV, bool Has_softcap, bool PackGQA>
-void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
+void run_mha_fwd_(Flash_fwd_params &params, hggcStream_t stream);
 template <int Arch, typename T, int Headdim, bool Has_softcap>
-void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
+void run_mha_bwd_(Flash_bwd_params &params, hggcStream_t stream);
 template <typename T, typename Tpartial, int Headdim>
-void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream);
+void run_mha_fwd_combine_(Flash_fwd_params &params, hggcStream_t stream);

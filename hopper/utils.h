@@ -1,4 +1,5 @@
 /******************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
@@ -8,10 +9,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#include <cuda_fp16.h>
+#include <hggc_fp16.h>
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-#include <cuda_bf16.h>
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 100
+#include <hggc_bf16.h>
 #endif
 
 #include <cute/tensor.hpp>
@@ -21,17 +22,28 @@
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 
+#ifdef USE_PPU
+#include "ppu_include.hpp"
+#endif
+#if !USE_AIU
+#define make_mix_tensor make_tensor
+#define make_mix_tensor_like(x)  x
+#endif
+
+#ifdef USE_PPU
+#include "acc_vreg_fraga.h"
+#endif
 
 #define CHECK_CUDA(call)                        \
     do {                                                                                                  \
-        cudaError_t status_ = call;                                                                       \
-        if (status_ != cudaSuccess) {                                                                     \
-            fprintf(stderr, "CUDA error (%s:%d): %s\n", __FILE__, __LINE__, cudaGetErrorString(status_)); \
+        hggcError_t status_ = call;                                                                       \
+        if (status_ != hggcSuccess) {                                                                     \
+            fprintf(stderr, "CUDA error (%s:%d): %s\n", __FILE__, __LINE__, hggcGetErrorString(status_)); \
             exit(1);                                                                                      \
         }                                                                                                 \
     } while(0)
 
-#define CHECK_CUDA_KERNEL_LAUNCH() CHECK_CUDA(cudaGetLastError())
+#define CHECK_CUDA_KERNEL_LAUNCH() CHECK_CUDA(hggcGetLastError())
 
 namespace flash {
 
@@ -47,9 +59,7 @@ template <typename Kernel>
 struct enable_sm90_or_later : Kernel {
     template <typename... Args>
     CUTLASS_DEVICE void operator()(Args&&... args) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-        Kernel::operator()(std::forward<Args>(args)...);
-#endif
+    // Kernel::operator()(std::forward<Args>(args)...);
     }
 };
 
@@ -57,11 +67,30 @@ template <typename Kernel>
 struct enable_sm80_to_sm89 : Kernel {
     template <typename... Args>
     CUTLASS_DEVICE void operator()(Args&&... args) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ <= 890)
+    Kernel::operator()(std::forward<Args>(args)...);
+    }
+};
+
+#ifdef USE_PPU
+template <typename Kernel>
+struct enable_sm80 : Kernel {
+    template <typename... Args>
+    CUTLASS_DEVICE void operator()(Args&&... args) {
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ == 100)
         Kernel::operator()(std::forward<Args>(args)...);
 #endif
     }
 };
+template <typename Kernel>
+struct enable_sm89 : Kernel {
+    template <typename... Args>
+    CUTLASS_DEVICE void operator()(Args&&... args) {
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
+        Kernel::operator()(std::forward<Args>(args)...);
+#endif
+    }
+};
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -113,7 +142,7 @@ static __device__ __forceinline__ T run(T x, Operator &op) {
 // For SM90, convert acc_layout from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
 template<bool Transposed=false, typename Layout0>
 CUTLASS_DEVICE auto convert_layout_acc_rowcol(Layout0 acc_layout) {
-    if constexpr (decltype(rank<0>(acc_layout))::value == 3) {  // SM90
+    if constexpr (decltype(rank<0>(acc_layout))::value == 3) {  // SM90, also applies to ppu1.5
         static_assert(decltype(size<0, 0>(acc_layout))::value == 2);
         static_assert(decltype(size<0, 1>(acc_layout))::value == 2);
         static_assert(decltype(rank(acc_layout))::value == 3);
@@ -125,9 +154,16 @@ CUTLASS_DEVICE auto convert_layout_acc_rowcol(Layout0 acc_layout) {
         }
 
     } else {  // SM80
+#ifdef USE_PPU   // applies to ppu1.0
+        // acc is ppu c layout, size0 is 8, MMA_N size is A100 MMA_N/2
+        static_assert(decltype(size<0>(acc_layout))::value == 8);
+        static_assert(decltype(rank(acc_layout))::value == 3);
+        auto l = logical_divide(acc_layout, Shape<_4>{}); //((2, 4), MMA_M, MMA_N)
+#else
         static_assert(decltype(size<0>(acc_layout))::value == 4);
         static_assert(decltype(rank(acc_layout))::value == 3);
         auto l = logical_divide(acc_layout, Shape<_2>{});  // ((2, 2), MMA_M, MMA_N)
+#endif
         if constexpr (!Transposed) {
             return make_layout(make_layout(get<0, 1>(l), get<1>(l)), make_layout(get<0, 0>(l), get<2>(l)));
         } else {
@@ -145,7 +181,7 @@ CUTLASS_DEVICE auto convert_layout_acc_rowcol(Layout0 acc_layout) {
 template<typename MMA_Traits, typename Layout0>
 CUTLASS_DEVICE auto convert_layout_acc_Aregs(Layout0 acc_layout) {
     using X = Underscore;
-    if constexpr (decltype(rank<0>(acc_layout))::value == 3) {  // SM90
+    if constexpr (decltype(rank<0>(acc_layout))::value == 3) {  // SM90, also applies to ppu1.5
         static_assert(decltype(size<0, 0>(acc_layout))::value == 2);
         static_assert(decltype(size<0, 1>(acc_layout))::value == 2);
         static_assert(decltype(rank(acc_layout))::value == 3);
@@ -181,6 +217,19 @@ CUTLASS_DEVICE auto convert_layout_acc_Aregs(Layout0 acc_layout) {
         }
     }
 };
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#ifdef USE_PPU
+template <typename To_type, typename Engine, typename Layout>
+inline __device__ auto convert_acc(Tensor<Engine, Layout> const &tensor) {
+    using From_type = typename Engine::value_type;
+    constexpr int numel = decltype(size(tensor))::value;
+    NumericArrayConverterPPU<To_type, From_type, numel> convert_op;
+    auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
+    return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
+}
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -223,8 +272,8 @@ CUTLASS_DEVICE void convert_type_out(Tensor<Engine, Layout> const &tensor, Tenso
 template <int N>
 CUTE_HOST_DEVICE
 void cp_async_wait() {
-#if defined(CUTE_ARCH_CP_ASYNC_SM80_ENABLED)
-    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+#if defined(CUTE_ARCH_CP_ASYNC_PPU_ENABLED)
+    asm volatile("ppu.cp.async.wait_group %0;\n" :: "n"(N));
 #endif
 }
 
@@ -245,6 +294,7 @@ auto mma_partition_fragment_AB(Mma const& mma, Tensor0 const& tensor0) {
 template <bool zero_init=false, int wg_wait=0, bool SwapAB=false, int M_slice=-1,
         typename Tensor0, typename Tensor1, typename Tensor2, typename TiledMma>
 CUTLASS_DEVICE void gemm(TiledMma& tiled_mma, Tensor0 const& tCrA, Tensor1 const& tCrB, Tensor2& tCrC) {
+#ifndef USE_PPU
     if constexpr (M_slice >= 0) {
         static constexpr int MMA_M = decltype(size<1>(tCrC))::value;
         static_assert(M_slice < MMA_M);
@@ -293,9 +343,58 @@ CUTLASS_DEVICE void gemm(TiledMma& tiled_mma, Tensor0 const& tCrA, Tensor1 const
             }
         }
     }
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#ifdef USE_PPU
+template<int kBlockN, int kBlockNPagedPerAiuLoad, int kHeadDim, int kBlockKSmem,
+         bool A_in_regs=false, bool B_in_regs=false, bool SwapAB=false,
+         typename Tensor0, typename Tensor1,
+         typename Tensor2, typename Tensor3, typename Tensor4,
+         typename TiledMma, typename TiledCopyA, typename TiledCopyB,
+         typename ThrCopyA, typename ThrCopyB, typename Hook>
+CUTLASS_DEVICE void gemm_sm80_kv_paged_aiu(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsA,
+                                    Tensor4 const& tCsB, TiledMma tiled_mma,
+                                    TiledCopyA smem_tiled_copy_A, TiledCopyB smem_tiled_copy_B,
+                                    ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B, Hook fn) {
+    if constexpr (SwapAB) {
+        gemm_sm80_kv_paged_aiu<kBlockN, kBlockNPagedPerAiuLoad, kHeadDim, kBlockKSmem, B_in_regs, A_in_regs>(acc, tCrB, tCrA, tCsB, tCsA, tiled_mma, smem_tiled_copy_B, smem_tiled_copy_A, smem_thr_copy_B, smem_thr_copy_A, fn);
+    } else {
+        CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
+        CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
+        CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
+        Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
+        CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // M
+        Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+        CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+        constexpr int OFFSET_MMA_N = kBlockNPagedPerAiuLoad * kBlockKSmem;
+        constexpr int OFFSET_TILE = kBlockN * kBlockKSmem;
+        int MMA_K_PER_TILE = size<2>(tCrB) / (kHeadDim / kBlockKSmem);
+        Tensor tCsB_rTile = make_tensor(tCsB.data(), tCsB.layout());
+        Tensor tCsB_sTile = make_tensor(tCsB.data(), tCsB.layout());
+        #pragma unroll
+        for (int i = 0; i < size<2>(tCrA); ++i) {
+            if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, i), tCrA_copy_view(_, _, i)); }
+            if (!B_in_regs) {
+                tCsB_rTile.data() = tCsB_sTile.data();
+                for (int n = 0; n < size<1>(tCrB); n++) {
+                    cute::copy(smem_tiled_copy_B, tCsB_rTile(_, _0{}, i % MMA_K_PER_TILE), tCrB_copy_view(_, n, i));
+                    tCsB_rTile.data() = tCsB_rTile.data() + OFFSET_MMA_N;
+                }
+                if ((i + 1) % MMA_K_PER_TILE == 0) {
+                    tCsB_sTile.data() = tCsB_sTile.data() + OFFSET_TILE;
+                }
+            }
+            if constexpr (!std::is_same_v<Hook, std::nullptr_t>) {
+                if (i == 0) { fn(); }
+            }
+            cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+        }
+    }
+}
+#endif
 
 template<bool A_in_regs=false, bool B_in_regs=false, bool SwapAB=false,
          typename Tensor0, typename Tensor1,
@@ -316,6 +415,17 @@ CUTLASS_DEVICE void gemm_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor
         CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // M
         Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
         CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+#ifdef USE_PPU
+        #pragma unroll
+        for (int i = 0; i < size<2>(tCrA); ++i) {
+            if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, i), tCrA_copy_view(_, _, i)); }
+            if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, i), tCrB_copy_view(_, _, i)); }
+            if constexpr (!std::is_same_v<Hook, std::nullptr_t>) {
+                if (i == 0) { fn(); }
+            }
+            cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+        }
+#else
         if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, _0{}), tCrA_copy_view(_, _, _0{})); }
         if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{})); }
         #pragma unroll
@@ -329,10 +439,39 @@ CUTLASS_DEVICE void gemm_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor
             }
             cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
         }
+#endif
     }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#ifdef USE_PPU
+template<int kBlockN, int kBlockNPagedPerAiuLoad, int kHeadDim, int kBlockKSmem,
+         typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
+         typename TiledMma, typename TiledCopy, typename ThrCopy>
+CUTLASS_DEVICE void gemm_rs_sm80_kv_paged_aiu(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsB,
+                                       TiledMma tiled_mma, TiledCopy smem_tiled_copy_B,
+                                       ThrCopy smem_thr_copy_B) {
+    Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+    constexpr int OFFSET_MMA_N = kBlockNPagedPerAiuLoad * kBlockKSmem;
+    constexpr int OFFSET_TILE = kBlockN * kBlockKSmem;
+    int MMA_K_PER_TILE = size<1>(tCrB) / (kHeadDim / kBlockKSmem);
+    Tensor tCsB_rTile = make_tensor(tCsB.data(), tCsB.layout());
+    Tensor tCsB_sTile = make_tensor(tCsB.data(), tCsB.layout());
+    #pragma unroll
+    for (int i = 0; i < size<2>(tCrA); ++i) {
+        tCsB_rTile.data() = tCsB_sTile.data();
+        for (int k = 0; k < size<1>(tCrB); k++) {
+            cute::copy(smem_tiled_copy_B, tCsB_rTile(_, k % MMA_K_PER_TILE, _0{}), tCrB_copy_view(_, k, i));
+            if ((k + 1) % MMA_K_PER_TILE == 0) {
+                tCsB_rTile.data() = tCsB_rTile.data() + OFFSET_TILE;
+            }
+        }
+        tCsB_sTile.data() = tCsB_sTile.data() + OFFSET_MMA_N;
+        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+    }
+}
+#endif
 
 template<typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
          typename TiledMma, typename TiledCopy, typename ThrCopy>
@@ -344,6 +483,13 @@ CUTLASS_DEVICE void gemm_rs_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Ten
     CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
     Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+#ifdef USE_PPU
+    #pragma unroll
+    for (int i = 0; i < size<2>(tCrA); ++i) {
+        cute::copy(smem_tiled_copy_B, tCsB(_, _, i), tCrB_copy_view(_, _, i));
+        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+    }
+#else
     cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
     #pragma unroll
     for (int i = 0; i < size<2>(tCrA); ++i) {
@@ -352,17 +498,36 @@ CUTLASS_DEVICE void gemm_rs_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Ten
         }
         cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
     }
+#endif
 }
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+//PPU: shared memory not support init by zero, need clear if not align.
+#ifdef USE_PPU
+template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=true, bool Clear_OOB_K=true,
+#else
 template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=false, bool Clear_OOB_K=true,
+#endif
           class CopyAtom, class TV, class Tiler, typename Engine0, typename Layout0, typename Engine1, typename Layout1,
           typename Engine2, typename Layout2, typename Engine3, typename Layout3>
-CUTLASS_DEVICE void copy(TiledCopy<CopyAtom, TV, Tiler> const &tiled_copy, Tensor<Engine0, Layout0> const &S,
+CUTLASS_DEVICE void copy(TiledCopy<CopyAtom, TV, Tiler> &tiled_copy, Tensor<Engine0, Layout0> const &S,
                          Tensor<Engine1, Layout1> &D, Tensor<Engine2, Layout2> const &identity_MN,
                          Tensor<Engine3, Layout3> const &predicate_K, const int max_MN=0) {
+// support AIU on PPU
+#if defined(USE_PPU) && USE_AIU
+    if constexpr (is_mix_iterator<typename Engine0::iterator>::value) {
+        const int warp_idx = __ppu_read_firstlane(threadIdx.x / 32);
+        if (warp_idx == 0) {
+            if constexpr (!Is_even_MN) {
+                tiled_copy.desc_.dim_h = max_MN;
+            }
+            cute::copy(tiled_copy, S, D);
+        }
+        return;
+    }
+#endif
     // Decay TiledCopy to CopyAtom
     auto copy_atom = static_cast<CopyAtom const&>(tiled_copy);
     CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});

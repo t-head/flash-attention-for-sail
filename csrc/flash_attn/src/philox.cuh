@@ -48,6 +48,16 @@ __forceinline__ __device__ uint4 philox(unsigned long long seed,
     }
     uint4 output = philox_single_round(counter, key);
     return output;
+// #else
+//     #pragma unroll
+//     for (int i = 0; i < 7; i++) {
+//         counter = philox_single_round(counter, key);
+//         key.x += (kPhilox10A);
+//         key.y += (kPhilox10B);
+//     }
+//     // uint4 output = philox_single_round(counter, key);
+//     return counter;
+// #endif
 }
 
 } // namespace FLASH_NAMESPACE

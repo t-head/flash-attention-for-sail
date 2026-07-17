@@ -1,4 +1,5 @@
 /******************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  ******************************************************************************/
 
@@ -8,7 +9,9 @@
 #include <cutlass/barrier.h>
 #include "cute/tensor.hpp"
 
+#ifndef FLASHATTENTION_DISABLE_SM90
 #include "cutlass/gemm/collective/builders/sm90_common.inl"
+#endif
 
 #include "seqlen.h"
 #include "named_barrier.hpp"
@@ -32,7 +35,9 @@ struct CollectiveEpilogueBwd {
 
     static_assert(ArchTag::kMinComputeCapability >= 80);
 
+#ifndef FLASHATTENTION_DISABLE_SM90
     using GmemTiledCopydKVTMA = cute::SM90_TMA_STORE;
+#endif
 
     // These are for storing the output tensor without TMA (e.g., for setting output to zero)
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
@@ -47,6 +52,7 @@ struct CollectiveEpilogueBwd {
                         GmemLayoutAtom{},
                         Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per store
 
+#ifndef FLASHATTENTION_DISABLE_SM90
     using SmemLayoutAtomdKVTMA = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
                                           // TODO: do we have to change this if dKV_swapAB is true?
                                           decltype(cute::get<1>(TileShape_MNK{})), Int<CUTE_STATIC_V(cute::get<2>(TileShape_MNK{})) / AtomLayoutKdKV>>());
@@ -55,6 +61,7 @@ struct CollectiveEpilogueBwd {
         decltype(cute::composition(SmemLayoutdKVTMA{},
                                    make_layout(make_shape(get<2>(TileShape_MNK{}), get<1>(TileShape_MNK{})),
                                                make_stride(decltype(get<1>(TileShape_MNK{})){}, _1{}))));
+#endif
 
     // If we don't use TMA
     static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : (kHeadDim % 32 == 0 ? 32 : 16);
@@ -64,7 +71,11 @@ struct CollectiveEpilogueBwd {
                              Layout<Shape<Int<8>, Int<kBlockKSmem>>,
                              Stride<Int<kBlockKSmem>, _1>>{}));
 
+#ifndef FLASHATTENTION_DISABLE_SM90
     using SmemLayoutAtomdKV = std::conditional_t<Use_TMA, SmemLayoutAtomdKVTMA, SmemLayoutAtomdKVSTG>;
+#else
+    using SmemLayoutAtomdKV = SmemLayoutAtomdKVSTG;
+#endif
     using SmemLayoutdKV = decltype(tile_to_shape(SmemLayoutAtomdKV{}, select<1, 2>(TileShape_MNK{})));
     using SmemLayoutdKVt =
         decltype(cute::composition(SmemLayoutdKV{},
@@ -72,17 +83,21 @@ struct CollectiveEpilogueBwd {
                                                make_stride(decltype(get<1>(TileShape_MNK{})){}, _1{}))));
 
     using SmemCopyAtomdKV = Copy_Atom<
+#ifndef FLASHATTENTION_DISABLE_SM90
         std::conditional_t<
             ArchTag::kMinComputeCapability >= 90,
             std::conditional_t<!dKV_swapAB, cute::SM90_U32x4_STSM_N, cute::SM90_U16x8_STSM_T>,
             AutoVectorizingCopyWithAssumedAlignment<128>
         >,
+#else
+        AutoVectorizingCopyWithAssumedAlignment<128>,
+#endif
         Element>;
 
     static constexpr size_t SmemAlignmentdKV = ArchTag::kMinComputeCapability >= 90 ? cutlass::detail::alignment_for_swizzle(SmemLayoutdKV{}) : 128;
     static_assert(SmemAlignmentdKV >= 128, "Require at least 128B alignment");
 
-    struct TensorStorage : cute::aligned_struct<SmemAlignmentdKV> {
+    struct CUTE_ALIGNAS(SmemAlignmentdKV) TensorStorage {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutdKV>, SmemAlignmentdKV> smem_dk;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutdKV>, SmemAlignmentdKV> smem_dv;
     };
@@ -90,6 +105,7 @@ struct CollectiveEpilogueBwd {
     using ShapedKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen_k, d, head, batch)
     using StridedKV = cute::Stride<int64_t, _1, int64_t, int64_t>;
 
+#ifndef FLASHATTENTION_DISABLE_SM90
     using TMA_dKV = std::conditional_t<
         Use_TMA,
         decltype(make_tma_copy(
@@ -100,6 +116,9 @@ struct CollectiveEpilogueBwd {
             _1{})),  // no mcast for dKV
         std::nullptr_t
         >;
+#else
+    using TMA_dKV = std::nullptr_t;
+#endif
 
     // Host side kernel arguments
     struct Arguments {
@@ -132,18 +151,26 @@ struct CollectiveEpilogueBwd {
         Tensor mdK = make_tensor(make_gmem_ptr(args.ptr_dK), args.shape_dK, args.stride_dK);
         Tensor mdV = make_tensor(make_gmem_ptr(args.ptr_dV), args.shape_dK, args.stride_dV);
         TMA_dKV tma_store_dK = [&] {
+#ifndef FLASHATTENTION_DISABLE_SM90
             if constexpr (Use_TMA) {
                 return make_tma_copy(GmemTiledCopydKVTMA{}, mdK, SmemLayoutdKVTMA{}, select<1, 2>(TileShape_MNK{}), _1{}); // no mcast for dKV
             } else {
                 return nullptr;
             }
+#else
+            return nullptr;
+#endif
         }();
         TMA_dKV tma_store_dV = [&] {
+#ifndef FLASHATTENTION_DISABLE_SM90
             if constexpr (Use_TMA) {
                 return make_tma_copy(GmemTiledCopydKVTMA{}, mdV, SmemLayoutdKVTMA{}, select<1, 2>(TileShape_MNK{}), _1{}); // no mcast for dKV
             } else {
                 return nullptr;
             }
+#else
+            return nullptr;
+#endif
         }();
         return {args.ptr_dK, args.shape_dK, args.stride_dK, args.ptr_dV, args.stride_dV,
                 tma_store_dK, tma_store_dV, args.cu_seqlens, args.seqused};
@@ -152,10 +179,12 @@ struct CollectiveEpilogueBwd {
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
     CUTLASS_DEVICE
     static void prefetch_tma_descriptors(Params const& params) {
+#ifndef FLASHATTENTION_DISABLE_SM90
         if constexpr (Use_TMA) {
             cute::prefetch_tma_descriptor(params.tma_store_dK.get_tma_descriptor());
             cute::prefetch_tma_descriptor(params.tma_store_dV.get_tma_descriptor());
         }
+#endif
     }
 
     template <typename SharedStorage, typename FrgTensorO, typename TiledMma>
@@ -210,15 +239,20 @@ struct CollectiveEpilogueBwd {
             if (warp_idx_sync == NumEpilogueThreads / cutlass::NumThreadsPerWarp - 1) {
                 cutlass::arch::NamedBarrier::sync(NumEpilogueThreads + cutlass::NumThreadsPerWarp,
                                                 cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+// for build with ppu
+#ifndef USE_PPU
                 if (cute::elect_one_sync()) {
                     cute::copy(params.tma_store_dV, tdVsdV, tdVgdV);
                     cute::copy(params.tma_store_dK, tdKsdK, tdKgdK);
                     tma_store_arrive();
                 }
+#endif
             }
+#ifndef USE_PPU
             tma_store_wait<0>();
             // // Tell warp 0 that smem_k and smem_v are ready
             // cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
+#endif
 
         } else {
             flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
@@ -342,7 +376,7 @@ struct CollectiveEpilogueBwdGQA {
     // Strangely without this SmemAlignment, the total smem for hdim 128 (80 x 128) is 228KB even though we
     // only need 227KB. We use the same alignment as the non-GQA epilogue to avoid this issue.
     static constexpr int SmemAlignment = kHeadDim % 64 == 0 ? 1024 : (kHeadDim % 32 == 0 ? 512 : 256);
-    struct TensorStorageTMA : cute::aligned_struct<SmemAlignment> {
+    struct CUTE_ALIGNAS(SmemAlignment) TensorStorageTMA {
         cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutdKVaccum>, SmemAlignment> smem_dkv;
     };
     struct TensorStorageSTG {
@@ -451,6 +485,7 @@ struct CollectiveEpilogueBwdGQA {
             Barrier::wait_eq(lock_ptr, thread_idx, n_block * num_batch * num_head_kv, bidh_idx_in_group);
         }
         // if (thread_idx == 0) { printf("After barrier blockIdx.x = %d, blockIdx.y = %d, blockIdx.z = %d, bidb = %d, bidh_kv = %d, lock_ptr = %p, dv_semaphore = %p\n", blockIdx.x, blockIdx.y, blockIdx.z, bidb, bidh_kv, lock_ptr, params.dv_semaphore);}
+#ifndef FLASHATTENTION_DISABLE_SM90
         if constexpr (Use_TMA) {
             cutlass::arch::fence_view_async_shared();
             cutlass::arch::NamedBarrier::sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
@@ -460,12 +495,15 @@ struct CollectiveEpilogueBwdGQA {
                 tma_store_wait<0>();
             }
         } else {
+#endif
             Tensor tdVrdV_atomic = r2g_thr_copy_dKVaccum.retile_S(tdVrdV);
             Tensor tdVgdV_atomic = r2g_thr_copy_dKVaccum.partition_D(gdVaccum);
             static_assert(CUTE_STATIC_V(size(tdVrdV_atomic)) == CUTE_STATIC_V(size(tdVgdV_atomic)));
             #pragma unroll
             for (int i = 0; i < size(tdVrdV_atomic); ++i) { atomicAdd(&tdVgdV_atomic(i), tdVrdV_atomic(i)); }
+#ifndef FLASHATTENTION_DISABLE_SM90
         }
+#endif
         if constexpr (Deterministic) {
             Barrier::arrive_inc(lock_ptr, thread_idx, n_block * num_batch * num_head_kv);
         }
@@ -482,6 +520,7 @@ struct CollectiveEpilogueBwdGQA {
             Barrier::wait_eq(lock_ptr, thread_idx, n_block * num_batch * num_head_kv, bidh_idx_in_group);
         }
         // if (thread_idx == 0) { printf("After barrier blockIdx.x = %d, blockIdx.y = %d, blockIdx.z = %d, bidb = %d, bidh_kv = %d, lock_ptr = %p, dk_semaphore = %p\n", blockIdx.x, blockIdx.y, blockIdx.z, bidb, bidh_kv, lock_ptr, params.dk_semaphore);}
+#ifndef FLASHATTENTION_DISABLE_SM90
         if constexpr (Use_TMA) {
             cutlass::arch::fence_view_async_shared();
             cutlass::arch::NamedBarrier::sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
@@ -491,12 +530,15 @@ struct CollectiveEpilogueBwdGQA {
                 tma_store_wait<0>();
             }
         } else {
+#endif
             Tensor tdKrdK_atomic = r2g_thr_copy_dKVaccum.retile_S(tdKrdK);
             Tensor tdKgdK_atomic = r2g_thr_copy_dKVaccum.partition_D(gdKaccum);
             static_assert(CUTE_STATIC_V(size(tdKrdK_atomic)) == CUTE_STATIC_V(size(tdKgdK_atomic)));
             #pragma unroll
             for (int i = 0; i < size(tdKrdK_atomic); ++i) { atomicAdd(&tdKgdK_atomic(i), tdKrdK_atomic(i)); }
+#ifndef FLASHATTENTION_DISABLE_SM90
         }
+#endif
         if constexpr (Deterministic) {
             Barrier::arrive_inc(lock_ptr, thread_idx, n_block * num_batch * num_head_kv);
         }

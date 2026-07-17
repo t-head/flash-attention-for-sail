@@ -1,4 +1,5 @@
 /******************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
@@ -55,7 +56,7 @@ public:
 
     // Kernel level shared memory storage
     struct SharedStorage {
-        struct TensorStorage : cute::aligned_struct<128> {
+        struct CUTE_ALIGNAS(128) TensorStorage {
             union {
                 typename CollectiveMainloop::TensorStorage mainloop;
                 typename CollectiveEpilogue::TensorStorage epilogue;

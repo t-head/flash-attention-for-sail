@@ -1,4 +1,5 @@
 /******************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
@@ -69,20 +70,31 @@ public:
         - int(sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v)))
         - int(sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_k)));
     static constexpr int mainloop_smem_padding = mainloop_smem_padding_ < 0 ? 0 : mainloop_smem_padding_;
-    struct SharedStorage {
-        struct TensorStorage : cute::aligned_struct<128> {
-            union {
-                struct {
-                    cute::array<uint32_t, mainloop_smem_padding / sizeof(uint32_t)> padding_;
-                    typename CollectiveMainloop::TensorStorage mainloop;
-                };
-                // We want smem_o to line up with the start of smem_v
-                typename CollectiveEpilogue::TensorStorage epilogue;
+
+    struct CUTE_ALIGNAS(128) TensorStorageWoPadding {
+        union {
+            typename CollectiveMainloop::TensorStorage mainloop;
+            // We want smem_o to line up with the start of smem_v
+            typename CollectiveEpilogue::TensorStorage epilogue;
+        };
+    };
+    struct CUTE_ALIGNAS(128) TensorStorageWPadding {
+        union {
+            struct {
+                cute::array<uint32_t, mainloop_smem_padding / sizeof(uint32_t)> padding_;
+                typename CollectiveMainloop::TensorStorage mainloop;
             };
-        } tensors;
+            // We want smem_o to line up with the start of smem_v
+            typename CollectiveEpilogue::TensorStorage epilogue;
+        };
+    };
+    using TensorStorage = std::conditional_t<(mainloop_smem_padding > 0), TensorStorageWPadding, TensorStorageWoPadding>;
 
-        alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
-
+    struct SharedStorage {    // smem_scheduler can be overlap with tensors
+        union {
+            TensorStorage tensors;
+            alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
+        };
     };
 
     static constexpr int SharedStorageSize = sizeof(SharedStorage);
@@ -138,6 +150,13 @@ public:
         return TileScheduler::get_grid_shape(params.scheduler, params.hw_info.sm_count * MinBlocksPerMultiprocessor);
     }
 
+#ifdef USE_PPU
+    static dim3
+    get_grid_shape(Params const& params, int blocks_per_sm) {
+        return TileScheduler::get_grid_shape(params.scheduler, params.hw_info.sm_count * (blocks_per_sm <= 1 ? MinBlocksPerMultiprocessor : blocks_per_sm));
+    }
+#endif
+
     static dim3
     get_block_shape() {
         return dim3(MaxThreadsPerBlock, 1, 1);
@@ -161,10 +180,45 @@ public:
         scheduler.init_consumer();
 
         int warp_idx = cutlass::canonical_warp_idx_sync();
+#ifdef USE_PPU
+        bool const IsExVarlenQ = [&]() -> bool {
+            if constexpr (is_instantiation_of_DynamicPersistentTileSchedulerSM80<TileScheduler>::value) {
+                return params.scheduler.varlen_q && params.scheduler.extreme_varlen_q;
+            } else {
+                return false;
+            }
+        }();
+        bool const IsNotExVarlenQ = [&]() -> bool {
+            if constexpr (is_instantiation_of_DynamicPersistentTileSchedulerSM80<TileScheduler>::value) {
+                return params.scheduler.varlen_q && !params.scheduler.extreme_varlen_q;
+            } else {
+                return false;
+            }
+        }();
+        auto is_valid = [&] (TileScheduler::WorkTileInfo& work_tile_info, TileSchedulerParams const& ps) {
+            if constexpr (is_instantiation_of_DynamicPersistentTileSchedulerSM80<TileScheduler>::value) {
+                return IsExVarlenQ ? work_tile_info.template is_valid</*IsExVarlenQ=*/true>(ps) : work_tile_info.template is_valid</*IsExVarlenQ=*/false>(ps);
+            } else {
+                return work_tile_info.is_valid(ps);
+            }
+        };
+#endif
         CUTLASS_PRAGMA_NO_UNROLL
+        #pragma clang loop licm(disable)
         for (auto work_tile_info = warp_idx == 0 ? scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler) : scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
+#ifdef USE_PPU
+             is_valid(work_tile_info, params.scheduler);
+#else
              work_tile_info.is_valid(params.scheduler);
+#endif
              work_tile_info = warp_idx == 0 ? scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info) : scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
+#ifdef USE_PPU
+            if constexpr (is_instantiation_of_DynamicPersistentTileSchedulerSM80<TileScheduler>::value) {
+                if (IsNotExVarlenQ ? work_tile_info.template is_empty</*IsNotExVarlenQ=*/true>(params.scheduler) : work_tile_info.template is_empty</*IsNotExVarlenQ=*/false>(params.scheduler)) {
+                    continue;
+                }
+            }
+#endif
             // Attention output (GEMM-II) accumulator.
             Tensor tOrO = partition_fragment_C(tiled_mma, select<0, 2>(TileShape_MNK{}));
             float softmax_scale_log2 = params.mainloop.softmax_scale_log2;

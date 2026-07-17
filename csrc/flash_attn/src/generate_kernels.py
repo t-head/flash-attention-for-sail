@@ -20,7 +20,7 @@ def get_fwd_template() -> str:
 namespace FLASH_NAMESPACE {{
 
 template<>
-void run_mha_fwd_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream) {{
+void run_mha_fwd_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, hggcStream_t stream) {{
     run_mha_fwd_hdim{HEAD_DIM}<{DTYPE}, {IS_CAUSAL}>(params, stream);
 }}
 
@@ -31,7 +31,7 @@ def get_fwd_split_template() -> str:
 
 namespace FLASH_NAMESPACE {{
 
-template void run_mha_fwd_splitkv_dispatch<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream);
+template void run_mha_fwd_splitkv_dispatch<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, hggcStream_t stream);
 
 }} // namespace FLASH_NAMESPACE"""
 
@@ -41,7 +41,7 @@ def get_bwd_template() -> str:
 namespace FLASH_NAMESPACE {{
 
 template<>
-void run_mha_bwd_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_bwd_params &params, cudaStream_t stream) {{
+void run_mha_bwd_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_bwd_params &params, hggcStream_t stream) {{
     run_mha_bwd_hdim{HEAD_DIM}<{DTYPE}, {IS_CAUSAL}>(params, stream);
 }}
 

@@ -1,4 +1,5 @@
 /******************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
@@ -27,7 +28,11 @@ struct Dropout {
     __forceinline__ __device__ void apply_dropout(Tensor<Engine, Layout> &tensor_,
                                          int block_row_start, int block_col_start, int block_row_stride) {
         // convert shape from (4, MMA_M, MMA_N) to (8, MMA_M, MMA_N / 2)
+#ifndef USE_PPU
         Tensor tensor = make_tensor(tensor_.data(), FLASH_NAMESPACE::convert_layout_acc_dropout(tensor_.layout()));
+#else
+        Tensor tensor = make_tensor(tensor_.data(), tensor_.layout());
+#endif
         using T = typename Engine::value_type;
         auto encode_dropout = [](bool keep, T val) {
             return keep ? val : (encode_dropout_in_sign_bit ? -val : T(0));
@@ -67,7 +72,7 @@ struct Dropout {
                         #pragma unroll
                         for (int i = 0; i < 4; i++) {
                             uint32_t mask;
-                            asm volatile("set.le.u32.f16x2 %0, %1, %2;\n" : "=r"(mask) : "r"(rnd_32[j * 4 + i]), "r"(p_dropout_8bit_in_uint32_t));
+                            asm volatile("ppu.cmp.le.u32.f16x2 %0, %1, %2;\n" : "=r"(mask) : "r"(rnd_32[j * 4 + i]), "r"(p_dropout_8bit_in_uint32_t));
                             tensor_uint32(i) &= mask;
                         }
                         // if (cute::thread0()) { printf("tensor_uint32 = 0x%x, 0x%x, 0x%x, 0x%x\n", tensor_uint32(0), tensor_uint32(1), tensor_uint32(2), tensor_uint32(3)); }

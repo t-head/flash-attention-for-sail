@@ -1,4 +1,5 @@
 /******************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  ******************************************************************************/
 
@@ -65,3 +66,53 @@ constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_sm8x(
         return {128, 64, 8, 2, false};
     }
 }
+
+#ifdef USE_PPU
+// Return {kBlockM, kBlockN, kNWarps, kStages, Q_in_regs}
+constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_ppu(
+        int arch, int headdim, bool is_causal, bool is_local, int element_size=2,
+        bool paged_kv=false, bool varlen=false, bool split=false,
+        bool softcap=false, bool append_kv=false, bool pack_gqa = false,
+        bool kBlockM_128=false, bool kBlockM_16=false) {
+    if (element_size == 2) {
+        bool const vreg_strain = paged_kv || pack_gqa || varlen || is_local;
+        if (kBlockM_16) {
+            if (headdim <= 64) {
+                return {16, split ? 16 : 128, 1, 1, true};
+            } else if (headdim <= 96) {
+                return {16, split ? 16 : 96, 1, 1, true};
+            } else if (headdim <= 128) {
+                return {16, split ? 16 : 64, 1, 1, true};
+            } else {
+                return {16, 16, 1, 1, true};
+            }
+        }
+        if (headdim <= 64) {
+            if ((is_causal && !varlen) || !kBlockM_128) {
+                return {64, 128, 4, 1, vreg_strain ? false : true};
+            } else {
+                return {128, vreg_strain ? 64 : 96, 4, 1, vreg_strain ? false : true};
+            }
+        } else if (headdim <= 96) {
+            if ((is_causal && !varlen) || !kBlockM_128) {
+                return {64, vreg_strain ? 96 : 128, 4, 1, vreg_strain ? false : true};
+            } else {
+                return {128, vreg_strain ? 32 : 64, 4, 1, vreg_strain ? false : true};
+            }
+        } else if (headdim <= 128) {
+            if ((is_causal && !varlen) || !kBlockM_128) {
+                return {64, is_causal || vreg_strain ? 64 : 96, 4, 1, vreg_strain ? false : true};
+            } else {
+                return {128, 64, 4, 1, false};
+            }
+        } else if (headdim <= 192) {
+            return {64, vreg_strain ? 32 : 64, 4, 1, vreg_strain ? false : true};
+        } else {
+            return {64, vreg_strain ? 16 : 32, 4, 1, vreg_strain ? false : true};
+        }
+    } else {
+        // Placeholder for now
+        return {128, 64, 8, 2, false};
+    }
+}
+#endif

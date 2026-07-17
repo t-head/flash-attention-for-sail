@@ -1,4 +1,5 @@
 /******************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  ******************************************************************************/
 
@@ -14,7 +15,11 @@ namespace flash {
 
 using namespace cute;
 
+#if defined(USE_PPU) && USE_AIU
+template <int kBlockN, int kHeadDim, int NumThreads, typename Element, bool KV_Same_Iter=false, int LoadsPerRow_LB=1, bool PagedAiuKV=false, int kBlockNPagedPerAiuLoad=16>
+#else
 template <int kBlockN, int kHeadDim, int NumThreads, typename Element, bool KV_Same_Iter=false, int LoadsPerRow_LB=1>
+#endif
 struct PagedKVManager {
     // If KV_Same_Iter=false, then we do load_page_table(0), load_K(0), load_page_table(1), load_K(1), load_V(0),
     // load_page_table(2), load_K(2), load_V(1), etc.
@@ -37,7 +42,7 @@ struct PagedKVManager {
     // We assume threads loading the same row are in the same warp. This is for an optimization in PagedKV where
     // these threads share the same page table entry and share the work of computing pointers to paged K and paged V.
     static_assert(cutlass::NumThreadsPerWarp % kGmemThreadsPerRow == 0, "kGmemThreadsPerRow must divide NumThreadsPerWarp");
-    using GmemCopyAtomCpAsync = cute::Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<uint128_t>, Element>;
+    using GmemCopyAtomCpAsync = cute::Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<uint128_t>, Element>;
     using GmemLayoutAtomKVCpAsync = Layout<Shape <Int<NumThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
                                            Stride<Int<kGmemThreadsPerRow>, _1>>;
     using GmemTiledCopyKVCpAsync = decltype(
@@ -81,6 +86,32 @@ struct PagedKVManager {
     TensortKpK tKpK;
     TensorPageOffset tPrPageOffset;
     TensorKVPtr tPrVPtr;
+#if defined(__HGGC_ARCH__) && defined(USE_PPU) && USE_AIU
+    static constexpr int bits_per_aiu_KV = kBlockNPagedPerAiuLoad * kBlockKGmem * sizeof(Element) * 8;
+#if __HGGC_ARCH__ == 100
+    using Gmem_copy_struct_KV = PPU0010_AIU_LOAD<cute::C<bits_per_aiu_KV>, Element, false>;
+#elif __HGGC_ARCH__ == 150
+    using Gmem_copy_struct_KV = PPU0015_AIU_LOAD<cute::C<bits_per_aiu_KV>, Element, false, kBlockNPagedPerAiuLoad, kBlockKGmem>;
+#endif
+    using GmemTiledCopyKVAiu = decltype(
+        make_tiled_copy(Copy_Atom<Gmem_copy_struct_KV, Element>{},
+                    Layout<Shape <_1,_1>,
+                           Stride<_1,_1>>{},
+                    Layout<Shape <Int<kBlockNPagedPerAiuLoad>, Int<kBlockKGmem>>>{}));
+    using GmemThrCopyKVAiu = decltype(GmemTiledCopyKVAiu{}.get_thread_slice(int(0)));
+    static constexpr int kNWarps = NumThreads / 32;
+    int const warp_idx;
+    static constexpr int kNAiuLoads = cute::ceil_div(kBlockN, kBlockNPagedPerAiuLoad);
+    static constexpr int kPageEntryPerWarp = cute::ceil_div(kNAiuLoads, kNWarps);
+    using TensorPageOffsetAiu = cute::tuple<int, int>;
+    using TensorKVPtrAiu = Element*;
+    GmemTiledCopyKVAiu gmem_tiled_copy_k_aiu;
+    GmemTiledCopyKVAiu gmem_tiled_copy_v_aiu;
+    GmemThrCopyKVAiu const gmem_thr_copy_k_aiu;
+    GmemThrCopyKVAiu const gmem_thr_copy_v_aiu;
+    TensorPageOffsetAiu tPrPageOffsetAiu;
+    TensorKVPtrAiu tPrVPtrAiu;
+#endif
 
 
     CUTLASS_DEVICE
@@ -95,6 +126,11 @@ struct PagedKVManager {
         , thread_idx(thread_idx)
         , seqlen_k(seqlen_k)
         , leftpad_k(leftpad_k)
+#if defined(__HGGC_ARCH__) &&  __HGGC_ARCH__ >= 100 && defined(USE_PPU) && USE_AIU
+        , gmem_thr_copy_k_aiu(gmem_tiled_copy_k_aiu.get_thread_slice(thread_idx))
+        , gmem_thr_copy_v_aiu(gmem_tiled_copy_v_aiu.get_thread_slice(thread_idx))
+        , warp_idx(thread_idx / 32)
+#endif
         , gmem_thr_copy_kv(gmem_tiled_copy_kv.get_thread_slice(thread_idx))
 
     {
@@ -107,11 +143,50 @@ struct PagedKVManager {
         Tensor tKcK = gmem_thr_copy_kv.partition_S(cK);
         #pragma unroll
         for (int k = 0; k < size<1>(tKpK); ++k) { tKpK(_0{}, k) = get<1>(tKcK(_0{}, _0{}, k)) < get<1>(shape_K); }
+#if defined(__HGGC_ARCH__) && defined(USE_PPU) && USE_AIU
+#if __HGGC_ARCH__ == 100
+        int aiu_offset_k = get<1>(shape_K) == kHeadDim ? 0 : (get<0>(stride_K) - get<1>(shape_K));
+        int aiu_offset_v = get<1>(shape_K) == kHeadDim ? 0 : (get<0>(stride_V) - get<1>(shape_K));
+        gmem_tiled_copy_k_aiu.desc_ = AiuDesc{nullptr, kBlockNPagedPerAiuLoad, get<0>(stride_K), kBlockNPagedPerAiuLoad, kBlockKGmem, aiu_offset_k};
+        gmem_tiled_copy_v_aiu.desc_ = AiuDesc{nullptr, kBlockNPagedPerAiuLoad, get<0>(stride_V), kBlockNPagedPerAiuLoad, kBlockKGmem, aiu_offset_v};
+#elif __HGGC_ARCH__ == 150
+        gmem_tiled_copy_k_aiu.desc_.init(nullptr, kBlockNPagedPerAiuLoad, get<1>(shape_K), get<0>(stride_K));
+        gmem_tiled_copy_v_aiu.desc_.init(nullptr, kBlockNPagedPerAiuLoad, get<1>(shape_K), get<0>(stride_V));
+#endif
+#endif
     };
+
+#if defined(__HGGC_ARCH__) &&  __HGGC_ARCH__ >= 100 && defined(USE_PPU) && USE_AIU
+    CUTLASS_DEVICE
+    TensorKVPtrAiu compute_K_ptr_aiu() {
+        auto [page, page_offset] = tPrPageOffsetAiu;
+        TensorKVPtrAiu tPrKPtrAiu = &mK_paged(page_offset, _0{}, page);
+        return tPrKPtrAiu;
+    };
+
+    CUTLASS_DEVICE
+    void compute_V_ptr_aiu() {
+        auto [page, page_offset] = tPrPageOffsetAiu;
+        tPrVPtrAiu = &mV_paged(page_offset, _0{}, page);
+    };
+#endif
 
     template <bool Seqlenk_mask=false, bool First_iter=false>
     CUTLASS_DEVICE
     void load_page_table(const int n_block) {
+#if defined(__HGGC_ARCH__) &&  __HGGC_ARCH__ >= 100 && defined(USE_PPU) && USE_AIU
+        if constexpr (PagedAiuKV) {
+            int const page_entry_idx = thread_idx % kPageEntryPerWarp;
+            int const row = (page_entry_idx * kNWarps + warp_idx) * kBlockNPagedPerAiuLoad;
+            int const row_idx = n_block * kBlockN + row;
+            int page_idx, page_offset;
+            page_idx = page_size_divmod.divmod(page_offset, row_idx + leftpad_k);
+            int const page = (row < kBlockN) && (!Seqlenk_mask || row_idx < seqlen_k) ? mPageTable[page_idx] : 0;
+            tPrPageOffsetAiu = {page, page_offset};
+            if constexpr (First_iter && !KV_Same_Iter) { compute_V_ptr_aiu(); }
+            return;
+        }
+#endif
         // The uncoalesced gmem load is intentional. This is so that each thread only loads the page table entries
         // it needs, and we don't need any sync between warps.
         // Assuming 8 threads per row, and 176 rows, then the rows from 0 to 175 are loaded by
@@ -154,6 +229,27 @@ struct PagedKVManager {
     template <bool Seqlenk_mask=false, typename TensorK>
     CUTLASS_DEVICE
     void load_K(const int n_block, TensorK &&sK) {
+#if defined(__HGGC_ARCH__) &&  __HGGC_ARCH__ >= 100 && defined(USE_PPU) && USE_AIU
+        if constexpr (PagedAiuKV) {
+            TensorKVPtrAiu tPrKPtrAiu = compute_K_ptr_aiu();
+            Tensor tKsK = gmem_thr_copy_k_aiu.partition_D(sK);
+            #pragma unroll
+            for (int m = 0; m < kPageEntryPerWarp; m++) {
+                int row_idx = warp_idx + m * kNWarps;
+                if (row_idx * kBlockNPagedPerAiuLoad >= kBlockN) { break; }
+                Element* k_ptr;
+                if constexpr (kPageEntryPerWarp > 1) {
+                    k_ptr = reinterpret_cast<Element*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrKPtrAiu), m, kPageEntryPerWarp));
+                } else {
+                    k_ptr = tPrKPtrAiu;
+                }
+                Tensor mK_paged_cur = make_tensor(make_gmem_ptr(k_ptr), make_shape(kBlockNPagedPerAiuLoad, shape<1>(mK_paged)), select<0, 1>(stride(mK_paged)));
+                Tensor mK_paged_cur_copy = cute::tiled_divide(make_mix_tensor_like(mK_paged_cur), Shape<Int<kBlockNPagedPerAiuLoad>, Int<kBlockKGmem>>{})(_, _0{}, _);
+                cute::copy(gmem_tiled_copy_k_aiu, mK_paged_cur_copy, tKsK(_, row_idx, _));
+            }
+            return;
+        }
+#endif
         // Do we need bound check to make sure the row doesn't go above kBlockN
         static constexpr bool EvenN = kBlockN % CUTE_STATIC_V(shape<0>(GmemLayoutAtomKVCpAsync{})) == 0;
 
@@ -193,6 +289,28 @@ struct PagedKVManager {
     template <bool Seqlenk_mask=false, typename TensorV>
     CUTLASS_DEVICE
     void load_V(const int n_block, TensorV &&sV) {
+#if defined(__HGGC_ARCH__) &&  __HGGC_ARCH__ >= 100 && defined(USE_PPU) && USE_AIU
+        if constexpr (PagedAiuKV) {
+            if constexpr (KV_Same_Iter) { compute_V_ptr_aiu(); }
+            Tensor tVsV = gmem_thr_copy_v_aiu.partition_D(sV);
+            #pragma unroll
+            for (int m = 0; m < kPageEntryPerWarp; m++) {
+                int row_idx = warp_idx + m * kNWarps;
+                if (row_idx * kBlockNPagedPerAiuLoad >= kBlockN) { break; }
+                Element* v_ptr;
+                if constexpr (kPageEntryPerWarp > 1) {
+                    v_ptr = reinterpret_cast<Element*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrVPtrAiu), m, kPageEntryPerWarp));
+                } else {
+                    v_ptr = tPrVPtrAiu;
+                }
+                Tensor mV_paged_cur = make_tensor(make_gmem_ptr(v_ptr), make_shape(kBlockNPagedPerAiuLoad, shape<1>(mV_paged)), select<0, 1>(stride(mV_paged)));
+                Tensor mV_paged_cur_copy = cute::tiled_divide(make_mix_tensor_like(mV_paged_cur), Shape<Int<kBlockNPagedPerAiuLoad>, Int<kBlockKGmem>>{})(_, _0{}, _);
+                cute::copy(gmem_tiled_copy_v_aiu, mV_paged_cur_copy, tVsV(_, row_idx, _));
+            }
+            if constexpr (!KV_Same_Iter) { compute_V_ptr_aiu(); }
+            return;
+        }
+#endif
         // Do we need bound check to make sure the row doesn't go above kBlockN
         static constexpr bool EvenN = kBlockN % CUTE_STATIC_V(shape<0>(GmemLayoutAtomKVCpAsync{})) == 0;
 

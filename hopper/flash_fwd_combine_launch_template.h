@@ -1,4 +1,5 @@
 /******************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  ******************************************************************************/
 
@@ -7,7 +8,7 @@
 #include "cute/tensor.hpp"
 
 #include "cutlass/cutlass.h"
-#include "cutlass/arch/arch.h"  // For cutlass::arch::Sm80
+#include "cutlass/arch/arch.h"  // For cutlass::arch::PPU0010
 #include "cutlass/device_kernel.h"  // For device_kernel
 
 #include "static_switch.h"
@@ -17,10 +18,10 @@
 using namespace cute;
 
 template <int kHeadDim, int kBlockM, int kLogMaxSplits, bool IsEvenK, bool Varlen, typename Element, typename ElementPartial>
-void run_flash_fwd_combine(Flash_fwd_params &params, cudaStream_t stream) {
+void run_flash_fwd_combine(Flash_fwd_params &params, hggcStream_t stream) {
     using TileShape_MK = cute::Shape<Int<kBlockM>, Int<kHeadDim>>;
     using CombineKernel = flash::FlashAttnFwdCombine<TileShape_MK, kLogMaxSplits, 256 /*kNThreads*/, 1 /*AlignmentLSE*/,
-                                                     IsEvenK, Varlen, Element, ElementPartial, cutlass::arch::Sm80>;
+                                                     IsEvenK, Varlen, Element, ElementPartial, cutlass::arch::PPU0010>;
 
     typename CombineKernel::Arguments args {
         static_cast<ElementPartial const*>(params.oaccum_ptr),
@@ -42,14 +43,14 @@ void run_flash_fwd_combine(Flash_fwd_params &params, cudaStream_t stream) {
     auto kernel = cutlass::device_kernel<CombineKernel>;
     int smem_size = CombineKernel::SharedStorageSize;
     if (smem_size >= 48 * 1024) {
-        CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        CHECK_CUDA(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     }
     kernel<<<grid_m, CombineKernel::MaxThreadsPerBlock, smem_size, stream>>>(kernel_params);
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
 template<typename T, typename Tpartial, int kHeadDim>
-void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd_combine_(Flash_fwd_params &params, hggcStream_t stream) {
     // We want kBlockM to be as small as possible to maximize parallelism.
     // E.g., if hdim is 64, we want kBlockM to be 16 so that we can use 256 threads, each reading 4 elements (floats).
     static_assert(kHeadDim % 32 == 0, "kHeadDim must be a multiple of 32");

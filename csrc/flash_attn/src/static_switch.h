@@ -112,3 +112,20 @@
       return __VA_ARGS__();                \
     }                                      \
   }()
+
+  // only support headdim192, headdimV128
+  #define HEADDIM_EQAL(HEADDIM, HEADDIMV, ...)   \
+  [&] {        \
+    if constexpr (HEADDIM == 192) {                 \
+      if (HEADDIM != HEADDIMV) {                   \
+        constexpr static int kHeadDimV = 128;  \
+        return __VA_ARGS__();                \
+      } else {           \
+        constexpr static int kHeadDimV = 192; \
+        return __VA_ARGS__();                \
+      }           \
+    } else { \
+      constexpr static int kHeadDimV = HEADDIM;  \
+      return __VA_ARGS__();                \
+    } \
+  }()

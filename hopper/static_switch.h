@@ -128,6 +128,31 @@
   #define CLUSTER_SWITCH BOOL_SWITCH
 #endif
 
+#ifdef FLASHATTENTION_DISABLE_SM90
+#ifndef FLASHATTENTION_DISABLE_SM86
+  #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)                                                      \
+  [&] {                                                                                          \
+    if (ARCH == 86 || ARCH == 89) {                                                              \
+      constexpr static int ARCH_NAME = 86;                                                       \
+      return __VA_ARGS__();                                                                      \
+    } else {                                                                                     \
+      constexpr static int ARCH_NAME = 80;                                                       \
+      return __VA_ARGS__();                                                                      \
+    }                                                                                            \
+  }()
+#else
+  #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)                                                      \
+  [&] {                                                                                          \
+    if (ARCH == 89) {                                                                            \
+      constexpr static int ARCH_NAME = 89;                                                       \
+      return __VA_ARGS__();                                                                      \
+    } else {                                                                                     \
+      constexpr static int ARCH_NAME = 80;                                                       \
+      return __VA_ARGS__();                                                                      \
+    }                                                                      \
+  }()
+#endif
+#else
 #ifdef FLASHATTENTION_DISABLE_SM8x
   #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)                                                      \
   [&] {                                                                                          \
@@ -135,6 +160,7 @@
     return __VA_ARGS__();                                                                        \
   }()
 #else
+#ifndef FLASHATTENTION_DISABLE_SM86
   #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)                                                      \
   [&] {                                                                                          \
     if (ARCH == 86 || ARCH == 89) {                                                              \
@@ -148,6 +174,22 @@
       return __VA_ARGS__();                                                                      \
     }                                                                                            \
   }()
+#else
+  #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)                                                      \
+  [&] {                                                                                          \
+    if (ARCH == 89) {                                                                            \
+      constexpr static int ARCH_NAME = 89;                                                       \
+      return __VA_ARGS__();                                                                      \
+    } else if (ARCH < 90) {                                                                      \
+      constexpr static int ARCH_NAME = 80;                                                       \
+      return __VA_ARGS__();                                                                      \
+    } else {                                                                                     \
+      constexpr static int ARCH_NAME = 90;                                                       \
+      return __VA_ARGS__();                                                                      \
+    }
+  }()
+#endif
+#endif
 #endif
 
 #ifndef FLASHATTENTION_ENABLE_VCOLMAJOR
@@ -179,3 +221,22 @@
       return __VA_ARGS__();                                                                      \
     }                                                                                            \
   }()
+
+#ifdef USE_PPU
+#define KBLOCKM_SWITCH(M16_COND, M128_COND, M16_CONST_NAME, M128_CONST_NAME, ...)                \
+  [&] {                                                                                          \
+    if (M16_COND) {                                                                              \
+      constexpr static bool M16_CONST_NAME = true;                                               \
+      constexpr static bool M128_CONST_NAME = false;                                             \
+      return __VA_ARGS__();                                                                      \
+    } else if (M128_COND) {                                                                      \
+      constexpr static bool M16_CONST_NAME = false;                                              \
+      constexpr static bool M128_CONST_NAME = true;                                              \
+      return __VA_ARGS__();                                                                      \
+    } else {                                                                                     \
+      constexpr static bool M16_CONST_NAME = false;                                              \
+      constexpr static bool M128_CONST_NAME = false;                                             \
+      return __VA_ARGS__();                                                                      \
+    }                                                                                            \
+  }()
+#endif

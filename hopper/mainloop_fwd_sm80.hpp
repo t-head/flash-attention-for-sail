@@ -1,4 +1,5 @@
 /******************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
@@ -23,7 +24,11 @@ namespace flash {
 using namespace cute;
 
 template <int kNWarps, int Stages, bool Q_in_regs, class TileShape_MNK_, class Element_, class ElementAccum_, class ArchTag_,
+#if defined(USE_PPU) && USE_AIU
+        bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool PagedAiuKV_, bool AppendKV_,
+#else
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool AppendKV_,
+#endif
         bool PackGQA_, bool Split_>
 struct CollectiveMainloopFwdSm80 {
 
@@ -39,6 +44,13 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr bool Has_softcap = Has_softcap_;
     static constexpr bool Varlen = Varlen_;
     static constexpr bool PagedKV = PagedKV_;
+#if defined(USE_PPU) && USE_AIU
+    static constexpr int kBlockNPagedPerAiuLoad = 16;
+    static constexpr bool PagedAiuKV = PagedAiuKV_;
+#else
+    static constexpr int kBlockNPagedPerAiuLoad = 1;   // not useful
+    static constexpr bool PagedAiuKV = false;
+#endif
     static constexpr bool AppendKV = AppendKV_;
     static constexpr bool PackGQA = PackGQA_;
     static constexpr bool Split = Split_;
@@ -53,14 +65,30 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
 
-    using MMA_Atom_Arch = std::conditional_t<
-        ArchTag::kMinComputeCapability >= 80,
+    using MMA_Atom_Arch =
+#ifdef USE_PPU
         std::conditional_t<
+            ArchTag::kMinComputeCapability >= 89,
+            std::conditional_t<
+                std::is_same_v<Element, cutlass::half_t>,
+                MMA_Atom<PPU0015_16x16x16_F32F16F16F32_TN>,
+                MMA_Atom<PPU0015_16x16x16_F32BF16BF16F32_TN>
+            >,
+            std::conditional_t<
+                std::is_same_v<Element, cutlass::half_t>,
+                MMA_Atom<PPU0010_16x16x16_F32F16F16F32_TN>,
+                MMA_Atom<PPU0010_16x16x16_F32BF16BF16F32_TN>
+            >
+#else
+        std::conditional_t<
+            ArchTag::kMinComputeCapability >= 80,
+            std::conditional_t<
             std::is_same_v<Element, cutlass::half_t>,
             MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
             MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>
         >,
         MMA_Atom<SM75_16x8x8_F32F16F16F32_TN>
+#endif
     >;
     using TiledMma = TiledMMA<
         MMA_Atom_Arch,
@@ -79,32 +107,64 @@ struct CollectiveMainloopFwdSm80 {
 
     static constexpr int kSwizzle = kBlockKGmem == 128 ? 4 : (kBlockKGmem == 64 ? 3 : (kBlockKGmem == 32 ? 2 : 1));
     static constexpr int kSwizzleBase = sizeof(Element) == 4 ? 2 : (sizeof(Element) == 2 ? 3 : 4);
+#if defined(USE_PPU) && USE_AIU
+    using SmemLayoutAtomQKV = Layout<Shape<_8, Int<kBlockKGmem>>, Stride<Int<kBlockKGmem>, _1>>;
+    using SmemLayoutAtomQKVSwizzle = decltype(
+        composition(Swizzle<kSwizzle, kSwizzleBase, kSwizzleBase>{},
+                    Layout<Shape<_8, Int<kBlockKGmem>>,
+                           Stride<Int<kBlockKGmem>, _1>>{}));
+#else
     using SmemLayoutAtomQKV = decltype(
         composition(Swizzle<kSwizzle, kSwizzleBase, kSwizzleBase>{},
                     Layout<Shape<_8, Int<kBlockKGmem>>,
                            Stride<Int<kBlockKGmem>, _1>>{}));
-    using SmemLayoutQ = decltype(tile_to_shape(SmemLayoutAtomQKV{}, select<0, 2>(TileShape_MNK{})));
+    using SmemLayoutAtomQKVSwizzle = SmemLayoutAtomQKV;
+#endif
+    using SmemLayoutQ = std::conditional_t<!PackGQA,
+        decltype(tile_to_shape(SmemLayoutAtomQKV{}, select<0, 2>(TileShape_MNK{}))),
+        decltype(tile_to_shape(SmemLayoutAtomQKVSwizzle{}, select<0, 2>(TileShape_MNK{})))>;
 
-    using SmemLayoutK = decltype(tile_to_shape(
-        SmemLayoutAtomQKV{},
-        make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})));
+    using SmemLayoutK = std::conditional_t<!PagedKV || PagedAiuKV,
+        decltype(tile_to_shape(SmemLayoutAtomQKV{}, make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{}))),
+        decltype(tile_to_shape(SmemLayoutAtomQKVSwizzle{}, make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})))>;
 
-    using SmemLayoutV = decltype(tile_to_shape(
-        SmemLayoutAtomQKV{},
-        make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})));
+    using SmemLayoutV = std::conditional_t<!PagedKV || PagedAiuKV,
+        decltype(tile_to_shape(SmemLayoutAtomQKV{}, make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{}))),
+        decltype(tile_to_shape(SmemLayoutAtomQKVSwizzle{}, make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})))>;
     using SmemLayoutVt = decltype(
         composition(SmemLayoutV{},
                     make_ordered_layout(make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{}), Int<kStages>{}),
                                         Step<_2, _1, _3>{})));
 
-    using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
-    using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, Element>;
+    using SmemCopyAtom = Copy_Atom<PPU_U32x4_LDSM_N, Element>;
+    using SmemCopyAtomTransposed = Copy_Atom<PPU_U16x8_LDSM_T, Element>;
+#if defined(USE_PPU) && USE_AIU
+    using SmemCopyOpQ = std::conditional_t<
+        ArchTag::kMinComputeCapability >= 89,
+        PPU0015_TSM_LD_SWZL<Element, kBlockM, kBlockKGmem, false, false, 1>,
+        PPU0010_TSM_LD_SWZL<Element, kBlockM, kBlockKGmem, false, false>>;
+    using SmemCopyOpK = std::conditional_t<
+        ArchTag::kMinComputeCapability >= 89,
+        PPU0015_TSM_LD_SWZL<Element, PagedAiuKV ? kBlockNPagedPerAiuLoad : kBlockN, kBlockKGmem, true, false, kHeadDim / kBlockKGmem>,
+        PPU0010_TSM_LD_SWZL<Element, PagedAiuKV ? kBlockNPagedPerAiuLoad : kBlockN, kBlockKGmem, false, false, kHeadDim / kBlockKGmem>>;   // config InstNum for multi-stage
+    using SmemCopyOpKVt = std::conditional_t<
+        ArchTag::kMinComputeCapability >= 89,
+        PPU0015_TSM_LD_SWZL<Element, PagedAiuKV ? kBlockNPagedPerAiuLoad : kBlockN, kBlockKGmem, true, true, kHeadDim / kBlockKGmem>,
+        PPU0010_TSM_LD_SWZL<Element, PagedAiuKV ? kBlockNPagedPerAiuLoad : kBlockN, kBlockKGmem, false, true, kHeadDim / kBlockKGmem>>;   // config InstNum for multi-stage
+    using SmemCopyAtomQ = std::conditional_t<!PackGQA, Copy_Atom<SmemCopyOpQ, Element>, SmemCopyAtom>;
+    using SmemCopyAtomK = std::conditional_t<!PagedKV || PagedAiuKV, Copy_Atom<SmemCopyOpK, Element>, SmemCopyAtom>;
+    using SmemCopyAtomKVt = std::conditional_t<!PagedKV || PagedAiuKV, Copy_Atom<SmemCopyOpKVt, Element>, SmemCopyAtomTransposed>;
+#else
+    using SmemCopyAtomQ = SmemCopyAtom;
+    using SmemCopyAtomK = SmemCopyAtom;
+    using SmemCopyAtomKVt = SmemCopyAtomTransposed;
+#endif
 
     // We use CACHEGLOBAL instead of CACHEALWAYS for both Q and K/V, since we won't be reading
     // from the same address by the same threadblock. This is slightly faster.
     using GmemCopyAtom = Copy_Atom<std::conditional_t<
         Has_cp_async,
-        SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>,
+        PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>,
         AutoVectorizingCopyWithAssumedAlignment<128>
     >, Element>;
 
@@ -116,6 +176,31 @@ struct CollectiveMainloopFwdSm80 {
         make_tiled_copy(GmemCopyAtom{},
                         GmemLayoutAtom{},
                         Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per read
+#if defined(USE_PPU) && USE_AIU
+    static constexpr int bits_per_aiu_Q = kBlockM * kBlockKGmem * sizeof(Element) * 8;
+    static constexpr int bits_per_aiu_KV = kBlockN * kBlockKGmem * sizeof(Element) * 8;
+    using Gmem_copy_struct_Q = std::conditional_t<
+        ArchTag::kMinComputeCapability >= 89,
+        PPU0015_AIU_LOAD<cute::C<bits_per_aiu_Q>, Element, false, kBlockM, kBlockKGmem>,
+        PPU0010_AIU_LOAD<cute::C<bits_per_aiu_Q>, Element, false>>;
+    using Gmem_copy_struct_KV = std::conditional_t<
+        ArchTag::kMinComputeCapability >= 89,
+        PPU0015_AIU_LOAD<cute::C<bits_per_aiu_KV>, Element, false, kBlockN, kBlockKGmem>,
+        PPU0010_AIU_LOAD<cute::C<bits_per_aiu_KV>, Element, false>>;
+    using GmemTiledCopyQ = decltype(
+        make_tiled_copy(Copy_Atom<Gmem_copy_struct_Q, Element>{},
+                    Layout<Shape <_1,_1>,
+                           Stride<_1,_1>>{},
+                    Layout<Shape <Int<kBlockM>, Int<kBlockKGmem>>>{}));
+    using GmemTiledCopyKV = decltype(
+        make_tiled_copy(Copy_Atom<Gmem_copy_struct_KV, Element>{},
+                    Layout<Shape <_1,_1>,
+                           Stride<_1,_1>>{},
+                    Layout<Shape <Int<kBlockN>, Int<kBlockKGmem>>>{}));
+#else
+    using GmemTiledCopyQ = GmemTiledCopyQKV;
+    using GmemTiledCopyKV = GmemTiledCopyQKV;
+#endif
     // So that we don't have to check if we overshot kBlockM when we load Q
     static_assert(kBlockM % CUTE_STATIC_V(shape<0>(GmemLayoutAtom{})) == 0);
 
@@ -152,7 +237,7 @@ struct CollectiveMainloopFwdSm80 {
 
     static constexpr bool Share_QV_Smem = Q_in_regs;
 
-    struct TensorStorageSharedQV : cute::aligned_struct<128> {
+    struct CUTE_ALIGNAS(128) TensorStorageSharedQV {
         union {
             cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>> smem_v;
             cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
@@ -160,7 +245,7 @@ struct CollectiveMainloopFwdSm80 {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
     };
 
-    struct TensorStorageSeparateQV : cute::aligned_struct<128> {
+    struct CUTE_ALIGNAS(128) TensorStorageSeparateQV {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>> smem_v;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
@@ -358,20 +443,25 @@ struct CollectiveMainloopFwdSm80 {
 
         int const bidb_kv = params.kv_batch_idx == nullptr ? bidb : params.kv_batch_idx[bidb];
         Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + seqlen_info.offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
-        Tensor gQ = local_tile(mQ, select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
+        Tensor gQ = local_tile(make_mix_tensor_like(mQ), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
         Tensor mK = make_tensor(make_gmem_ptr(params.ptr_K + seqlen_info.offset_k * get<0>(params.stride_K)), params.shape_K, params.stride_K)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
-        Tensor gK = local_tile(mK, select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
+        Tensor gK = local_tile(make_mix_tensor_like(mK), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
         Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V + seqlen_info.offset_k * get<0>(params.stride_V)), params.shape_K, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
-        Tensor gV = local_tile(mV, select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
+        Tensor gV = local_tile(make_mix_tensor_like(mV), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
 
-        GmemTiledCopyQKV gmem_tiled_copy_QKV;
-        auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(thread_idx);
-        auto gmem_thr0_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(_0{});  // For index calculation
+        GmemTiledCopyQ gmem_tiled_copy_Q;
+        GmemTiledCopyKV gmem_tiled_copy_K;
+        GmemTiledCopyKV gmem_tiled_copy_V;
+        auto gmem_thr_copy_Q = gmem_tiled_copy_Q.get_thread_slice(thread_idx);
+        auto gmem_thr_copy_K = gmem_tiled_copy_K.get_thread_slice(thread_idx);
+        auto gmem_thr_copy_V = gmem_tiled_copy_V.get_thread_slice(thread_idx);
+        auto gmem_thr0_copy_Q = gmem_tiled_copy_Q.get_thread_slice(_0{});  // For index calculation
+        auto gmem_thr0_copy_KV = gmem_tiled_copy_K.get_thread_slice(_0{});  // For index calculation
 
-        Tensor tKgK = gmem_thr_copy_QKV.partition_S(gK);  // (KCPY, KCPY_N, KCPY_K, nblocksN)
-        Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
-        Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K, nblocksN)
-        Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
+        Tensor tKgK = gmem_thr_copy_K.partition_S(gK);  // (KCPY, KCPY_N, KCPY_K, nblocksN)
+        Tensor tKsK = gmem_thr_copy_K.partition_D(sK);
+        Tensor tVgV = gmem_thr_copy_V.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K, nblocksN)
+        Tensor tVsV = gmem_thr_copy_V.partition_D(sV);
 
         TiledMma tiled_mma;
         auto thr_mma = tiled_mma.get_slice(thread_idx);
@@ -379,21 +469,67 @@ struct CollectiveMainloopFwdSm80 {
         // Allocate "fragments/descriptors"
         Tensor tSrQ = thr_mma.partition_fragment_A(sQ);
 
+#if defined(USE_PPU) && USE_AIU
+        if constexpr (ArchTag::kMinComputeCapability >= 89) {
+            gmem_tiled_copy_Q.desc_.init(nullptr, seqlen_info.seqlen_q, get<1>(params.shape_Q), get<0>(params.stride_Q));
+            gmem_tiled_copy_K.desc_.init(nullptr, seqlen_info.seqlen_k, get<1>(params.shape_Q), get<0>(params.stride_K));
+            gmem_tiled_copy_V.desc_.init(nullptr, seqlen_info.seqlen_k, get<1>(params.shape_Q), get<0>(params.stride_V));
+        } else {
+            int aiu_offset_q = get<1>(params.shape_Q) == kHeadDim ? 0 : (get<0>(params.stride_Q) - get<1>(params.shape_Q));
+            int aiu_offset_k = get<1>(params.shape_Q) == kHeadDim ? 0 : (get<0>(params.stride_K) - get<1>(params.shape_Q));
+            int aiu_offset_v = get<1>(params.shape_Q) == kHeadDim ? 0 : (get<0>(params.stride_V) - get<1>(params.shape_Q));
+            gmem_tiled_copy_Q.desc_ = AiuDesc{nullptr, seqlen_info.seqlen_q, get<0>(params.stride_Q), kBlockM, kBlockKGmem, aiu_offset_q};
+            gmem_tiled_copy_K.desc_ = AiuDesc{nullptr, seqlen_info.seqlen_k, get<0>(params.stride_K), kBlockN, kBlockKGmem, aiu_offset_k};
+            gmem_tiled_copy_V.desc_ = AiuDesc{nullptr, seqlen_info.seqlen_k, get<0>(params.stride_V), kBlockN, kBlockKGmem, aiu_offset_v};
+        }
+        const int warp_idx = __ppu_read_firstlane(threadIdx.x / 32);
+        const int tid_thread_slice = warp_idx * 32;
+#else
+        const int tid_thread_slice = thread_idx;
+#endif
         // Copy Atom retiling
-        auto smem_tiled_copy_Q = make_tiled_copy_A(SmemCopyAtom{}, tiled_mma);
-        auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(thread_idx);
-        auto smem_tiled_copy_K = make_tiled_copy_B(SmemCopyAtom{}, tiled_mma);
+        auto smem_tiled_copy_Q = make_tiled_copy_A(SmemCopyAtomQ{}, tiled_mma);
+        auto smem_thr_copy_Q = !PackGQA ? smem_tiled_copy_Q.get_thread_slice(tid_thread_slice) : smem_tiled_copy_Q.get_thread_slice(thread_idx);
+        auto smem_tiled_copy_K = make_tiled_copy_B(SmemCopyAtomK{}, tiled_mma);
+        auto smem_tiled_copy_V = make_tiled_copy_B(SmemCopyAtomKVt{}, tiled_mma);
+#if defined(USE_PPU) && USE_AIU
+        auto smem_thr_copy_K = !PagedKV || PagedAiuKV ? smem_tiled_copy_K.get_thread_slice(tid_thread_slice) : smem_tiled_copy_K.get_thread_slice(thread_idx);
+        auto smem_thr_copy_V = !PagedKV || PagedAiuKV ? smem_tiled_copy_V.get_thread_slice(tid_thread_slice) : smem_tiled_copy_V.get_thread_slice(thread_idx);
+#else
         auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(thread_idx);
-        auto smem_tiled_copy_V = make_tiled_copy_B(SmemCopyAtomTransposed{}, tiled_mma);
         auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(thread_idx);
-        Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
+#endif
+        Tensor tSsQ = [&]() -> auto {
+            if constexpr (!PackGQA) {
+                return smem_thr_copy_Q.partition_S(make_mix_tensor_like(sQ));
+            } else {
+                return smem_thr_copy_Q.partition_S(sQ);
+            }
+        }();
+#if defined(USE_PPU) && USE_AIU
+        Tensor tSsK = [&]() -> auto {
+            if constexpr (!PagedKV || PagedAiuKV) {
+                return smem_thr_copy_K.partition_S(make_mix_tensor_like(sK));
+            } else {
+                return smem_thr_copy_K.partition_S(sK);
+            }
+        }();
+        Tensor tOsVt = [&]() -> auto {
+            if constexpr (!PagedKV || PagedAiuKV) {
+                return smem_thr_copy_V.partition_S(make_mix_tensor_like(sVt));
+            } else {
+                return smem_thr_copy_V.partition_S(sVt);
+            }
+        }();
+#else
         Tensor tSsK = smem_thr_copy_K.partition_S(sK);
         Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
+#endif
 
         // Predicates
         Tensor cKV = cute::make_identity_tensor(select<1, 2>(TileShape_MNK{}));
-        Tensor tKVcKV = gmem_thr_copy_QKV.partition_S(cKV);
-        Tensor t0KVcKV = gmem_thr0_copy_QKV.partition_S(cKV);
+        Tensor tKVcKV = gmem_thr_copy_K.partition_S(cKV);
+        Tensor t0KVcKV = gmem_thr0_copy_KV.partition_S(cKV);
         Tensor tKVpKV = make_tensor<bool>(make_shape(size<2>(tKsK)));
         #pragma unroll
         for (int k = 0; k < size(tKVpKV); ++k) { tKVpKV(k) = get<1>(tKVcKV(_0{}, _0{}, k)) < get<1>(params.shape_K); }
@@ -410,27 +546,38 @@ struct CollectiveMainloopFwdSm80 {
         // If persistent, need to sync to make sure all threads have finished with smem_o before writing to smem_v
         if constexpr (Share_QV_Smem) { __syncthreads(); }
         if constexpr (!PackGQA) {
-            Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ);
-            Tensor tQsQ = gmem_thr_copy_QKV.partition_D(sQ);
+            Tensor tQgQ = gmem_thr_copy_Q.partition_S(gQ);
+            Tensor tQsQ = gmem_thr_copy_Q.partition_D(sQ);
             Tensor cQ = cute::make_identity_tensor(select<0, 2>(TileShape_MNK{}));
-            Tensor tQcQ = gmem_thr_copy_QKV.partition_S(cQ);
-            Tensor t0QcQ = gmem_thr0_copy_QKV.partition_S(cQ);
+            Tensor tQcQ = gmem_thr_copy_Q.partition_S(cQ);
+            Tensor t0QcQ = gmem_thr0_copy_Q.partition_S(cQ);
             Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
+#if defined(USE_PPU) && USE_AIU
+            flash::copy</*Is_even_MN=*/true>(
+                gmem_tiled_copy_Q, tQgQ, tQsQ, t0QcQ, tQpQ
+            );
+            // if (cute::thread0()) { print("Using AIU Load Q...\n"); }
+#else
             #pragma unroll
             for (int k = 0; k < size(tQpQ); ++k) { tQpQ(k) = get<1>(tQcQ(_0{}, _0{}, k)) < get<1>(params.shape_Q); }
             // Instead of passing in tQcQ, we pass in t0QcQ and subtract the offset from the limit
             // (seqlen_q - m_block * kBlockM). This is because the entries of t0QcQ are known at compile time.
             // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
             flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/true>(
-                gmem_tiled_copy_QKV, tQgQ, tQsQ, t0QcQ, tQpQ, seqlen_info.seqlen_q - m_block * kBlockM - get<0>(tQcQ(_0{}, _0{}, _0{}))
+                gmem_tiled_copy_Q, tQgQ, tQsQ, t0QcQ, tQpQ, seqlen_info.seqlen_q - m_block * kBlockM - get<0>(tQcQ(_0{}, _0{}, _0{}))
             );
+#endif
         } else {
             using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumMmaThreads, Element>;
             PackGQAt::load_Q(mQ, sQ, params.qhead_per_khead_divmod, thread_idx, seqlen_q, m_block);
         }
         cute::cp_async_fence();
 
+#if defined(USE_PPU) && USE_AIU
+        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumMmaThreads, Element, true /*KV_Same_Iter*/, 1 /*LoadsPerRow_LB*/, PagedAiuKV, kBlockNPagedPerAiuLoad>;
+#else
         using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumMmaThreads, Element, true /*KV_Same_Iter*/>;
+#endif
         PagedKVManager_t paged_kv_manager(
             params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
             params.ptr_K, params.shape_K, params.stride_K,
@@ -444,6 +591,10 @@ struct CollectiveMainloopFwdSm80 {
                 // Do we need bound check to make sure the row doesn't go above kBlockN
                 static constexpr bool EvenN = kBlockN % CUTE_STATIC_V(shape<0>(GmemLayoutAtom{})) == 0;
                 Tensor tKsK_cur = tKsK(_, _, _, smem_pipe_write);
+#if defined(USE_PPU) && USE_AIU
+                flash::copy</*Is_even_MN=*/true>(
+                    gmem_tiled_copy_K, tKgK(_, _, _, n_block), tKsK_cur, t0KVcKV, tKVpKV);
+#else
                 // Instead of passing in tKVcKV, we pass in t0KVcKV and subtract the offset from the limit
                 // (seqlen_k - n_block * kBlockN). This is because the entries of t0KVcKV are known at compile time.
                 int const seqlenk_row_limit = -int(get<0>(tKVcKV(_0{}, _0{}, _0{}))) + (EvenN
@@ -451,7 +602,8 @@ struct CollectiveMainloopFwdSm80 {
                     : (!Seqlenk_mask ? kBlockN : std::min(seqlen_info.seqlen_k - n_block * kBlockN, kBlockN)));
                 // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
                 flash::copy</*Is_even_MN=*/!Seqlenk_mask && EvenN, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/true>(
-                    gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK_cur, t0KVcKV, tKVpKV, seqlenk_row_limit);
+                    gmem_tiled_copy_K, tKgK(_, _, _, n_block), tKsK_cur, t0KVcKV, tKVpKV, seqlenk_row_limit);
+#endif
             } else {
                 paged_kv_manager.template load_page_table<Seqlenk_mask>(n_block);
                 paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK(_, _, smem_pipe_write));
@@ -467,6 +619,10 @@ struct CollectiveMainloopFwdSm80 {
                 // We don't call flash::copy since it doesn't support bound checking
                 // to not overshot kBlockN when writing to smem.
                 Tensor tVgV_cur = tVgV(_, _, _, n_block);
+#if defined(USE_PPU) && USE_AIU
+                flash::copy</*Is_even_MN=*/true>(
+                    gmem_tiled_copy_V, tVgV_cur, tVsV_cur, t0KVcKV, tKVpKV);
+#else
                 int const seqlenk_row_limit = seqlen_info.seqlen_k - n_block * kBlockN - get<0>(tKVcKV(_0{}, _0{}, _0{}));
                 #pragma unroll
                 for (int m = 0; m < size<1>(tVsV); ++m) {
@@ -475,10 +631,11 @@ struct CollectiveMainloopFwdSm80 {
                         bool const predicate_n = !Seqlenk_mask || get<0>(t0KVcKV(_0{}, m, _0{})) < seqlenk_row_limit;
                         #pragma unroll
                         for (int k = 0; k < size<2>(tVsV); ++k) {
-                            cute::copy(gmem_tiled_copy_QKV.with(tKVpKV(k) && predicate_n), tVgV_cur(_, m, k), tVsV_cur(_, m, k));
+                            cute::copy(gmem_tiled_copy_V.with(tKVpKV(k) && predicate_n), tVgV_cur(_, m, k), tVsV_cur(_, m, k));
                         }
                     }
                 }
+#endif
             } else {
                 paged_kv_manager.template load_V<Seqlenk_mask>(n_block, sV(_, _, smem_pipe_write));
             }
@@ -520,7 +677,13 @@ struct CollectiveMainloopFwdSm80 {
             if constexpr (Q_in_regs) {
                 __syncthreads();
                 Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
-                Tensor tSsQ_copy_view = smem_thr_copy_Q.partition_S(sQ);
+                Tensor tSsQ_copy_view = [&]() -> auto {
+                    if constexpr (!PackGQA) {
+                        return smem_thr_copy_Q.partition_S(make_mix_tensor_like(sQ));
+                    } else {
+                        return smem_thr_copy_Q.partition_S(sQ);
+                    }
+                }();
                 cute::copy(smem_tiled_copy_Q, tSsQ_copy_view, tSrQ_copy_view);
             }
         };
@@ -607,10 +770,24 @@ struct CollectiveMainloopFwdSm80 {
             };
             Tensor tSrQ_cur = cute::conditional_return<Q_in_regs>(tSrQ, thr_mma.partition_fragment_A(sQ));
             Tensor tSrK = thr_mma.partition_fragment_B(sK(_, _, _0{}));
+#ifdef USE_PPU
+            if constexpr (PagedAiuKV) {
+                flash::gemm_sm80_kv_paged_aiu<kBlockN, kBlockNPagedPerAiuLoad, kHeadDim, kBlockKGmem, Q_in_regs>(
+                    tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
+                    tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
+                );
+            } else {
+                flash::gemm_sm80<Q_in_regs>(
+                    tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
+                    tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
+                );
+            }
+#else
             flash::gemm_sm80<Q_in_regs>(
                 tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
                 tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
             );
+#endif
             smem_pipe_write = smem_pipe_write < kStages - 1 ? smem_pipe_write + 1 : 0;
             scoremod_premask_fn(tSrS);
             // Faster to load_K before gemm if we only have 1 stage
@@ -619,13 +796,39 @@ struct CollectiveMainloopFwdSm80 {
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
             softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
             if constexpr (Is_FP8) { flash::permute_Cregs_fp8(tSrS); }
+#ifdef USE_PPU
+            Tensor tOrP_acc = [&]() -> auto {
+                if constexpr (ArchTag::kMinComputeCapability >= 89) {
+                    return make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMma>(tSrS.layout()));
+                } else {
+                    return flash::convert_acc<Element>(tSrS);
+                }
+            }();
+            Tensor tOrP = [&]() -> auto {
+                if constexpr (ArchTag::kMinComputeCapability >= 89) {
+                    return make_tensor_like<Element>(tOrP_acc);
+                } else {
+                    return make_tensor(tOrP_acc.data(), make_layout(get<0>(tSrQ.layout()), get<1>(tSrS.layout()), get<2>(tSrS.layout())));
+                }
+            }();
+            if constexpr (ArchTag::kMinComputeCapability >= 89) { convert_type_out(tOrP_acc, tOrP); }
+#else
             Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMma>(tSrS.layout()));
             Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
             convert_type_out(tOrP_acc, tOrP);
+#endif
             if constexpr (!Is_first_iter) { softmax.rescale_o(tOrO, scores_scale); }
             if constexpr (kStages > 1) { sync(); }
             Tensor tOrV = thr_mma.partition_fragment_B(sVt(_, _, _0{}));
+#ifdef USE_PPU
+            if constexpr (PagedAiuKV) {
+                flash::gemm_rs_sm80_kv_paged_aiu<kBlockN, kBlockNPagedPerAiuLoad, kHeadDim, kBlockKGmem>(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+            } else {
+                flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+            }
+#else
             flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+#endif
             if constexpr (kStages > 1) { load_K_next(); }
             smem_pipe_read = smem_pipe_read < kStages - 1 ? smem_pipe_read + 1 : 0;
         };

@@ -1,4 +1,5 @@
 /******************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  ******************************************************************************/
 
@@ -8,8 +9,11 @@
 #include <cutlass/fast_math.h>  // For FastDivMod
 #include "cute/tensor.hpp"
 
+
+#ifndef FLASHATTENTION_DISABLE_SM90
 #include "cutlass/gemm/collective/builders/sm90_common.inl"
 #include "cutlass/epilogue/collective/builders/sm90_common.inl"
+#endif
 
 #include "seqlen.h"
 #include "named_barrier.hpp"
@@ -40,7 +44,9 @@ struct CollectiveEpilogueFwd {
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
 
+#ifndef FLASHATTENTION_DISABLE_SM90
     using GmemTiledCopyOTMA = cute::SM90_TMA_STORE;
+#endif
 
     // These are for storing the output tensor without TMA (e.g., for setting output to zero)
     static constexpr int kGmemElemsPerStore = sizeof(cute::uint128_t) / sizeof(Element);
@@ -64,9 +70,12 @@ struct CollectiveEpilogueFwd {
                         GmemLayoutAtom{},
                         Layout<Shape<_1, Int<kGmemElemsPerStore>>>{}));  // Val layout, 8 or 16 vals per store
 
+
+#ifndef FLASHATTENTION_DISABLE_SM90
     using SmemLayoutAtomOTMA = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
         decltype(cute::get<0>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
     using SmemLayoutOTMA = decltype(tile_to_shape(SmemLayoutAtomOTMA{}, select<0, 2>(TileShape_MNK{})));
+#endif
     static constexpr int kSwizzle = kBlockKGmem == 128 ? 4 : (kBlockKGmem == 64 ? 3 : (kBlockKGmem == 32 ? 2 : 1));
     static constexpr int kSwizzleBase = sizeof(Element) == 4 ? 2 : (sizeof(Element) == 2 ? 3 : 4);
     using SmemLayoutAtomO = decltype(
@@ -74,7 +83,11 @@ struct CollectiveEpilogueFwd {
                     Layout<Shape<_8, Int<kBlockKGmem>>,
                            Stride<Int<kBlockKGmem>, _1>>{}));
     using SmemLayoutOSTS = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0, 2>(TileShape_MNK{})));
+#ifndef FLASHATTENTION_DISABLE_SM90
     using SmemLayoutO = std::conditional_t<ArchTag::kMinComputeCapability >= 90, SmemLayoutOTMA, SmemLayoutOSTS>;
+#else
+    using SmemLayoutO = SmemLayoutOSTS;
+#endif
 
     using ShapeO = cute::Shape<int32_t, int32_t, int32_t, int32_t, int32_t>;  // (seqlen_q, d, head, batch, num_splits)
     using StrideO = cute::Stride<int64_t, _1, int64_t, int64_t, int64_t>;
@@ -86,23 +99,28 @@ struct CollectiveEpilogueFwd {
     using ShapeLSEPacked = std::conditional_t<!PackGQA, cute::Shape<int32_t, int32_t, int32_t, int32_t>, cute::Shape<cute::Shape<int32_t, int32_t>, int32_t, int32_t, int32_t>>;
     using StrideLSEPacked = std::conditional_t<!PackGQA, StrideLSE, cute::Stride<cute::Stride<int64_t, _1>, int64_t, int64_t, int64_t>>;
 
+#ifndef FLASHATTENTION_DISABLE_SM90
     using CopyOpR2S = std::conditional_t<
         ArchTag::kMinComputeCapability >= 90,
         // cute::SM90_U32x4_STSM_N if Element size is 2 bytes (fp16, bf16)
         decltype(cutlass::epilogue::collective::detail::sm90_get_smem_store_op_for_accumulator<StrideO, Element>()),
         AutoVectorizingCopyWithAssumedAlignment<128>
     >;
+#else
+    using CopyOpR2S = AutoVectorizingCopyWithAssumedAlignment<128>;
+#endif
     using SmemCopyAtomO = Copy_Atom<CopyOpR2S, Element>;
 
     // static constexpr size_t SmemAlignmentO = cutlass::detail::alignment_for_swizzle(SmemLayoutO{});
     // static_assert(SmemAlignmentO >= 128, "Require at least 128B alignment");
-    // struct TensorStorage : cute::aligned_struct<SmemAlignmentO> {
+    // struct CUTE_ALIGNAS(SmemAlignmentO) TensorStorage {
     //     cute::array_aligned<Element, Use_smem ? cute::cosize_v<SmemLayoutO> : 0, SmemAlignmentO> smem_o;
     // };
-    struct TensorStorage : cute::aligned_struct<128> {
+    struct CUTE_ALIGNAS(128) TensorStorage {
         cute::array_aligned<Element, Use_smem ? cute::cosize_v<SmemLayoutO> : 0> smem_o;
     };
 
+#ifndef FLASHATTENTION_DISABLE_SM90
     using TMA_O = std::conditional_t<
         Use_TMA_O,
         decltype(make_tma_copy(
@@ -113,6 +131,9 @@ struct CollectiveEpilogueFwd {
             _1{})),  // no mcast for O
         std::nullptr_t
     >;
+#else
+    using TMA_O = std::nullptr_t;
+#endif
 
     // Host side kernel arguments
     struct Arguments {
@@ -147,11 +168,15 @@ struct CollectiveEpilogueFwd {
     to_underlying_arguments(Arguments const& args) {
         Tensor mO = make_tensor(make_gmem_ptr(args.ptr_O), args.shape_O, args.stride_O);
         TMA_O tma_store_O = [&]{
+#ifndef FLASHATTENTION_DISABLE_SM90
             if constexpr (Use_TMA_O) {
                 return make_tma_copy(GmemTiledCopyOTMA{}, mO, SmemLayoutO{}, select<0, 2>(TileShape_MNK{}), _1{}); // no mcast
             } else {
                 return nullptr;
             }
+#else
+            return nullptr;
+#endif
         }();
         // If PackGQA, reshape O to be ((qhead_per_khead, seqlen_q), head_size, nhead_k, batch_size, num_splits)
         int const qhead_per_khead = !PackGQA ? 1 : cute::ceil_div(get<2>(args.shape_O), args.nheads_kv);
@@ -181,9 +206,11 @@ struct CollectiveEpilogueFwd {
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
     CUTLASS_DEVICE
     static void prefetch_tma_descriptors(Params const& params) {
+#ifndef FLASHATTENTION_DISABLE_SM90
         if constexpr (Use_TMA_O) {
             cute::prefetch_tma_descriptor(params.tma_store_O.get_tma_descriptor());
         }
+#endif
     }
 
     template <typename SharedStorage, typename FrgTensorO, typename FrgTensorLSE, typename TiledMma>
@@ -244,7 +271,11 @@ struct CollectiveEpilogueFwd {
         auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
         // (MMA,MMA_M,MMA_K)
         Tensor taccOcO = thread_mma.partition_C(cute::make_identity_tensor(select<0, 2>(TileShape_MNK{})));
+#ifdef USE_PPU
+        static_assert(decltype(size<0, 0>(taccOcO))::value == (ArchTag::kMinComputeCapability >= 89 ? 2 : 4));
+#else
         static_assert(decltype(size<0, 0>(taccOcO))::value == 2);
+#endif
         static_assert(decltype(size<0, 1>(taccOcO))::value == 2);
         Tensor taccOcO_rowcol = make_tensor(taccOcO.data(), flash::convert_layout_acc_rowcol(taccOcO.layout()));
         Tensor taccOcO_row = taccOcO_rowcol(_, _0{});
@@ -275,6 +306,7 @@ struct CollectiveEpilogueFwd {
             if (warp_idx_sync == NumEpilogueThreads / cutlass::NumThreadsPerWarp - 1) {
                 cutlass::arch::NamedBarrier::sync(NumEpilogueThreads + cutlass::NumThreadsPerWarp,
                                                   cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+#ifndef USE_PPU
                 if (cute::elect_one_sync()) {
                     cute::copy(params.tma_store_O, tOsO, tOgO);
                     tma_store_arrive();
@@ -284,6 +316,7 @@ struct CollectiveEpilogueFwd {
                         shared_storage.pipelines.barrier_O.arrive(cta_id);
                     }
                 }
+#endif
             }
         } else {  // Don't use TMA in Varlen case since we don't want to overwrite the output of another sequence
             Tensor mO = make_tensor(make_gmem_ptr(params.ptr_O + offset_o * get<0>(params.stride_O)), params.shape_O_packed, params.stride_O_packed)(_, _, bidh, !is_varlen ? bidb : 0, split_idx);
@@ -321,8 +354,13 @@ struct CollectiveEpilogueFwd {
             } else {
                 // We already arrived on barrier_O earlier
                 if constexpr (!PackGQA) {
+#ifdef USE_PPU
+                    static constexpr int kGmemElemsPerStoreDirect = ArchTag::kMinComputeCapability >= 89 ? 2 : 1;
+                    cute::Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<ArchTag::kMinComputeCapability >= 89 ? 128 : sizeof(Element) * 8>, Element> gmem_copy_direct;
+#else
                     static constexpr int kGmemElemsPerStoreDirect = 2;
                     cute::Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element> gmem_copy_direct;
+#endif
                     // Reshape acc from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
                     Tensor tOrO_rowcol = make_tensor(tOrO_out.data(), flash::convert_layout_acc_rowcol(tOrO.layout()));
                     Tensor tOrO_copy = cute::tiled_divide(tOrO_rowcol, Shape<_1, Int<kGmemElemsPerStoreDirect>>{});

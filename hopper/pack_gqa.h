@@ -1,4 +1,5 @@
 /******************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  ******************************************************************************/
 
@@ -30,7 +31,7 @@ struct PackGQAManager {
     // We assume threads loading the same row are in the same warp. This is for an optimization in PagedKV where
     // these threads share the same page table entry and share the work of computing pointers to paged K and paged V.
     static_assert(cutlass::NumThreadsPerWarp % kGmemThreadsPerRow == 0, "kGmemThreadsPerRow must divide NumThreadsPerWarp");
-    using GmemCopyAtomCpAsync = cute::Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<uint128_t>, Element>;
+    using GmemCopyAtomCpAsync = cute::Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<uint128_t>, Element>;
     using GmemLayoutAtom = Layout<Shape <Int<NumThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
                                   Stride<Int<kGmemThreadsPerRow>, _1>>;
     using GmemTiledCopyQCpAsync = decltype(
@@ -207,8 +208,13 @@ struct PackGQAManager {
                    int const thread_idx, int const seqlen_o, int const m_block
                  )
     {
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100 && defined(USE_PPU)
+        static constexpr int kGmemElemsPerStoreDirect = 1;
+        cute::Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<sizeof(Element) * 8>, Element> gmem_copy_direct;
+#else
         static constexpr int kGmemElemsPerStoreDirect = 2;
         cute::Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element> gmem_copy_direct;
+#endif
         // Reshape acc from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
         Tensor tOrO_rowcol = make_tensor(tOrO.data(), flash::convert_layout_acc_rowcol(tOrO.layout()));
         Tensor tOrO_copy = cute::tiled_divide(tOrO_rowcol, Shape<_1, Int<kGmemElemsPerStoreDirect>>{});

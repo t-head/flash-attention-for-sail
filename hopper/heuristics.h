@@ -1,4 +1,5 @@
 /******************************************************************************
+ * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  ******************************************************************************/
 
@@ -6,6 +7,17 @@
 
 #include <vector>
 
+#ifdef USE_PPU
+inline bool should_pack_gqa(bool varlen_q, int seqlen_q, int qhead_per_khead, int blockM_nopack, int blockM_pack) {
+    // If varlen, we don't actually know seqlen_q but only max_seqlen_q.
+    if (varlen_q) return true;
+    // Heuristic: PackGQA is a bit slower but can help if seqlen_q is small or not near a multiple of kBlockM
+    auto round_up = [](int a, int b) { return (a + b - 1) / b * b; };
+    float nopack_gqa_efficiency = float(seqlen_q) / float(round_up(seqlen_q, blockM_nopack));
+    float pack_gqa_efficiency = float(seqlen_q * qhead_per_khead) / float(round_up(seqlen_q * qhead_per_khead, blockM_pack));
+    return nopack_gqa_efficiency < 0.9 * pack_gqa_efficiency;
+};
+#else
 inline bool should_pack_gqa(bool varlen_q, int seqlen_q, int qhead_per_khead, int blockM) {
     // If varlen, we don't actually know seqlen_q but only max_seqlen_q.
     if (varlen_q) return true;
@@ -15,6 +27,7 @@ inline bool should_pack_gqa(bool varlen_q, int seqlen_q, int qhead_per_khead, in
     float pack_gqa_efficiency = float(seqlen_q * qhead_per_khead) / float(round_up(seqlen_q * qhead_per_khead, blockM));
     return nopack_gqa_efficiency < 0.9 * pack_gqa_efficiency;
 };
+#endif
 
 // Find the number of splits that maximizes the occupancy. For example, if we have
 // batch * n_heads = 48 and we have 108 SMs, having 2 splits (efficiency = 0.89) is
@@ -39,7 +52,14 @@ inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n
         efficiency.push_back(eff);
     }
     for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
+#ifdef USE_PPU
+        if (efficiency[num_splits - 1] >= 0.90 * max_efficiency) {
+            // minimize num_splits to reduce the overhead of combine kernel
+            int num_n_blocks_per_split = (num_n_blocks + num_splits - 1) / num_splits;
+            num_splits = (num_n_blocks + num_n_blocks_per_split - 1) / num_n_blocks_per_split;
+#else
         if (efficiency[num_splits - 1] >= 0.85 * max_efficiency) {
+#endif
             // printf("num_splits chosen = %d\n", num_splits);
             return num_splits;
         }
