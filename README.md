@@ -1,5 +1,5 @@
 # FlashAttention
-This repository provides the PPU implementation of FlashAttention-2 and FlashAttention-3 from the following papers.
+This repository provides the PPU implementation of FlashAttention-2 from the following papers.
 
 
 **FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness**
@@ -16,19 +16,21 @@ Paper: https://tridao.me/publications/flash2/flash2.pdf
 
 ![FlashAttention-2](assets/flashattention_logo.png)
 
-
-**FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision**
-Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, and Tri Dao
-
-Paper: https://arxiv.org/pdf/2407.08608
-
 ## FlashAttention PPU Support
 The PPU version of Flash Attention supports building from source or using the released wheel package.
 
 Currently released version supports:
 - FP16 / BF16: forward and backward pass
-- FP8: forward pass (FA3 only)
 - Head dimensions up to 256
+
+## PPU Backend Extensions and Optimizations
+
+The PPU version includes adaptation optimizations around data movement, TSM layout, Tensor Cell instructions, and the compilation backend, making FlashAttention-2 fit the PPU hardware characteristics more closely.
+
+- **AIU + Swizzle data path**: The PPU version routes the movement of tiled Q/K/V data through the AIU and applies a swizzle layout when writing to TSM / shared memory, reducing separate data reshuffling and shared memory access conflicts.
+- **PPU Tensor Cell mapping**: Matrix multiply-accumulate is organized as tiled MMA and mapped onto PPU Tensor Cell instructions, covering the FP16/BF16 forward and backward compute paths.
+- **Tile strategy tuning**: Block shape, warp layout, and shared memory tiling are tuned for basic scenarios such as head dimension, causal, and SplitKV, improving execution efficiency across different input shapes.
+- **Compilation options assisting backend orchestration**: The build parameters enable PPU/AIU support and configure HGCC backend optimization options such as register count and address sinking, helping the compiler better orchestrate memory access, register usage, and the compute pipeline.
 
 ## Build from Source
 
@@ -56,23 +58,8 @@ sh
 python setup.py install
 # Or:
 python setup.py bdist_wheel
-
-# If using Flash Attention 3:
-cd hopper
-python setup.py install
-# Or:
-python setup.py bdist_wheel
 ```
 
-
-
-**After installation, you can import it as follows:**
-
-
-```c++
-import flash_attn_interface
-flash_attn_interface.flash_attn_func()
-```
 
 
 ## How to use FlashAttention
@@ -249,9 +236,6 @@ To run the tests:
 ```
 sh
 pytest -q -s tests/test_flash_attn.py
-
-# If using Flash Attention 3:
-pytest -q -s hopper/test_flash_attn.py
 ```
 
 ## Issue Reporting
