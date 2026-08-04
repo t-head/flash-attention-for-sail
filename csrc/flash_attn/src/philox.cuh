@@ -14,7 +14,7 @@ struct ull2 {
 __forceinline__ __device__ uint2 mulhilo32(const unsigned int a, const unsigned int b) {
     uint2 *res;
     unsigned long long tmp;
-    asm ("mul.wide.u32 %0, %1, %2;\n\t"
+    asm ("ppu.mul.wide.u32 %0, %1, %2;\n\t"
           : "=l"(tmp)
           : "r"(a), "r"(b));
     res = (uint2*)(&tmp);
