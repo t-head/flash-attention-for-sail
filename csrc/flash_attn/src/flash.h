@@ -5,13 +5,10 @@
 
 #pragma once
 
-#ifdef __HGGCCC__
-#include <hggc_runtime.h>
-#else
-typedef struct HGstream_st* hggcStream_t;
-#endif
+#include <hggc.h>
 #include <vector>
-#include <ATen/cuda/CUDAGeneratorImpl.h>  // cuda-free PyTorch provides this
+
+#include <ATen/cuda/CUDAGeneratorImpl.h> // For at::Generator and at::PhiloxCudaState
 
 constexpr int TOTAL_DIM = 0;
 constexpr int H_DIM = 1;

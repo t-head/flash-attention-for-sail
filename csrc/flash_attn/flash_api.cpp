@@ -552,7 +552,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
 
     if (seqlen_k > 0) {
-        hggcStream_t stream = (hggcStream_t)at::cuda::getCurrentCUDAStream().stream();
+        auto stream = at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream);
     } else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
@@ -858,7 +858,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
 
     if (max_seqlen_k > 0) {
-        hggcStream_t stream = (hggcStream_t)at::cuda::getCurrentCUDAStream().stream();
+        auto stream = at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream, paged_KV);
     } else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
@@ -961,7 +961,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     // TORCH_CHECK(is_sm90 || is_sm8x || is_sm75, "FlashAttention only supports Turing GPUs or newer.");
 
     bool is_dropout = p_dropout > 0.0;
-    hggcStream_t stream = (hggcStream_t)at::cuda::getCurrentCUDAStream().stream();
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -1234,7 +1234,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     // We will support Turing in the near future
     // TORCH_CHECK(is_sm90 || is_sm8x || is_sm75, "FlashAttention only supports Turing GPUs or newer.");
     bool is_dropout = p_dropout > 0.0;
-    hggcStream_t stream = (hggcStream_t)at::cuda::getCurrentCUDAStream().stream();
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -1732,7 +1732,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     }
     ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
 
-    hggcStream_t stream = (hggcStream_t)at::cuda::getCurrentCUDAStream().stream();
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
     // Only split kernel supports appending to KV cache, or indexing to the cache with cache_batch_idx,
     // or paged KV cache
     run_mha_fwd(params, stream, /*force_split_kernel=*/k_.has_value() || cache_batch_idx_.has_value() || paged_KV);
