@@ -48,7 +48,7 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
     static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;
     static constexpr bool FP8_TransposeV = Is_FP8 && !V_colmajor;
 #ifdef USE_PPU
-    using ArchTag = std::conditional_t<Arch == 89, cutlass::arch::Sm89, cutlass::arch::Sm80>;
+    using ArchTag = std::conditional_t<Arch == 89, cutlass::arch::PPU0015, cutlass::arch::PPU0010>;
 #else
     using ArchTag = std::conditional_t<Arch >= 90, cutlass::arch::PPU0015, cutlass::arch::PPU0010>;
 #endif

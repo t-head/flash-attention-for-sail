@@ -125,17 +125,17 @@ public:
     to_underlying_arguments(Arguments const& args) {
         CUTLASS_TRACE_HOST("to_underlying_arguments():");
 
-        // Get SM count if needed, otherwise use user supplied SM count
-        int sm_count = args.hw_info.sm_count;
-        if (sm_count <= 0) {
-            CUTLASS_TRACE_HOST("  WARNING: Arguments do not include a valid SM count.\n"
-                "  For optimal performance, populate the arguments KernelHardwareInfo struct with the SM count.");
-            sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(args.hw_info.device_id);
+        // Get CU count if needed, otherwise use user supplied CU count
+        int cu_count = args.hw_info.cu_count;
+        if (cu_count <= 0) {
+            CUTLASS_TRACE_HOST("  WARNING: Arguments do not include a valid CU count.\n"
+                "  For optimal performance, populate the arguments KernelHardwareInfo struct with the CU count.");
+            cu_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(args.hw_info.device_id);
         }
 
-        CUTLASS_TRACE_HOST("to_underlying_arguments(): Setting persistent grid SM count to " << sm_count);
+        CUTLASS_TRACE_HOST("to_underlying_arguments(): Setting persistent grid CU count to " << cu_count);
 
-        cutlass::KernelHardwareInfo hw_info{args.hw_info.device_id, sm_count};
+        cutlass::KernelHardwareInfo hw_info{args.hw_info.device_id, cu_count};
         return {
             CollectiveMainloop::to_underlying_arguments(args.mainloop),
             CollectiveEpilogue::to_underlying_arguments(args.epilogue),
@@ -147,13 +147,13 @@ public:
     // Computes the kernel launch grid shape based on runtime parameters
     static dim3
     get_grid_shape(Params const& params) {
-        return TileScheduler::get_grid_shape(params.scheduler, params.hw_info.sm_count * MinBlocksPerMultiprocessor);
+        return TileScheduler::get_grid_shape(params.scheduler, params.hw_info.cu_count * MinBlocksPerMultiprocessor);
     }
 
 #ifdef USE_PPU
     static dim3
     get_grid_shape(Params const& params, int blocks_per_sm) {
-        return TileScheduler::get_grid_shape(params.scheduler, params.hw_info.sm_count * (blocks_per_sm <= 1 ? MinBlocksPerMultiprocessor : blocks_per_sm));
+        return TileScheduler::get_grid_shape(params.scheduler, params.hw_info.cu_count * (blocks_per_sm <= 1 ? MinBlocksPerMultiprocessor : blocks_per_sm));
     }
 #endif
 

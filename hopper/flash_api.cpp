@@ -954,7 +954,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
 #endif
     if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
-        hggcStream_t stream = (hggcStream_t)at::cuda::getCurrentCUDAStream().stream();
+        auto stream = at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream);
         if (params.num_splits > 1) {
             if (out_type == at::ScalarType::BFloat16) {
@@ -1324,7 +1324,7 @@ std::vector<at::Tensor> mha_bwd(
     #endif
 
     if (total_q > 0 && total_k > 0 && num_heads_k > 0) {
-        hggcStream_t stream = (hggcStream_t)at::cuda::getCurrentCUDAStream().stream();
+        auto stream = at::cuda::getCurrentCUDAStream().stream();
         run_mha_bwd(params, stream);
     } else if (total_k > 0 && num_heads_k > 0) {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
@@ -1429,7 +1429,7 @@ mha_combine(const at::Tensor &out_partial,         // num_splits x batch_size x 
     params.o_batch_stride = out.stride(0);
 
     if (seqlen > 0 && batch_size > 0) {
-        hggcStream_t stream = (hggcStream_t)at::cuda::getCurrentCUDAStream().stream();
+        auto stream = at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd_combine(params, stream);
     }
 

@@ -9,14 +9,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#if defined(USE_CLANG)
 #include <hggc_fp16.h>
-#include <hggc_bf16.h>
-#else
-#include <hggc_fp16.h>
+
 #if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 100
 #include <hggc_bf16.h>
-#endif
 #endif
 
 #include <cute/tensor.hpp>

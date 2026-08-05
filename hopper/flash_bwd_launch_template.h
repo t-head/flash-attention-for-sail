@@ -40,7 +40,7 @@ void run_flash_bwd(Flash_bwd_params &params, hggcStream_t stream) {
     static_assert(!(Is_causal && Is_local), "Is_causal and Is_local cannot be true at the same time.");
     using ElementAccum = float;
 #ifdef USE_PPU
-    using ArchTag = std::conditional_t<Arch == 89, cutlass::arch::Sm89, cutlass::arch::Sm80>;
+    using ArchTag = std::conditional_t<Arch == 89, cutlass::arch::PPU0015, cutlass::arch::PPU0010>;
 #else
     using ArchTag = std::conditional_t<Arch >= 90, cutlass::arch::PPU0015, cutlass::arch::PPU0010>;
 #endif
