@@ -864,6 +864,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm8x = dprops->major >= 8;
     bool is_sm89 = (dprops->major == 8) && (dprops->minor == 9);
+    bool is_fp8 = q.scalar_type() == at::ScalarType::Float8_e4m3fn;
     TORCH_CHECK(is_sm8x, "FlashAttention only supports Ampere GPUs or newer.");
 
     auto q_type = q.scalar_type();
@@ -1211,13 +1212,13 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     params.use_kblockm_128 =
         (params.is_varlen_q &&
          ((params.d_rounded <= 128 && 1.0 * params.total_q / params.b > 64) ||
-          (params.arch == 89 && params.d_rounded == 192 && params.h == params.h_k && params.seqlen_q == params.seqlen_k && params.is_causal && 1.0 * params.total_q / params.b > 704)
+          (params.arch == 89 && params.d_rounded == 192 && ((params.h == params.h_k && params.seqlen_q == params.seqlen_k) || is_fp8) && params.is_causal && 1.0 * params.total_q / params.b > 704)
          )
         ) ||
         (!params.is_varlen_q &&
          params.b * (params.pack_gqa ? params.h_k : params.h) * ((params.seqlen_q * (params.pack_gqa ? params.h / params.h_k : 1) + 127) / 128) / params.num_sm >= 8 &&
          ((params.d_rounded <= 128 && params.seqlen_q > (params.is_causal ? 704 : 64)) ||
-          (params.arch == 89 && params.d_rounded == 192 && params.h == params.h_k && params.seqlen_q == params.seqlen_k && params.is_causal && params.seqlen_q > 704)
+          (params.arch == 89 && params.d_rounded == 192 && ((params.h == params.h_k && params.seqlen_q == params.seqlen_k) || is_fp8) && params.is_causal && params.seqlen_q > 704)
          )
         );   // 704 is an empirical threshold.
 #endif

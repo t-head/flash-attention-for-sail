@@ -26,6 +26,7 @@
 
 #ifdef USE_PPU
 #include "ppu_include.hpp"
+#include <cute/arch/copy_ppu.hpp>
 #endif
 #if !USE_AIU
 #define make_mix_tensor make_tensor
@@ -33,6 +34,24 @@
 #endif
 #ifdef USE_PPU
 #include "acc_vreg_fraga.h"
+#endif
+
+#ifdef USE_PPU
+// Epilogue-only twin of the PPU1.5 FP8 MMA atom with a permuted CLayout that
+// matches the pi_n column order produced by the zero-shfl V-direct PV path
+// (after flash::permute_output_fp8): lane (q=lane%4, p=lane/4) register slot
+// d[v0+2*v1+4*v2] holds (m = p+8*v1, n = 4*q + v0 + 2*v2) instead of the
+// standard (m = p+8*v1, n = 2*q + v0 + 8*v2). Never execute MMA through this
+// atom; it only re-interprets accumulator coordinates for the epilogue.
+namespace cute {
+struct PPU0015_16x16x32_F32E4M3E4M3F32_TN_EpiPerm : PPU0015_16x16x32_F32E4M3E4M3F32_TN {};
+template <>
+struct MMA_Traits<PPU0015_16x16x32_F32E4M3E4M3F32_TN_EpiPerm>
+    : MMA_Traits<PPU0015_16x16x32_F32E4M3E4M3F32_TN> {
+  using CLayout = Layout<Shape <Shape < _4,_8>,Shape < _2,_2,_2>>,
+                         Stride<Stride<_64,_1>,Stride<_16,_8,_32>>>;
+};
+} // namespace cute
 #endif
 
 namespace flash {
@@ -530,6 +549,8 @@ CUTLASS_DEVICE void gemm_rs_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Ten
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 #ifdef USE_PPU
 template<int kBlockN, int kBlockNPagedPerAiuLoad, int kHeadDim, int kBlockKSmem,
          typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
@@ -561,6 +582,141 @@ CUTLASS_DEVICE void gemm_rs_sm80_kv_paged_aiu(Tensor0 &acc, Tensor1 &tCrA, Tenso
         #pragma unroll
         for (int j = 0; j < kBlockNPagedPerAiuLoad / 16; ++j) {
             cute::gemm(tiled_mma, tCrA(_, _, i * (kBlockNPagedPerAiuLoad / 16) + j), tCrB(_, _, i * (kBlockNPagedPerAiuLoad / 16) + j), acc);
+        }
+    }
+    }
+}
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// FP8 PV: register-direct V load, zero-shfl pi_k/pi_n permutation scheme.
+//
+// Device-measured hardware truths (PPU1.5, hopper/test_tsm_trans_semantics.cu):
+//   * TSM `ppu.tc02.ldmatrix.swzl.sync.bulk.tensor.m8n8.x4.b16.trans` request
+//     (coord_h=kv0, coord_w=w0 in b16 units, cube ic) on the cube-blocked raw
+//     sV tile ([NCUBE][kBlockN][kBlockKGmem] e4m3, as written by the AIU g2s
+//     load) delivers to lane (q=lane%4, p=lane/4):
+//       r0 = {V[kv0+2q][2t], V[kv0+2q][2t+1], V[kv0+2q+1][2t], V[kv0+2q+1][2t+1]}
+//       with t = ic*(CUBE_W) + w0 + p; r1: kv+8; r2: t+8; r3: kv+8 and t+8.
+//   * One x4 request covers a 16-row x 16-b16-col (32B) window that must lie
+//     fully inside its cube (coord_h+16<=CUBE_H, coord_w+16<=CUBE_W), so
+//     requests are issued per n-tile PAIR (j0=32*np): r0/r1 serve the even
+//     n-tile, r2/r3 the odd one. The TSM bulk address must be warp-uniform.
+//   * MMA m16n16k32 e4m3 fragment layouts (measured):
+//       A(lane u32 j, byte kq) = (m=p+8*(j&1), k=4q+kq+16*(j>>1))
+//       B(lane u32 w, byte kq) = (k=4q+kq+16*(w&1), n=p+8*(w>>1))
+//       C(lane d[v0+2v1+4v2])  = (m=p+8*v1, n=2q+v0+8*v2)
+//
+// pi_k/pi_n framework: the reduction axis (k) may be permuted freely as long
+// as A and B carry the same real k at every (lane,reg,byte) slot; the n axis
+// may be permuted if the accumulator is un-permuted once at the end.
+//   pi_k: slot k=4q+kq (+16 for j>>1 / w&1) carries real k = 2q+(kq&1)+8*(kq>>1)
+//         (+16 for the high half). A (permute_Cregs_fp8 + the plain
+//         convert_layout_acc_Aregs view, see mainloop_fwd_sm80.hpp) and B
+//         (below) agree on this slot-for-slot, so the MMA sum is exact.
+//   pi_n: slot n=p carries real n=2*(t0+p), slot n=p+8 carries real
+//         n=2*(t0+p)+1 (t0 = n16-tile base in b16 units). The accumulator then
+//         holds columns {4q,4q+2,4q+1,4q+3} at d{d0,d1,d4,d5};
+//         permute_output_fp8 (d1<->d4, d3<->d6) sorts them into
+//         n = 4q+v0+2*v2, which the epilogue consumes through the permuted
+//         CLayout atom PPU0015_16x16x32_F32E4M3E4M3F32_TN_EpiPerm.
+//
+// Assembly (per n-tile pair, kv0=32*mk, j0=32*np), lane (q,p), h in {0,1}
+// selecting n-tile mn=2*np+h, requests A(kv0)/B(kv0+16):
+//   w0 = byte_perm(rA[2h], rA[2h+1], 0x6420)  // real k {2q,2q+1,2q+8,2q+9}, real n=2t
+//   w1 = byte_perm(rB[2h], rB[2h+1], 0x6420)  // same, k+16
+//   w2 = byte_perm(rA[2h], rA[2h+1], 0x7531)  // real n=2t+1
+//   w3 = byte_perm(rB[2h], rB[2h+1], 0x7531)  // same, k+16
+// Cost per n-tile: 1 TSM_LD_SWZL + 4 byte_perm, zero shfl/sel
+// (per n-tile pair: 2 TSM_LD_SWZL + 8 byte_perm).
+//
+// Issue granularity: the MMAs are emitted PER N-TILE (atom-granular) right
+// after that tile's B fragment is assembled, not in one batch over the full
+// N width. Live B registers drop from MMA_N*4 u32 (64 for hdim256) to ~8 u32
+// (one TSM pair rA/rB + one assembled fragment), and the compiler is free to
+// software-pipeline the next pair's TSM loads against the in-flight MMAs.
+// The mk loop stays outermost so every (m,n) accumulator sees ascending k.
+//
+// UseTsmLd selects the smem read instruction:
+//   true  (non-paged / paged-AIU): TSM ldmatrix.swzl b16.trans on the
+//          cube-blocked raw tile written by the AIU g2s load.
+//   false (paged non-AIU): plain ldmatrix.x4.trans (PPU_U16x8_LDSM_T) with
+//          per-lane row addresses evaluated through SmemLayoutVRaw (the raw
+//          XOR-swizzle row layout; its swizzle permutes whole 16B chunks
+//          only, so j0 %% 16 == 0 addresses are 16B-aligned chunk starts).
+//          Per (mk, np), lane l issues two x4 loads at &sV(32mk+l, j0) and
+//          &sV(32mk+l, j0+16) and remaps the halves to the TSM pair:
+//            rA = {ldA0, ldA1, ldB0, ldB1}, rB = {ldA2, ldA3, ldB2, ldB3}.
+//          Device-verified byte-for-byte identical to the TSM pair
+//          (hopper/test_tsm_trans_semantics.cu phase 5, all four tiles).
+//          The byte_perm assembly + per-atom MMA emission below is shared.
+#ifdef USE_PPU
+template<int kBlockN, int kHeadDimV, int kBlockKGmem,
+         bool UseTsmLd, typename SmemLayoutVRaw,
+         typename Tensor0, typename Tensor1, typename Tensor2, typename TiledMma>
+CUTLASS_DEVICE void gemm_rs_sm80_pv_fp8_vdirect(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB,
+                                                void *smem_v, int stage, TiledMma tiled_mma) {
+    static_assert(kBlockN % 32 == 0 && kHeadDimV % 32 == 0 && kHeadDimV % kBlockKGmem == 0);
+    static_assert(decltype(size<1>(tCrB))::value == kHeadDimV / 16, "tCrB MMA_N mismatch");
+    static_assert(decltype(size<2>(tCrB))::value == kBlockN / 32, "tCrB MMA_K mismatch");
+    static_assert(decltype(size<2>(tCrA))::value == kBlockN / 32, "tCrA MMA_K mismatch");
+    // b16 element view of the raw sV cube: CUBE_W in b16 units = kBlockKGmem/2.
+    using TsmOp = cute::PPU0015_TSM_LD_SWZL<cute::bfloat16_t, kBlockN, kBlockKGmem / 2,
+                                            true /*Swap*/, true /*Trans*/, kHeadDimV / kBlockKGmem>;
+    constexpr int MMA_K = kBlockN / 32;
+    constexpr int MMA_NP = kHeadDimV / 32;  // n-tiles processed in pairs
+    Tensor tCrB32 = cute::recast<uint32_t>(tCrB);
+    CUTE_STATIC_ASSERT_V(size<0>(tCrB32) == Int<4>{});
+    // Raw b8 view of sV for the LDSM_T path (type-identical to SmemLayoutV in
+    // the paged non-AIU FP8 instantiation this path is compiled for).
+    Tensor sVraw = make_tensor(make_smem_ptr(reinterpret_cast<uint8_t const*>(smem_v)), SmemLayoutVRaw{});
+    const int lane = threadIdx.x % 32;
+    #pragma hggc mmatiestrictly
+    {
+    #pragma unroll
+    for (int mk = 0; mk < MMA_K; ++mk) {
+        #pragma unroll
+        for (int np = 0; np < MMA_NP; ++np) {
+            const int j0 = 32 * np;
+            uint32_t rA[4], rB[4];
+            if constexpr (UseTsmLd) {
+                const int cube = j0 / kBlockKGmem;
+                const int wcoord = (j0 % kBlockKGmem) / 2;  // b16 units
+                TsmOp::copy(rA, smem_v, /*coord_h=*/32 * mk,      /*coord_w=*/wcoord, cube, stage);
+                TsmOp::copy(rB, smem_v, /*coord_h=*/32 * mk + 16, /*coord_w=*/wcoord, cube, stage);
+            } else {
+                const int kv0 = 32 * mk;
+                uint32_t ldA[4], ldB[4];
+                const uint8_t* addrA = &sVraw(kv0 + lane, j0,      stage);
+                const uint8_t* addrB = &sVraw(kv0 + lane, j0 + 16, stage);
+                cute::PPU_U16x8_LDSM_T::copy(*reinterpret_cast<cute::uint128_t const*>(addrA),
+                                             ldA[0], ldA[1], ldA[2], ldA[3]);
+                cute::PPU_U16x8_LDSM_T::copy(*reinterpret_cast<cute::uint128_t const*>(addrB),
+                                             ldB[0], ldB[1], ldB[2], ldB[3]);
+                // Remap the two 32-row x 16B LDSM results to the TSM pair:
+                // rA serves rows kv0..kv0+15, rB rows kv0+16..kv0+31, both
+                // covering byte cols j0..j0+31 (r2/r3 = the j0+16 halves).
+                rA[0] = ldA[0]; rA[1] = ldA[1]; rA[2] = ldB[0]; rA[3] = ldB[1];
+                rB[0] = ldA[2]; rB[1] = ldA[3]; rB[2] = ldB[2]; rB[3] = ldB[3];
+            }
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int mn = 2 * np + h;
+                // Zero-shfl pi_k/pi_n B-fragment assembly (see header comment).
+                tCrB32(0, mn, mk) = __byte_perm(rA[2 * h + 0], rA[2 * h + 1], 0x6420u);
+                tCrB32(1, mn, mk) = __byte_perm(rB[2 * h + 0], rB[2 * h + 1], 0x6420u);
+                tCrB32(2, mn, mk) = __byte_perm(rA[2 * h + 0], rA[2 * h + 1], 0x7531u);
+                tCrB32(3, mn, mk) = __byte_perm(rB[2 * h + 0], rB[2 * h + 1], 0x7531u);
+                // Emit the 16x16x32 atom MMA(s) for this n-tile immediately:
+                // rank-1 fragment slices hit cute::gemm dispatch [1] (V)x(V)->(V)
+                // which forwards straight to MMA_Atom::call. The (mn, mk) B slot
+                // is dead right after the call, so the compiler can recycle its
+                // registers instead of keeping the whole N width live.
+                #pragma unroll
+                for (int m = 0; m < size<1>(acc); ++m) {
+                    cute::gemm(tiled_mma, tCrA(_, m, mk), tCrB(_, mn, mk), acc(_, m, mn));
+                }
+            }
         }
     }
     }

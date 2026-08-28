@@ -46,6 +46,10 @@ public:
     using TileShape_MNK = typename CollectiveMainloop::TileShape_MNK;
     using TileShape_MNK_PV = typename CollectiveMainloop::TileShape_MNK_PV;
     using TiledMma = typename CollectiveMainloop::TiledMma;
+    // Epilogue MMA view: same as TiledMma except on the zero-shfl FP8
+    // V-direct path, where it carries the pi_n-permuted CLayout so O columns
+    // land correctly (see CollectiveMainloop::TiledMmaOPerm).
+    using TiledMmaEpilogue = typename CollectiveMainloop::TiledMmaOPerm;
     using ArchTag = typename CollectiveMainloop::ArchTag;
     using MainloopArguments = typename CollectiveMainloop::Arguments;
     using MainloopParams = typename CollectiveMainloop::Params;
@@ -259,7 +263,7 @@ public:
             scheduler.prefetch_next_work(params.scheduler, work_tile_info);
             if (tile_valid) {
                 // if (threadIdx.x == 128) { printf("Before epilogue, bid.x = %d, bid.y = %d, bid.z = %d, m_block = %d, bidb = %d, split_idx = %d\n", blockIdx.x, blockIdx.y, blockIdx.z, m_block, bidb, split_idx); }
-                epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, tiled_mma,
+                epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, TiledMmaEpilogue{},
                                threadIdx.x, block_coord);
             } else {
                 // Write 0 to gO and -inf to gLSE.
