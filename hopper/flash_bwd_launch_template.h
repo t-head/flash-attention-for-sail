@@ -406,7 +406,18 @@ void run_mha_bwd_hdim128(Flash_bwd_params &params, hggcStream_t stream) {
         if constexpr (Arch == 80) {
             run_mha_bwd_dispatch<Arch, T, 64, 96, 128, Is_causal, Is_local, Has_softcap, 1, 2, false, false, false, 2, 4, 2, 2, false>(params, stream);
         } else {
-            run_mha_bwd_dispatch<Arch, T, 48, 128, 128, Is_causal, Is_local, Has_softcap, 1, 2, false, false, false, 2, 1, 2, 1, false>(params, stream);
+            // The kBlockN=128 tile turns on the CVT + swizzled smem load path (Use_CVT_SWZL_LD in
+            // mainloop_bwd_sm80.hpp), whose 8x64 AIU tile descriptor carries no headdim boundary:
+            // it always reads kHeadDim columns per row.  That is only correct when the real headdim
+            // of Q/K (params.d) and of dO/V (params.dv) both equal kHeadDim, otherwise the copy
+            // bleeds into the neighbouring heads.  Fall back to the CVT-off tile in that case
+            // (e.g. headdim 64 with headdim_v 128).  flash_api.cpp mirrors this condition when it
+            // computes kBlockM / kBlockN.
+            if (params.d == 128 && params.dv == 128) {
+                run_mha_bwd_dispatch<Arch, T, 48, 128, 128, Is_causal, Is_local, Has_softcap, 1, 2, false, false, false, 2, 1, 2, 1, false>(params, stream);
+            } else {
+                run_mha_bwd_dispatch<Arch, T, 64, 96, 128, Is_causal, Is_local, Has_softcap, 1, 2, false, false, false, 2, 4, 2, 2, false>(params, stream);
+            }
         }
 #else
         if constexpr (Arch >= 90) {
@@ -452,7 +463,14 @@ void run_mha_bwd_hdim256(Flash_bwd_params &params, hggcStream_t stream) {
         if constexpr (Arch == 80) {
             run_mha_bwd_dispatch<Arch, T, 64, 64, 256, Is_causal, Is_local, Has_softcap, 1, 1, false, false, false, 2, 4, 2, 2, false>(params, stream);
         } else {
-            run_mha_bwd_dispatch<Arch, T, 64, 128, 256, Is_causal, Is_local, Has_softcap, 1, 1, false, false, false, 4, 2, 2, 2, false>(params, stream);
+            // Same CVT headdim requirement as hdim128 above: the kBlockN=128 tile only works when
+            // params.d == params.dv == kHeadDim, so fall back to the CVT-off tile otherwise
+            // (e.g. headdim 64 with headdim_v 256).
+            if (params.d == 256 && params.dv == 256) {
+                run_mha_bwd_dispatch<Arch, T, 64, 128, 256, Is_causal, Is_local, Has_softcap, 1, 1, false, false, false, 4, 2, 2, 2, false>(params, stream);
+            } else {
+                run_mha_bwd_dispatch<Arch, T, 64, 64, 256, Is_causal, Is_local, Has_softcap, 1, 1, false, false, false, 2, 4, 2, 2, false>(params, stream);
+            }
         }
 #else
         if constexpr (Arch >= 90) {

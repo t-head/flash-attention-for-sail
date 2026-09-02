@@ -1707,15 +1707,22 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     //      128       64,  96            48, 128
     //      192       64,  64           128, 128
     //      256       64,  64            64, 128
+    // The Arch >= 89 hdim128 / hdim256 tiles (kBlockN == 128) turn on the CVT + swizzled smem load
+    // path, which always reads kHeadDim (== head_size_rounded) columns per row and is therefore only
+    // valid when the real headdim of Q/K and of dO/V both equal head_size_rounded.  When they don't
+    // (e.g. head_size 64 with head_size_v 256), run_mha_bwd_hdim128 / run_mha_bwd_hdim256 fall back
+    // at runtime to the Arch == 80 tile, so mirror that fallback here too.
     bool const is_arch80 = arch == 80;
+    bool const use_cvt_tiles = !is_arch80 && head_size == head_size_rounded && head_size_v == head_size_rounded;
     int const kBlockM = head_size_rounded <= 64 ? 128
         : (head_size_rounded <= 96 ? 64
-           : (head_size_rounded <= 128 ? (is_arch80 ? 64 : 48)
+           : (head_size_rounded <= 128 ? (use_cvt_tiles ? 48 : 64)
               : (head_size_rounded <= 192 ? (is_arch80 ? 64 : 128) : 64)));
     int const kBlockN = head_size_rounded <= 64 ? 64
         : (head_size_rounded <= 96 ? 128
-           : (head_size_rounded <= 128 ? (is_arch80 ? 96 : 128)
-              : (is_arch80 ? 64 : 128)));  // hdim192 and hdim256 share the same (M,N)
+           : (head_size_rounded <= 128 ? (use_cvt_tiles ? 128 : 96)
+              : (head_size_rounded <= 192 ? (is_arch80 ? 64 : 128)
+                 : (use_cvt_tiles ? 128 : 64))));
     // One dispatch per (headdim, arch), so the semaphore block counts use the same tiles.
     int const kBlockM_min = kBlockM;
     int const kBlockN_min = kBlockN;
@@ -1830,9 +1837,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     // When seqlen is not divisible by kBlockM/kBlockN, the last tile reads past
     // the end of the tensor, causing IMA. Padding ensures OOB reads land in
     // valid (allocated) memory.
-    // Only enable on sm89 with hdim128/256 (the CVT path is only used there).
+    // Only enable on sm89 with hdim128/256 and when the CVT tiles are actually used (see
+    // use_cvt_tiles above): with a mismatched headdim the kernel falls back to a CVT-off tile,
+    // which has a proper boundary desc and needs no padding.
 #if defined(USE_PPU) && USE_AIU
-    bool const enable_bwd_seqlen_padding = (arch == 89) && (head_size == 128 || head_size == 256);
+    bool const enable_bwd_seqlen_padding = (arch == 89) && use_cvt_tiles && (head_size_rounded == 128 || head_size_rounded == 256);
     if (enable_bwd_seqlen_padding && total_q > 0) {
         if (is_varlen_q) {
             int const total_q_padded = total_q + kBlockM;
