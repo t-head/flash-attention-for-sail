@@ -14,7 +14,7 @@ namespace flash {
 
 using namespace cute;
 
-template <int kBlockM, int kBlockN, bool PackGQA, typename TiledMma, bool SwapAB=false>
+template <int kBlockM, int kBlockN, bool PackGQA, typename TiledMma, bool SwapAB=false, bool Is_QSA=false>
 struct Mask {
 
     static_assert(!(PackGQA && SwapAB), "Cannot be both PackGQA and SwapAB");
@@ -83,7 +83,7 @@ struct Mask {
                 int mma_m_idx;
                 // Might get OOB but it's ok since we'll check it later
                 if constexpr (PackGQA) {
-                    mma_m_idx = qhead_per_khead_divmod.divide(m_block * kBlockM + get<Row>(tScS_rowcol(thread_idx % kMmaThreadsPerRow, _0{})));
+                    mma_m_idx = Is_QSA ? m_block : qhead_per_khead_divmod.divide(m_block * kBlockM + get<Row>(tScS_rowcol(thread_idx % kMmaThreadsPerRow, _0{})));
                 }
                 int const causal_row_offset = 1 + seqlen_k - n_block * kBlockN - seqlen_q - thread_col_offset;
                 if constexpr (Causal_mask) {

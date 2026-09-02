@@ -148,7 +148,7 @@ public:
 ///////////////////////////////////////////////////////////////////////////////
 
 #ifdef USE_PPU
-template<bool Varlen=false, bool Split=false, bool PackGQA=false, int kBlock=128>
+template<bool Varlen=false, bool Split=false, bool PackGQA=false, int kBlock=128, bool Is_QSA=false>
 class DynamicPersistentTileSchedulerSM80 {
 
 public:
@@ -206,7 +206,7 @@ public:
             if constexpr (IsExVarlenQ) {
                 if (bidb >= params.num_batch) return false;
                 int seqlen = params.seqused ? __ld_smem(&params.seqused[bidb]) : (params.cu_seqlens ? __ld_smem(&params.cu_seqlens[bidb + 1]) - __ld_smem(&params.cu_seqlens[bidb]): params.seqlen);
-                int num_blocks = cute::ceil_div((PackGQA ? params.qhead_per_khead : 1) * seqlen, kBlock);
+                int num_blocks = Is_QSA ? seqlen : cute::ceil_div((PackGQA ? params.qhead_per_khead : 1) * seqlen, kBlock);
                 #pragma clang loop licm(disable)
                 while (tile_idx < tile_idx_next) {
                     int tile_idx_distance = tile_idx_next - tile_idx;
@@ -218,7 +218,7 @@ public:
                         split_idx = 0;
                         block_idx = 0;
                         seqlen = params.seqused ? __ld_smem(&params.seqused[bidb]) : (params.cu_seqlens ? __ld_smem(&params.cu_seqlens[bidb + 1]) - __ld_smem(&params.cu_seqlens[bidb]): params.seqlen);
-                        num_blocks = cute::ceil_div((PackGQA ? params.qhead_per_khead : 1) * seqlen, kBlock);
+                        num_blocks = Is_QSA ? seqlen : cute::ceil_div((PackGQA ? params.qhead_per_khead : 1) * seqlen, kBlock);
                     } else {
                         tile_idx += tile_idx_distance;
                         int bidh_append, block_idx_append, split_idx_append;
@@ -257,7 +257,7 @@ public:
             }
             if constexpr (IsNotExVarlenQ) {
                 int seqlen = params.seqused ? __ld_smem(&params.seqused[bidb]) : (params.cu_seqlens ? __ld_smem(&params.cu_seqlens[bidb + 1]) - __ld_smem(&params.cu_seqlens[bidb]): params.seqlen);
-                return is_empty_tile || (block_idx * kBlock >= (PackGQA ? params.qhead_per_khead : 1) * seqlen);
+                return is_empty_tile || (Is_QSA ? (block_idx >= seqlen) : (block_idx * kBlock >= (PackGQA ? params.qhead_per_khead : 1) * seqlen));
             } else {
                 return is_empty_tile;
             }
@@ -267,7 +267,7 @@ public:
         cute::tuple<int32_t, int32_t, int32_t, int32_t>
         get_block_coord(Params const& params) const {
             int seqlen = params.seqused ? __ld_smem(&params.seqused[bidb]) : (params.cu_seqlens ? __ld_smem(&params.cu_seqlens[bidb + 1]) - __ld_smem(&params.cu_seqlens[bidb]): params.seqlen);
-            int num_blocks = cute::ceil_div((PackGQA ? params.qhead_per_khead : 1) * seqlen, kBlock);
+            int num_blocks = Is_QSA ? seqlen : cute::ceil_div((PackGQA ? params.qhead_per_khead : 1) * seqlen, kBlock);
             int block_idx_reversed = block_idx < num_blocks ? num_blocks - 1 - block_idx : block_idx;   // take the longest worktile (bigger block_idx when causal=true) for the free worker.
             if constexpr (!Split) {
                 return {block_idx_reversed, bidh, bidb, 0 /*split_idx*/};
@@ -316,8 +316,8 @@ public:
 };
 template<typename T>
 struct is_instantiation_of_DynamicPersistentTileSchedulerSM80 : std::false_type {};
-template<bool Varlen, bool Split, bool PackGQA, int kBlock>
-struct is_instantiation_of_DynamicPersistentTileSchedulerSM80<DynamicPersistentTileSchedulerSM80<Varlen, Split, PackGQA, kBlock>> : std::true_type {};
+template<bool Varlen, bool Split, bool PackGQA, int kBlock, bool Is_QSA>
+struct is_instantiation_of_DynamicPersistentTileSchedulerSM80<DynamicPersistentTileSchedulerSM80<Varlen, Split, PackGQA, kBlock, Is_QSA>> : std::true_type {};
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////

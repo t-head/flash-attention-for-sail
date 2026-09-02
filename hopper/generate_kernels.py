@@ -66,6 +66,28 @@ template void run_mha_fwd_<86, {DTYPE}, {HEAD_DIM}, {HEAD_DIM_V}, {SPLIT}, {PAGE
 #endif
 """
 
+# QSA (query-sparse attention) reuses the paged-KV kernels with Is_QSA=true. It is only verified
+# for head dim 256 bf16/fp16, so only those kernels get the extra instantiation, behind an opt-in macro.
+KERNEL_IMPL_TEMPLATE_FWD_SM8x_PAGED_QSA = """#include "flash_fwd_launch_template.h"
+
+#ifndef FLASHATTENTION_DISABLE_SM8x
+#ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
+template void run_mha_fwd_<80, {DTYPE}, {HEAD_DIM}, {HEAD_DIM_V}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}>(Flash_fwd_params &params, cudaStream_t stream);
+template void run_mha_fwd_<89, {DTYPE}, {HEAD_DIM}, {HEAD_DIM_V}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}>(Flash_fwd_params &params, cudaStream_t stream);
+#ifndef FLASHATTENTION_DISABLE_SM86
+template void run_mha_fwd_<86, {DTYPE}, {HEAD_DIM}, {HEAD_DIM_V}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}>(Flash_fwd_params &params, cudaStream_t stream);
+#endif
+#ifdef FLASHATTENTION_ENABLE_QSA
+template void run_mha_fwd_<80, {DTYPE}, {HEAD_DIM}, {HEAD_DIM_V}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}, true>(Flash_fwd_params &params, cudaStream_t stream);
+template void run_mha_fwd_<89, {DTYPE}, {HEAD_DIM}, {HEAD_DIM_V}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}, true>(Flash_fwd_params &params, cudaStream_t stream);
+#ifndef FLASHATTENTION_DISABLE_SM86
+template void run_mha_fwd_<86, {DTYPE}, {HEAD_DIM}, {HEAD_DIM_V}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}, true>(Flash_fwd_params &params, cudaStream_t stream);
+#endif
+#endif
+#endif
+#endif
+"""
+
 KERNEL_IMPL_TEMPLATE_BWD_SM90 = """#include "flash_bwd_launch_template.h"
 
 #ifndef FLASHATTENTION_DISABLE_SM90
@@ -135,7 +157,10 @@ class Kernel:
                 )
             else:
                 packgqa = self.packgqa or self.split
-                return KERNEL_IMPL_TEMPLATE_FWD_SM8x.format(
+                template = (KERNEL_IMPL_TEMPLATE_FWD_SM8x_PAGED_QSA
+                            if self.paged_kv and self.head_dim == 256
+                            else KERNEL_IMPL_TEMPLATE_FWD_SM8x)
+                return template.format(
                     DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim, HEAD_DIM_V=self.head_dim_v,
                     SPLIT=str(self.split).lower(), PAGEDKV=str(self.paged_kv).lower(),
                     SOFTCAP=str(self.softcap).lower(), PACKGQA=str(packgqa).lower()

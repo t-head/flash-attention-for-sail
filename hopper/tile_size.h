@@ -85,7 +85,7 @@ constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_ppu(
         bool paged_kv=false, bool varlen=false, bool split=false,
         bool softcap=false, bool append_kv=false, bool pack_gqa = false,
         bool kBlockM128=false, bool kBlockM16=false, bool kBlockN16=false,
-        bool PagedKVAiu=false) {
+        bool PagedKVAiu=false, bool is_qsa=false) {
     if (element_size == 2) {
         bool const vreg_strain = paged_kv || pack_gqa || varlen || is_local;
         if (kBlockM16) {
@@ -131,7 +131,10 @@ constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_ppu(
                 return {128, 64, 8, 1, true};
             }
         } else {
-            return {64, arch == 89 ? 48 : 32, 4, 1, true};
+            // One m_block covers only qhead_per_khead rows, so a narrower kBlockM wastes fewer.
+            // kBlockN must stay at the AIU per-load granularity that SmemCopyOpK is built on.
+            return is_qsa ? std::tuple<int, int, int, int, bool>{32, 16, 2, 1, true}
+                          : std::tuple<int, int, int, int, bool>{64, arch == 89 ? 48 : 32, 4, 1, true};
         }
     } else {
         if (kBlockM16) {

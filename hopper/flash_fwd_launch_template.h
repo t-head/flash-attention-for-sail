@@ -38,7 +38,7 @@ template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element,
           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv,
 #endif
 #ifdef USE_PPU
-          bool PackGQA, bool Split, bool V_colmajor, bool kBlockM128, bool kBlockM16, bool kBlockN16>
+          bool PackGQA, bool Split, bool V_colmajor, bool kBlockM128, bool kBlockM16, bool kBlockN16, bool Is_QSA=false>
 #else
           bool PackGQA, bool Split, bool V_colmajor>
 #endif
@@ -57,7 +57,7 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
 
 #ifdef USE_PPU
     // Using PackGQA=true routine (using cp.aync) has impact on tiling (concerning vreg amount).
-    static constexpr std::tuple<int, int, int, int, bool> kBlockMN_kNWarps_Stages_RS = tile_size_fwd_ppu(Arch, kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, PagedKVNonTMA, Varlen, Split, Has_softcap, AppendKV, PackGQA, kBlockM128, kBlockM16, kBlockN16, PagedKVAiu);
+    static constexpr std::tuple<int, int, int, int, bool> kBlockMN_kNWarps_Stages_RS = tile_size_fwd_ppu(Arch, kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, PagedKVNonTMA, Varlen, Split, Has_softcap, AppendKV, PackGQA, kBlockM128, kBlockM16, kBlockN16, PagedKVAiu, Is_QSA);
 #else
     // Can't use structured binding since it's not compatible with constexpr
     static constexpr std::tuple<int, int, bool, bool> kBlockMN_RS_IntraWGOverlap = tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap);
@@ -88,13 +88,13 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
 #else
 #if defined(USE_PPU) && USE_AIU
     static constexpr int kBlockNPagedPerAiuLoad = kBlockN % kBlockNPagedPerAiuLoad_ == 0 ? kBlockNPagedPerAiuLoad_ : 16;   // kBlockNPagedPerAiuLoad_ = 64 or 16
-    using CollectiveMainloop = flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, ArchTag, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, PagedKVAiu, kBlockNPagedPerAiuLoad, AppendKV, PackGQA, Split, ElementS>;
+    using CollectiveMainloop = flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, ArchTag, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, PagedKVAiu, kBlockNPagedPerAiuLoad, AppendKV, PackGQA, Split, ElementS, Is_QSA>;
 #else
-    using CollectiveMainloop = flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, ArchTag, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split, ElementS>;
+    using CollectiveMainloop = flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, ArchTag, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split, ElementS, Is_QSA>;
 #endif
 #endif
 #if defined(USE_PPU)
-    using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, Split, false>;
+    using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, Split, false, Is_QSA>;
 #else
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, Split, FP8_TransposeV>;
 #endif
@@ -108,7 +108,7 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
 #ifdef USE_PPU
         // on PPU, we implement DynamicPersistentTileSchedulerSM80 for Varlen situation, with much simpler logic and less vreg usage,
         // which solved the vreg spill problem caused by FA3 original VarlenDynamicPersistentTileScheduler.
-        flash::DynamicPersistentTileSchedulerSM80<Varlen, Split, PackGQA, kBlockM>,
+        flash::DynamicPersistentTileSchedulerSM80<Varlen, Split, PackGQA, kBlockM, Is_QSA>,
 #else
         flash::VarlenDynamicPersistentTileScheduler<kBlockM, CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/>,
 #endif
@@ -132,7 +132,7 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
     >;
 #else
 #ifdef USE_PPU
-    static constexpr bool UsePersistentScheduler = Varlen || (!Varlen && Is_causal);
+    static constexpr bool UsePersistentScheduler = Is_QSA || Varlen || (!Varlen && Is_causal);
     using Scheduler = std::conditional_t<!UsePersistentScheduler, SchedulerSingleTile, SchedulerPersistent>;
     using AttnKernel = std::conditional_t<
         Arch >= 89,
@@ -192,7 +192,11 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
         params.is_rotary_interleaved,
         params.page_table,
         // if page_size is not set, avoid dividing by zero
+#ifdef USE_PPU
+        {Is_QSA ? seqlen_q : (params.kv_batch_idx ? params.b_k : params.b), !params.page_table ? 0 : (Is_QSA ? params.seqlen_k : params.seqlen_k / params.page_size)}, // shape_page_table
+#else
         {params.kv_batch_idx ? params.b_k : params.b, !params.page_table ? 0 : params.seqlen_k / params.page_size}, // shape_page_table
+#endif
         {params.page_table_batch_stride, _1{}},  // stride_page_table
         params.scale_softmax,
         params.q_descale_ptr, params.k_descale_ptr, params.v_descale_ptr,
@@ -228,7 +232,11 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
     };
 
     int qhead_per_khead = !PackGQA ? 1 : cutlass::ceil_div(params.h, params.h_k);
+#ifdef USE_PPU
+    int num_blocks_m = Is_QSA ? params.seqlen_q : cutlass::ceil_div(params.seqlen_q * qhead_per_khead, get<0>(TileShape_MNK{}));
+#else
     int num_blocks_m = cutlass::ceil_div(params.seqlen_q * qhead_per_khead, get<0>(TileShape_MNK{}));
+#endif
     num_blocks_m = cutlass::round_up(num_blocks_m, size<0>(ClusterShape{}));
     typename flash::TileSchedulerArguments scheduler_args {
 #ifdef USE_PPU
@@ -294,11 +302,12 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
-template<int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>
+template<int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA, bool Is_QSA>
 void run_mha_fwd_(Flash_fwd_params &params, hggcStream_t stream) {
     static_assert(sizeof(T) == 2 || sizeof(T) == 1, "Only 16bit and 8bit are supported");
     static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
     using T_out = std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>;
+    if constexpr (!Is_QSA || PagedKVNonTMA) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         VCOLMAJOR_SWITCH(params.v_dim_stride != 1, V_colmajor_, [&] {
             static constexpr bool V_colmajor = V_colmajor_ && sizeof(T) == 1;
@@ -318,17 +327,19 @@ void run_mha_fwd_(Flash_fwd_params &params, hggcStream_t stream) {
 #if USE_AIU
                                 if constexpr (PagedKVNonTMA) {
                                     PAGEDKVAIU_SWITCH(!params.leftpad_k && params.page_size % 16 == 0, params.page_size, PagedKVAiu, kBlockNPagedPerAiuLoad, [&] {
+                                        // QSA's page table is per query token, so a per-row read would put a
+                                        // gmem load on the K/V address critical path; dense keeps the old tile.
                                         if constexpr (kBlockM16 && (kBlockN16 || kBlockNPagedPerAiuLoad == 16)) {
-                                            run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, true /*PagedKVNonTMA*/, false /*PagedKVAiu*/, 1 /*kBlockNPagedPerAiuLoad_*/, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, false /*kBlockM128*/, true /*kBlockM16*/, kBlockN16>(params, stream);
+                                            run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, true /*PagedKVNonTMA*/, Is_QSA && PagedKVAiu, Is_QSA ? kBlockNPagedPerAiuLoad : 1, !Is_QSA && AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, false /*kBlockM128*/, true /*kBlockM16*/, kBlockN16, Is_QSA>(params, stream);
                                         } else {
-                                            run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, true /*PagedKVNonTMA*/, PagedKVAiu, kBlockNPagedPerAiuLoad, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, kBlockM128, kBlockM16, false /*kBlockN16*/>(params, stream);
+                                            run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, true /*PagedKVNonTMA*/, PagedKVAiu, kBlockNPagedPerAiuLoad, !Is_QSA && AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, kBlockM128, kBlockM16, false /*kBlockN16*/, Is_QSA>(params, stream);
                                         }
                                     });
                                 } else {
-                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, false /*PagedKVNonTMA*/, false /*PagedKVAiu*/,  1 /*kBlockNPagedPerAiuLoad_*/, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, kBlockM128, kBlockM16, false /*kBlockN16*/>(params, stream);
+                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, false /*PagedKVNonTMA*/, false /*PagedKVAiu*/,  1 /*kBlockNPagedPerAiuLoad_*/, !Is_QSA && AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, kBlockM128, kBlockM16, false /*kBlockN16*/, Is_QSA>(params, stream);
                                 }
 #else
-                                run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, kBlockM128, kBlockM16, kBlockN16>(params, stream);
+                                run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, !Is_QSA && AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, kBlockM128, kBlockM16, kBlockN16, Is_QSA>(params, stream);
 #endif
                             });
 #else
@@ -340,4 +351,5 @@ void run_mha_fwd_(Flash_fwd_params &params, hggcStream_t stream) {
             });
         });
     });
+    } // end if constexpr (!Is_QSA || PagedKVNonTMA)
 }

@@ -39,6 +39,7 @@ public:
     static constexpr bool Transpose_V = CollectiveMainloop::Transpose_V;
     static constexpr bool AppendKV = CollectiveMainloop::AppendKV;
     static constexpr bool PackGQA = CollectiveMainloop::PackGQA;
+    static constexpr bool Is_QSA = CollectiveMainloop::Is_QSA;
     static constexpr int NumProducerThreads = CollectiveMainloop::NumProducerThreads;
     using SeqlenInfo_t = typename CollectiveMainloop::SeqlenInfo_t;
 
@@ -66,7 +67,7 @@ public:
 
     static constexpr uint32_t NumThreads = CUTE_STATIC_V(size(TiledMma{}));
     static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMma{}));
-    static constexpr uint32_t MinBlocksPerMultiprocessor = NumThreads == 128 ? 2 : 1;
+    static constexpr uint32_t MinBlocksPerMultiprocessor = (Is_QSA && NumThreads <= 64) ? (256 / NumThreads) : (NumThreads == 128 ? 2 : 1);
 
     // Kernel level shared memory storage
     // We overlap the shared memory for the mainloop and epilogue. However, we only want smem_o to overlap with smem_v + smem_k and not smem_q
@@ -242,7 +243,9 @@ public:
             SeqlenInfo_t seqlen_info{
                 bidb,
                 get<0>(params.mainloop.shape_Q),
-                !PagedKV ? size<0>(params.mainloop.shape_K) : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable),
+                !PagedKV ? size<0>(params.mainloop.shape_K)
+                         : (Is_QSA ? size<1>(params.mainloop.shape_pagetable)
+                                   : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable)),
                 get<0>(params.mainloop.shape_K_new),
                 params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
                 params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,

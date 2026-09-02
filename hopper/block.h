@@ -6,7 +6,7 @@
 
 namespace flash {
 
-template <class SeqlenInfo_t, int kBlockM, int kBlockN, bool Is_causal, bool Is_local, bool PackGQA=false, bool Split=false>
+template <class SeqlenInfo_t, int kBlockM, int kBlockN, bool Is_causal, bool Is_local, bool PackGQA=false, bool Split=false, bool Is_QSA=false>
 struct BlockMN {
 
     static
@@ -21,7 +21,10 @@ struct BlockMN {
         int const seqlen_k = seqlen_info.seqlen_k;
         int const seqlen_q = seqlen_info.seqlen_q;
         int n_block_max = cute::ceil_div(seqlen_k, kBlockN);
-        if constexpr (Is_causal || Is_local) {
+        // In QSA mode the topk list is already causally filtered, and the column index is a position
+        // within the topk list rather than an absolute token position. The contiguous causal formula
+        // below would incorrectly restrict the n_block range, so skip it for QSA.
+        if constexpr ((Is_causal || Is_local) && !Is_QSA) {
             int m_idx_max = (m_block + 1) * kBlockM;
             // TODO: check off-by-1 error
             if (PackGQA) { m_idx_max = qhead_per_khead_divmod.divide(m_idx_max - 1) + 1 ; }
@@ -35,7 +38,7 @@ struct BlockMN {
         int n_block_min = 0;
         if constexpr (Is_local) {
             int m_idx_min = m_block * kBlockM;
-            if (PackGQA) { m_idx_min = qhead_per_khead_divmod.divide(m_idx_min); }
+            if (PackGQA) { m_idx_min = Is_QSA ? m_block : qhead_per_khead_divmod.divide(m_idx_min); }
             int const n_idx = m_idx_min + seqlen_k - seqlen_q;
             int n_idx_left = n_idx - window_size_left;
             if (attention_chunk_divmod.divisor > 0) {
@@ -87,7 +90,7 @@ struct BlockMN {
         // TODO: support attention_chunk
         int const seqlen_q = seqlen_info.seqlen_q;
         int const seqlen_k = seqlen_info.seqlen_k;
-        int m_block_max = cute::ceil_div(seqlen_q, kBlockM);
+        int m_block_max = Is_QSA ? seqlen_q : cute::ceil_div(seqlen_q, kBlockM);
         if constexpr (Is_local) {
             if (n_block >= cute::ceil_div(sink_token_length, kBlockN)) {
                 m_block_max = std::min(m_block_max, cute::ceil_div((n_block + 1) * kBlockN + seqlen_q - seqlen_k + window_size_left, kBlockM));
@@ -108,7 +111,7 @@ struct BlockMN {
             int const m_block, int const n_block_min, int const window_size_right,
             cutlass::FastDivmod const& attention_chunk_divmod,
             cutlass::FastDivmod const& qhead_per_khead_divmod) {
-        int const m_idx_min = !PackGQA ? m_block * kBlockM : qhead_per_khead_divmod.divide(m_block * kBlockM);
+        int const m_idx_min = !PackGQA ? m_block * kBlockM : (Is_QSA ? m_block : qhead_per_khead_divmod.divide(m_block * kBlockM));
         int const n_idx = m_idx_min + seqlen_info.seqlen_k - seqlen_info.seqlen_q;
         int n_idx_right = !Is_local ? n_idx : n_idx + window_size_right;
         if (Is_local && attention_chunk_divmod.divisor > 0) {
@@ -125,7 +128,7 @@ struct BlockMN {
             int const m_block, int const n_block_min, int const window_size_left,
             cutlass::FastDivmod const& attention_chunk_divmod,
             cutlass::FastDivmod const& qhead_per_khead_divmod) {
-        int const m_idx_max = !PackGQA ? (m_block + 1) * kBlockM : qhead_per_khead_divmod.divide((m_block + 1) * kBlockM - 1) + 1;
+        int const m_idx_max = !PackGQA ? (m_block + 1) * kBlockM : (Is_QSA ? m_block + 1 : qhead_per_khead_divmod.divide((m_block + 1) * kBlockM - 1) + 1);
         int const n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q;
         int n_idx_left = !Is_local ? n_idx : n_idx - window_size_left;
         if (Is_local && attention_chunk_divmod.divisor > 0) {

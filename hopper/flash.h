@@ -170,6 +170,7 @@ struct Flash_fwd_params : public Qkv_params {
     bool use_kblockm_16;
     bool use_kblockm_128;
     bool use_kblockn_16;
+    bool is_qsa;
     // The S extra matrix, (num_heads)
     void *__restrict__ s_aux_ptr;
 
@@ -233,7 +234,7 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>
+template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA, bool Is_QSA=false>
 void run_mha_fwd_(Flash_fwd_params &params, hggcStream_t stream);
 void prepare_varlen_num_blocks(Flash_fwd_params &params, hggcStream_t stream, bool packgqa, int blockM, int blockN, bool enable_pdl);
 template <int Arch, typename T, int kHeadDim, bool Has_softcap>

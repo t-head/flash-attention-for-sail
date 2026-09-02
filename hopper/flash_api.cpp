@@ -460,6 +460,24 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, hggcStream_t stream) {
     }
 }
 
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
+// QSA is only verified for head dim 256 bf16/fp16, so only those kernels are instantiated.
+template <int Arch, int Split, bool PagedKVNonTMA, bool PackGQA, bool Has_softcap>
+void run_mha_fwd_qsa(Flash_fwd_params &params, hggcStream_t stream) {
+#ifndef FLASHATTENTION_DISABLE_HDIM256
+    TORCH_CHECK(params.d == 256 && params.dv == 256, "QSA only supports head dim 256");
+    if (params.is_bf16) {
+        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA, true>(params, stream);
+    } else {
+#ifndef FLASHATTENTION_DISABLE_FP16
+        return run_mha_fwd_<Arch, cutlass::half_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA, true>(params, stream);
+#endif
+    }
+#endif
+    TORCH_CHECK(false, "QSA kernel for this dtype / head dim is not compiled in");
+}
+#endif
+
 void run_mha_fwd(Flash_fwd_params &params, hggcStream_t stream) {
     // HEADDIM_SWITCH(params.d, [&] {
     //     run_mha_fwd_<cutlass::half_t, kHeadSize>(params, stream);
@@ -480,6 +498,14 @@ void run_mha_fwd(Flash_fwd_params &params, hggcStream_t stream) {
                     static constexpr bool PackGQA = PackGQA_ || Arch < 90 || PagedKVNonTMA || Split;
 #endif
                     SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
+                        if constexpr (PagedKVNonTMA) {
+                            if (params.is_qsa) {
+                                run_mha_fwd_qsa<Arch, Split, PagedKVNonTMA, PackGQA, Has_softcap>(params, stream);
+                                return;
+                            }
+                        }
+#endif
                         run_mha_fwd_constexpr<Arch, Split, PagedKVNonTMA, PackGQA, Has_softcap>(params, stream);
                     });
                 });
@@ -546,13 +572,13 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
         params.page_table, varlen, false /*split*/, params.softcap > 0.f, params.knew_ptr, false /*pack_gqa*/,
         ((params.is_varlen_q && ((params.d_rounded <= 128 && 1.0 * params.total_q / params.b > 64) || (params.arch == 89 && params.d_rounded == 192 && params.h == params.h_k && params.seqlen_q == params.seqlen_k && params.is_causal && 1.0 * params.total_q / params.b > 704))) ||
          (!params.is_varlen_q && params.b * params.h * ((params.seqlen_q + 127) / 128) / params.num_sm >= 8 && ((params.d_rounded <= 128 && params.seqlen_q > (params.is_causal ? 704 : 64)) || (params.arch == 89 && params.d_rounded == 192 && params.h == params.h_k && params.seqlen_q == params.seqlen_k && params.is_causal && params.seqlen_q > 704)))) /*kBlockM128*/,
-        params.use_kblockm_16, params.use_kblockn_16);
+        params.use_kblockm_16, params.use_kblockn_16, false /*PagedKVAiu*/, params.is_qsa);
     int const kBlockM_wo_PackGQA = std::get<0>(kBlockMN_kernel_args_sm8x_wo_PackGQA);
     auto kBlockMN_kernel_args_sm8x_w_PackGQA = tile_size_fwd_ppu(params.arch, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/,
         params.page_table, varlen, false /*split*/, params.softcap > 0.f, params.knew_ptr, true /*pack_gqa*/,
         ((params.is_varlen_q && ((params.d_rounded <= 128 && 1.0 * params.total_q / params.b > 64) || (params.arch == 89 && params.d_rounded == 192 && params.h == params.h_k && params.seqlen_q == params.seqlen_k && params.is_causal && 1.0 * params.total_q / params.b > 704))) ||
          (!params.is_varlen_q && params.b * params.h_k * ((params.seqlen_q * params.h / params.h_k + 127) / 128) / params.num_sm >= 8 && ((params.d_rounded <= 128 && params.seqlen_q > (params.is_causal ? 704 : 64)) || (params.arch == 89 && params.d_rounded == 192 && params.h == params.h_k && params.seqlen_q == params.seqlen_k && params.is_causal && params.seqlen_q > 704)))) /*kBlockM128*/,
-        params.use_kblockm_16, params.use_kblockn_16);
+        params.use_kblockm_16, params.use_kblockn_16, false /*PagedKVAiu*/, params.is_qsa);
     int const kBlockM_w_PackGQA = std::get<0>(kBlockMN_kernel_args_sm8x_w_PackGQA);
     return should_pack_gqa((params.cu_seqlens_q || params.seqused_q) && (params.b > 2 || params.total_q / params.b < 0.95 * params.seqlen_q), params.seqlen_q, params.h, params.h_k, kBlockM_wo_PackGQA, kBlockM_w_PackGQA, params.num_sm * 4);   // 4 is the common occupancy in prefill instance
 #else
@@ -571,7 +597,9 @@ inline int get_num_splits(Flash_fwd_params const& params) {
 #ifdef USE_PPU
     int block_m = std::max(params.seqlen_q * params.h / params.h_k, 64) / 64;
     float waves = 1.0 * params.b * params.h_k * block_m / params.num_sm;
-    if ((!params.use_kblockm_16) && ((params.seqlen_q > 16) ||
+    // QSA sets seqlen_k to topk, so this wave/seqlen_k heuristic reads it as already
+    // saturating the SMs and denies split-KV that the same-FLOP dense shape does get.
+    if ((!params.is_qsa) && (!params.use_kblockm_16) && ((params.seqlen_q > 16) ||
         ((params.seqlen_q <= 16) && (waves > 1) && (params.seqlen_k < 3660 * waves)))) { return 1; }
 #endif
     // Always enable PackGQA for Split
@@ -583,7 +611,7 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     // has not been set here. It's OK though because we might just underestimate kBlockN a bit
 #ifdef USE_PPU
     auto kBlockMN_kernel_args_sm8x = tile_size_fwd_ppu(params.arch, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/,
-        params.page_table, varlen, true /*split*/, params.softcap > 0.f, params.knew_ptr, true /*pack_gqa*/, false /*kBlockM128*/, params.use_kblockm_16, params.use_kblockn_16);
+        params.page_table, varlen, true /*split*/, params.softcap > 0.f, params.knew_ptr, true /*pack_gqa*/, false /*kBlockM128*/, params.use_kblockm_16, params.use_kblockn_16, false /*PagedKVAiu*/, params.is_qsa);
 #else
     auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, varlen, params.softcap > 0.f, params.knew_ptr);
 #endif
@@ -606,6 +634,28 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     // We only use Split in kBlockM == 16 scenario, hence we can get exact occ for corresponding tiling.
     int const occ = params.use_kblockn_16 ? (params.d_rounded <= 64 && params.dv_rounded > 256 ? 14 : 16) :
         (params.d_rounded <= 64 ? (params.dv_rounded <= 64 ? 8 : (params.dv_rounded <= 256 ? 6 : 14)) : (params.d_rounded <= 96 ? 10 : (params.d_rounded <= 128 ? 8 : (params.d_rounded <= 192 ? 5 : 16))));
+    // QSA maps one m_block to one query token, so total_mblocks above under-counts it by
+    // kBlockM / qhead_per_khead and the generic heuristic below sizes the wrong M axis.
+    if (params.is_qsa && params.seqlen_q > 16) {
+        int const qsa_mblocks = std::max(1, params.h_k * params.total_q);
+        int const slots = std::max(1, params.num_sm * occ);
+        if (slots / qsa_mblocks > 1) { return std::min(128, slots / qsa_mblocks); }
+        if (qsa_mblocks <= slots) { return 1; }
+        // The combine pass costs an fp32 O write plus read per valid row, so its price scales
+        // with qhead_per_khead; past the 16-wide tile no split pays for itself.
+        if (params.h / params.h_k > 16) { return 1; }
+        // Wave integrality eff(s) = w / ceil(w) with w = qsa_mblocks * s / slots, as integers.
+        auto near_integral = [&](int s, int pct) {
+            long long const n = 1LL * qsa_mblocks * s;
+            long long const waves_up = (n + slots - 1) / slots;
+            return 100 * n >= 1LL * pct * slots * waves_up;
+        };
+        if (near_integral(1, 93)) { return 1; }
+        for (int s = 2; s <= 4; ++s) {
+            if (near_integral(s, 97)) { return std::max(1, std::min(s, num_n_blocks)); }
+        }
+        return 1;
+    }
 #ifndef FA3_HLLM_BUILD
     int num_splits_average = num_splits_heuristic(total_mblocks, params.num_sm, occ, num_n_blocks, num_m_blocks, size_one_kv_head, params.is_causal || params.is_local, 128);
     int num_splits_uppper_bound = num_splits_heuristic(min_mblocks, params.num_sm, occ, num_n_blocks, num_m_blocks, size_one_kv_head, params.is_causal || params.is_local, 128);
@@ -888,6 +938,15 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 
     at::Tensor page_table;
     const bool paged_KV = page_table_.has_value();
+    // A QSA topk table is (total_q, 1, topk); a normal page table is (batch, pages_per_seq). Their
+    // 2-D forms are indistinguishable whenever every sequence holds a single query token, so the
+    // rank is the only reliable marker. It is squeezed away right here, leaving the rest of the
+    // function to see a 2-D table either way.
+#if defined(USE_PPU) && !defined(FA3_HLLM_BUILD)
+    bool const qsa_page_table = paged_KV && page_table_.value().dim() == 3;
+#else
+    bool const qsa_page_table = false;
+#endif
     if (paged_KV) {
         page_table = page_table_.value();
         CHECK_DEVICE(page_table);
@@ -897,6 +956,10 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         TORCH_CHECK(page_table.dtype() == torch::kInt64, "page_table must have dtype torch.int64");
 #endif
         TORCH_CHECK(page_table.stride(-1) == 1, "page_table must have contiguous last dimension");
+        if (qsa_page_table) {
+            TORCH_CHECK(page_table.size(1) == 1, "QSA page_table must have shape (total_q, 1, topk)");
+            page_table = page_table.squeeze(1);
+        }
     }
 
     at::Tensor cu_seqlens_q;
@@ -932,10 +995,29 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 #endif // FA3_HLLM_BUILD
     int const num_pages = !paged_KV ? 0 : k.size(0);
     int const page_size = !paged_KV ? 1 : k.size(1);
-    int const seqlen_k = !is_varlen_k ? (!paged_KV ? k.size(1) : max_num_pages_per_seq * page_size) : max_seqlen_k_.value();
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
+    bool const is_qsa = qsa_page_table;
+    if (is_qsa) {
+        TORCH_CHECK(head_size == 256, "QSA only supports head dim 256");
+        TORCH_CHECK(q_type != at::ScalarType::Float8_e4m3fn, "QSA does not support fp8");
+        TORCH_CHECK(is_varlen_q, "QSA requires cu_seqlens_q");
+        TORCH_CHECK(!kv_batch_idx_.has_value(), "QSA does not support kv_batch_idx");
+        TORCH_CHECK(!k_new_.has_value(), "QSA does not support appending new KV");
+        // The topk list already holds absolute token indices, so a leftpad shift would double-apply.
+        TORCH_CHECK(!leftpad_k_.has_value(), "QSA does not support leftpad_k");
+        TORCH_CHECK(page_table.size(0) == total_q,
+                    "QSA page_table must have one row per query token, i.e. shape (total_q, 1, topk)");
+    }
+#else
+    bool const is_qsa = false;
+    TORCH_CHECK(!qsa_page_table,
+                "page_table is 3-D, i.e. a QSA topk table, but QSA is not compiled in; rebuild with "
+                "FLASH_ATTENTION_ENABLE_QSA=TRUE");
+#endif
+    int const seqlen_k = !is_varlen_k ? (!paged_KV ? k.size(1) : (is_qsa ? int(page_table.size(1)) : max_num_pages_per_seq * page_size)) : max_seqlen_k_.value();
     int const total_k = !is_varlen_k ? batch_size * k.size(1) : k.size(0);
     int const num_heads_k = k.size(-2);
-    int const batch_size_k = !paged_KV ? (!is_varlen_k ? k.size(0) : cu_seqlens_k.size(0) - 1) : page_table.size(0);
+    int const batch_size_k = !paged_KV ? (!is_varlen_k ? k.size(0) : cu_seqlens_k.size(0) - 1) : (is_qsa ? batch_size : int(page_table.size(0)));
     double softmax_scale = 1.0 / sqrt(double(head_size));
     if (softmax_scale_.has_value()) {
         softmax_scale = softmax_scale_.value();
@@ -946,6 +1028,11 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     int const max_headdim = get_max_headdim();
     TORCH_CHECK(head_size <= max_headdim, "FlashAttention forward only supports head dimension at most " + std::to_string(max_headdim));
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+    if (is_qsa) {
+        // One m_block per query token means all qhead_per_khead rows must fit in kBlockM, whose
+        // widest hd256 QSA value is 32; heads past kBlockM would never be scheduled at all.
+        TORCH_CHECK(num_heads / num_heads_k <= 32, "QSA supports at most 32 query heads per KV head");
+    }
     if (head_size_v != head_size) {
         TORCH_CHECK((head_size > 128 && head_size <= 192 && head_size_v > 96 && head_size_v <= 128) ||
                    (head_size <= 64 && head_size_v <= 512),
@@ -988,11 +1075,13 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     } else {
         CHECK_SHAPE(k, num_pages, page_size, num_heads_k, head_size);
         CHECK_SHAPE(v, num_pages, page_size, num_heads_k, head_size_v);
+        if (!is_qsa) {
 #ifndef FA3_HLLM_BUILD
-        CHECK_SHAPE(page_table, batch_size_k, max_num_pages_per_seq);
+            CHECK_SHAPE(page_table, batch_size_k, max_num_pages_per_seq);
 #else
-        CHECK_SHAPE(page_table, batch_size_k, 2, max_num_pages_per_seq); // 2 stands for k&v
+            CHECK_SHAPE(page_table, batch_size_k, 2, max_num_pages_per_seq); // 2 stands for k&v
 #endif // FA3_HLLM_BUILD
+        }
     }
 
     if (seqused_q_.has_value()){
@@ -1098,6 +1187,14 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     params.b_k = batch_size_k;
     params.dv = head_size_v;
     params.dv_rounded = head_size_v_rounded;
+#ifdef USE_PPU
+    params.is_qsa = is_qsa;
+    if (is_qsa) {
+        // seqlen_k is already topk; seqused_k holds the dense span and would win in SeqlenInfo,
+        // inflating the n_block range that split-KV slices and the seqlen_k mask bound.
+        params.seqused_k = nullptr;
+    }
+#endif
     if (leftpad_k_.has_value()) {  // This needs to be set before get_pagedkv_tma
         params.leftpad_k = static_cast<int *>(leftpad_k_.value().data_ptr());
     }
@@ -1179,7 +1276,10 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 #endif // FA3_HLLM_BUILD
 
 #ifdef USE_PPU
-    bool const use_dynamic_split = is_varlen && params.b <= 992 && params.b > 1 && num_splits <= 0;
+    // flash_prepare_scheduler.cu forces every batch's split to 1 once seqlen_q > 16, so for QSA
+    // prefill the dynamic path pays the fp32 partial write and combine pass without splitting.
+    bool const use_dynamic_split = is_varlen && params.b <= 992 && params.b > 1 && num_splits <= 0
+        && !(params.is_qsa && params.seqlen_q > 16);
     int const ttl_m = params.seqlen_q * params.h / params.h_k;
     int const m64_cnt = std::max(1, ttl_m / 64);
     float waves = std::max(1.0 * params.b * params.h_k * m64_cnt / params.num_sm, 1.0);
@@ -1190,6 +1290,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         (ttl_m <= 16) ||
         ((ttl_m <= 32) && (params.b * params.h_k <= params.num_sm * 2)) ||
         ((ttl_m < 64) && (params.b * params.h_k <= params.num_sm));
+    // One m_block per query token means a tile row past qhead_per_khead is masked off and
+    // discarded, so take the narrowest tile that still covers qhead_per_khead.
+    if (params.is_qsa) { params.use_kblockm_16 = params.h / params.h_k <= 16; }
     int const kblockn = params.d_rounded <= 64 ? (params.dv_rounded <= 64 ? 128 : (params.dv_rounded <= 256 ? 64 : 16)) : (params.d_rounded <= 192 ? 64 : 16);   // Very important that these match the kernel configs
     params.use_kblockn_16 = params.use_kblockm_16 && paged_KV && params.page_size < 64 && (!max_seqlen_k_.has_value() || (max_seqlen_k_.has_value() && max_seqlen_k_.value() <  kblockn * 128 /*empirical coefficient*/));
 #else

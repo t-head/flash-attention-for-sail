@@ -16,9 +16,9 @@ namespace flash {
 using namespace cute;
 
 #if defined(USE_PPU) && USE_AIU
-template <int kBlockN, int kHeadDim, int kHeadDimV, int NumThreads, typename Element, bool KV_Same_Iter=false, int LoadsPerRow_LB=1, bool PagedKVAiu=false, int kBlockNPagedPerAiuLoad=16>
+template <int kBlockN, int kHeadDim, int kHeadDimV, int NumThreads, typename Element, bool KV_Same_Iter=false, int LoadsPerRow_LB=1, bool PagedKVAiu=false, int kBlockNPagedPerAiuLoad=16, bool Is_QSA=false>
 #else
-template <int kBlockN, int kHeadDim, int kHeadDimV, int NumThreads, typename Element, bool KV_Same_Iter=false, int LoadsPerRow_LB=1>
+template <int kBlockN, int kHeadDim, int kHeadDimV, int NumThreads, typename Element, bool KV_Same_Iter=false, int LoadsPerRow_LB=1, bool Is_QSA=false>
 #endif
 struct PagedKVManager {
     // If KV_Same_Iter=false, then we do load_page_table(0), load_K(0), load_page_table(1), load_K(1), load_V(0),
@@ -169,7 +169,8 @@ struct PagedKVManager {
                    cutlass::FastDivmod const &page_size_divmod,
                    cutlass::FastDivmod const &blockN_per_page_size_divmod,
                    int const bidb, int const bidh, int const thread_idx, int const seqlen_k, int const leftpad_k,
-                   int bidb_kv_idx
+                   int bidb_kv_idx,
+                   int const offset_q = 0, int const m_block = 0
                    )
         : page_size_divmod(page_size_divmod)
         , blockN_per_page_size_divmod(blockN_per_page_size_divmod)
@@ -187,11 +188,12 @@ struct PagedKVManager {
         , bidb_kv_idx_prev(bidb_kv_idx)
 
     {
+        int const page_table_row = Is_QSA ? offset_q + m_block : bidb;
 #ifndef FA3_HLLM_BUILD
-        mPageTable = make_tensor(make_gmem_ptr(ptr_page_table), shape_pagetable, stride_pagetable)(bidb, _);
+        mPageTable = make_tensor(make_gmem_ptr(ptr_page_table), shape_pagetable, stride_pagetable)(page_table_row, _);
 #else
         mPageTable = make_tensor(make_gmem_ptr(ptr_page_table), make_shape(get<0>(shape_pagetable), get<1>(shape_pagetable) * 2),
-            make_stride(get<0>(stride_pagetable) * 2, _1{}))(bidb, _);
+            make_stride(get<0>(stride_pagetable) * 2, _1{}))(page_table_row, _);
 #endif // FA3_HLLM_BUILD
         mK_paged = make_tensor(make_gmem_ptr(ptr_K), shape_K, stride_K)(_, _, bidh, _);
         auto shape_V = make_shape(get<0>(shape_K), headdim_v, get<2>(shape_K), get<3>(shape_K));
@@ -269,6 +271,17 @@ struct PagedKVManager {
             int const page_entry_idx = thread_idx % kPageEntryPerWarp;
             int const row = (page_entry_idx * kNWarps + warp_idx) * kBlockNPagedPerAiuLoad;
             int const row_idx = n_block * kBlockN + row;
+            if constexpr (Is_QSA) {
+                bool const flag = (row < kBlockN) && (row_idx < seqlen_k);
+                int const token_index = flag ? __ldg(&mPageTable[row_idx]) : -1;
+                int page_offset_local;
+                int const page = token_index >= 0 ? page_size_divmod.divmod(page_offset_local, token_index) : -1;
+                if (page >= 0) {
+                    __ppu_prefetch_nonebulk_LLC(&mK_paged(page_offset_local, _0{}, page));
+                    __ppu_prefetch_nonebulk_LLC(&mV_paged(page_offset_local, _0{}, page));
+                }
+                return;
+            }
             int page_idx, page_offset;
             page_idx = page_size_divmod.divmod(page_offset, row_idx + leftpad_k);
             int const page = (row < kBlockN) && (row_idx < seqlen_k) ? mPageTable[page_idx] : 0;
@@ -292,6 +305,33 @@ struct PagedKVManager {
             int const page_entry_idx = thread_idx % kPageEntryPerWarp;
             int const row = (page_entry_idx * kNWarps + warp_idx) * kBlockNPagedPerAiuLoad;
             int const row_idx = n_block * kBlockN + row;
+            if constexpr (Is_QSA) {
+                bool flag = (row < kBlockN) && (!Seqlenk_mask || row_idx < seqlen_k);
+#ifndef FA3_HLLM_BUILD
+                int const token_index = flag ? __ldg(&mPageTable[row_idx]) : 0;
+                int page_offset_local;
+                int const page = token_index >= 0 ? page_size_divmod.divmod(page_offset_local, token_index) : -1;
+                tPrPageOffsetAiu = {page, page_offset_local};
+#else
+#ifndef FA3_HLLM_USE_ADDR
+                int const token_index_k = flag ? __ldg(&mPageTable[row_idx]) : 0;
+                int const token_index_v = flag ? __ldg(&mPageTable[row_idx + get<0>(shape(mPageTable.layout())) / 2]) : 0;
+                int page_offset_k, page_offset_v;
+                int const page_k = token_index_k >= 0 ? page_size_divmod.divmod(page_offset_k, token_index_k) : -1;
+                int const page_v = token_index_v >= 0 ? page_size_divmod.divmod(page_offset_v, token_index_v) : -1;
+                tPrHllmKPageOffsetAiu = {page_k, page_offset_k};
+                tPrHllmVPageOffsetAiu = {page_v, page_offset_v};
+#else
+                int64_t const token_index_k = flag ? __ldg(&mPageTable[row_idx]) : int64_t(-1);
+                int64_t const token_index_v = flag ? __ldg(&mPageTable[row_idx + get<0>(shape(mPageTable.layout())) / 2]) : int64_t(-1);
+                int page_offset_k, page_offset_v;
+                int const page_k = token_index_k >= 0 ? page_size_divmod.divmod(page_offset_k, (int)token_index_k) : -1;
+                int const page_v = token_index_v >= 0 ? page_size_divmod.divmod(page_offset_v, (int)token_index_v) : -1;
+                tPrHllmKPageOffsetAiu = {page_k, page_offset_k};
+                tPrHllmVPageOffsetAiu = {page_v, page_offset_v};
+#endif // FA3_HLLM_USE_ADDR
+#endif // FA3_HLLM_BUILD
+            } else {
             int page_idx, page_offset;
             page_idx = page_size_divmod.divmod(page_offset, row_idx + leftpad_k);
 #ifndef FA3_HLLM_BUILD
@@ -312,6 +352,7 @@ struct PagedKVManager {
             tPrHllmVPageOffsetAiu = {page_ptr_v, page_offset};
 #endif // FA3_HLLM_USE_ADDR
 #endif // FA3_HLLM_BUILD
+            }
             if constexpr (First_iter && !KV_Same_Iter) { compute_V_ptr_aiu(); }
             return;
         }
@@ -324,6 +365,33 @@ struct PagedKVManager {
         for (int i = 0; i < kPageEntryPerThread; ++i) {
             int const row = i * NumThreads + (thread_idx % kGmemThreadsPerRow) * (NumThreads / kGmemThreadsPerRow) + (thread_idx / kGmemThreadsPerRow);
             int const row_idx = n_block * kBlockN + row;
+            if constexpr (Is_QSA) {
+                bool flag = ((i + 1) * NumThreads <= kBlockN || row < kBlockN) && (!Seqlenk_mask || row_idx < seqlen_k);
+#ifndef FA3_HLLM_BUILD
+                int const token_index = flag ? __ldg(&mPageTable[row_idx]) : 0;
+                int page_offset_local;
+                int const page = token_index >= 0 ? page_size_divmod.divmod(page_offset_local, token_index) : -1;
+                tPrPageOffset[i] = {page, page_offset_local};
+#else
+#ifndef FA3_HLLM_USE_ADDR
+                int const token_index_k = flag ? __ldg(&mPageTable[row_idx]) : 0;
+                int const token_index_v = flag ? __ldg(&mPageTable[row_idx + get<0>(shape(mPageTable.layout())) / 2]) : 0;
+                int page_offset_k, page_offset_v;
+                int const page_k = token_index_k >= 0 ? page_size_divmod.divmod(page_offset_k, token_index_k) : -1;
+                int const page_v = token_index_v >= 0 ? page_size_divmod.divmod(page_offset_v, token_index_v) : -1;
+                tPrHllmKPageOffset[i] = {page_k, page_offset_k};
+                tPrHllmVPageOffset[i] = {page_v, page_offset_v};
+#else
+                int64_t const token_index_k = flag ? __ldg(&mPageTable[row_idx]) : int64_t(-1);
+                int64_t const token_index_v = flag ? __ldg(&mPageTable[row_idx + get<0>(shape(mPageTable.layout())) / 2]) : int64_t(-1);
+                int page_offset_k, page_offset_v;
+                int const page_k = token_index_k >= 0 ? page_size_divmod.divmod(page_offset_k, (int)token_index_k) : -1;
+                int const page_v = token_index_v >= 0 ? page_size_divmod.divmod(page_offset_v, (int)token_index_v) : -1;
+                tPrHllmKPageOffset[i] = {page_k, page_offset_k};
+                tPrHllmVPageOffset[i] = {page_v, page_offset_v};
+#endif // FA3_HLLM_USE_ADDR
+#endif // FA3_HLLM_BUILD
+            } else {
             int page_idx, page_offset;
             page_idx = page_size_divmod.divmod(page_offset, row_idx + leftpad_k);
             // Add the condition (i + 1) * NumThreads <= kBlockN since that is an upper bound of row
@@ -351,6 +419,7 @@ struct PagedKVManager {
 #endif // FA3_HLLM_USE_ADDR
 #endif // FA3_HLLM_BUILD
             // if (cute::thread0()) { printf("row = %d, page_idx = %d, page_offset = %d, page = %d, leftpad_k = %d, seqlen_k = %d\n", row, page_idx, page_offset, page, leftpad_k, seqlen_k); }
+            }
         }
         if constexpr (First_iter && !KV_Same_Iter) { compute_V_ptr(); }
     };
@@ -398,11 +467,20 @@ struct PagedKVManager {
 #else
             auto [page, page_offset] = tPrHllmKPageOffset[i];
 #endif // FA3_HLLM_BUILD
-            tPrKPtr[i] = &mK_paged(page_offset, _0{}, page);
+            if constexpr (Is_QSA) {
+                tPrKPtr[i] = page >= 0 ? &mK_paged(page_offset, _0{}, page) : nullptr;
+            } else {
+                tPrKPtr[i] = &mK_paged(page_offset, _0{}, page);
+            }
 #else
             auto [page_ptr, page_offset] = tPrHllmKPageOffset[i];
-            tPrKPtr[i] = reinterpret_cast<Element*>(page_ptr +
-            static_cast<int64_t>(get<0>(stride(mK_paged.layout())) * page_offset + bidh_offset_k) * sizeof(Element));
+            if constexpr (Is_QSA) {
+                tPrKPtr[i] = page_ptr >= 0 ? reinterpret_cast<Element*>(page_ptr +
+                    static_cast<int64_t>(get<0>(stride(mK_paged.layout())) * page_offset + bidh_offset_k) * sizeof(Element)) : nullptr;
+            } else {
+                tPrKPtr[i] = reinterpret_cast<Element*>(page_ptr +
+                    static_cast<int64_t>(get<0>(stride(mK_paged.layout())) * page_offset + bidh_offset_k) * sizeof(Element));
+            }
 #endif
         }
         return tPrKPtr;
@@ -418,11 +496,20 @@ struct PagedKVManager {
 #else
             auto [page, page_offset] = tPrHllmVPageOffset[i];
 #endif // FA3_HLLM_BUILD
-            tPrVPtr[i] = &mV_paged(page_offset, _0{}, page);
+            if constexpr (Is_QSA) {
+                tPrVPtr[i] = page >= 0 ? &mV_paged(page_offset, _0{}, page) : nullptr;
+            } else {
+                tPrVPtr[i] = &mV_paged(page_offset, _0{}, page);
+            }
 #else
             auto [page_ptr, page_offset] = tPrHllmVPageOffset[i];
-            tPrVPtr[i] = reinterpret_cast<Element*>(page_ptr +
-            static_cast<int64_t>(get<0>(stride(mV_paged.layout())) * page_offset + bidh_offset_v) * sizeof(Element));
+            if constexpr (Is_QSA) {
+                tPrVPtr[i] = page_ptr >= 0 ? reinterpret_cast<Element*>(page_ptr +
+                    static_cast<int64_t>(get<0>(stride(mV_paged.layout())) * page_offset + bidh_offset_v) * sizeof(Element)) : nullptr;
+            } else {
+                tPrVPtr[i] = reinterpret_cast<Element*>(page_ptr +
+                    static_cast<int64_t>(get<0>(stride(mV_paged.layout())) * page_offset + bidh_offset_v) * sizeof(Element));
+            }
 #endif
         }
     };
@@ -448,6 +535,9 @@ struct PagedKVManager {
                     k_ptr = reinterpret_cast<Element*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrKPtrAiu), m));
                 } else {
                     k_ptr = tPrKPtrAiu;
+                }
+                if constexpr (Is_QSA) {
+                    if (k_ptr == nullptr) { continue; }
                 }
                 Tensor mK_paged_cur = make_tensor(make_gmem_ptr(k_ptr), make_shape(kBlockNPagedPerAiuLoad, shape<1>(mK_paged)), select<0, 1>(stride(mK_paged)));
                 Tensor mK_paged_cur_copy = cute::tiled_divide(make_mix_tensor_like(mK_paged_cur), Shape<Int<kBlockNPagedPerAiuLoad>, Int<kBlockKGmem>>{})(_, _0{}, _);
@@ -479,6 +569,9 @@ struct PagedKVManager {
                 ? (!Seqlenk_mask || get<0>(t0KcK(_0{}, m, _0{})) < seqlenk_row_limit)
                 : get<0>(t0KcK(_0{}, m, _0{})) < seqlenk_row_limit;
             Element const* k_ptr = reinterpret_cast<Element const*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrKPtr(m / kGmemThreadsPerRow)), (m % kGmemThreadsPerRow), kGmemThreadsPerRow));
+            if constexpr (Is_QSA) {
+                if (k_ptr == nullptr) { continue; }
+            }
             Tensor mK_paged_cur = make_tensor(make_gmem_ptr(k_ptr), Shape<Int<kHeadDim>>{});
             Tensor mK_paged_cur_copy = cute::tiled_divide(mK_paged_cur, Shape<Int<kGmemElemsPerLoad>>{});
             if (should_load) {
@@ -537,6 +630,9 @@ struct PagedKVManager {
                 } else {
                     v_ptr = tPrVPtrAiu;
                 }
+                if constexpr (Is_QSA) {
+                    if (v_ptr == nullptr) { continue; }
+                }
                 Tensor mV_paged_cur = make_tensor(make_gmem_ptr(v_ptr), make_shape(kBlockNPagedPerAiuLoad, shape<1>(mV_paged)), select<0, 1>(stride(mV_paged)));
                 Tensor mV_paged_cur_copy = cute::tiled_divide(make_mix_tensor_like(mV_paged_cur), Shape<Int<kBlockNPagedPerAiuLoad>, Int<kBlockKGmem>>{})(_, _0{}, _);
                 cute::copy(gmem_tiled_copy_v_aiu, mV_paged_cur_copy, tVsV(_, row_idx, _));
@@ -567,12 +663,13 @@ struct PagedKVManager {
             if (EvenN || m < size<1>(tVsV) - 1 || get<0>(tVcV(_0{}, m, _0{})) < kBlockN) {
                 bool const should_load = !Seqlenk_mask || get<0>(t0VcV(_0{}, m, _0{})) < seqlenk_row_limit;
                 Element const* v_ptr = reinterpret_cast<Element const*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrVPtr(m / kGmemThreadsPerRow)), m % kGmemThreadsPerRow, kGmemThreadsPerRow));
+                bool const qsa_valid = Is_QSA ? (v_ptr != nullptr) : true;
                 Tensor mV_paged_cur = make_tensor(make_gmem_ptr(v_ptr), Shape<Int<kHeadDimV>>{});
                 Tensor mV_paged_cur_copy = cute::tiled_divide(mV_paged_cur, Shape<Int<kGmemElemsPerLoad>>{});
                 #pragma unroll
                 for (int k = 0; k < size<2>(tVsV); ++k) {
                     int const ki = get<1>(tVcV(_0{}, _0{}, k)) / kGmemElemsPerLoad;
-                    cute::copy(gmem_tiled_copy_kv.with(tVpV(_0{}, k) && should_load), mV_paged_cur_copy(_, ki), tVsV(_, m, k));
+                    cute::copy(gmem_tiled_copy_kv.with(tVpV(_0{}, k) && should_load && qsa_valid), mV_paged_cur_copy(_, ki), tVsV(_, m, k));
                 }
             }
         }

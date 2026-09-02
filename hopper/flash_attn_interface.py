@@ -1021,6 +1021,9 @@ def flash_attn_with_kvcache(
                  might come from any of the duplicate indices.
         cache_leftpad: (batch_size,), dtype torch.int32. The index that the KV cache starts. If None, assume 0.
         page_table [optional]: (batch_size, max_num_blocks_per_seq), dtype torch.int32.
+            Pass (total_q, 1, topk) instead to select query-sparse attention (QSA), where each row
+            holds the token indices selected for one unpadded query token. Requires head dim 256,
+            cu_seqlens_q, no cache_batch_idx, and a build with FLASH_ATTENTION_ENABLE_QSA.
         softmax_scale: float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).

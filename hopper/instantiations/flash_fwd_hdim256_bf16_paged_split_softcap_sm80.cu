@@ -12,5 +12,12 @@ template void run_mha_fwd_<89, cutlass::bfloat16_t, 256, 256, true, true, true, 
 #ifndef FLASHATTENTION_DISABLE_SM86
 template void run_mha_fwd_<86, cutlass::bfloat16_t, 256, 256, true, true, true, true>(Flash_fwd_params &params, hggcStream_t stream);
 #endif
+#ifdef FLASHATTENTION_ENABLE_QSA
+template void run_mha_fwd_<80, cutlass::bfloat16_t, 256, 256, true, true, true, true, true>(Flash_fwd_params &params, hggcStream_t stream);
+template void run_mha_fwd_<89, cutlass::bfloat16_t, 256, 256, true, true, true, true, true>(Flash_fwd_params &params, hggcStream_t stream);
+#ifndef FLASHATTENTION_DISABLE_SM86
+template void run_mha_fwd_<86, cutlass::bfloat16_t, 256, 256, true, true, true, true, true>(Flash_fwd_params &params, hggcStream_t stream);
+#endif
+#endif
 #endif
 #endif

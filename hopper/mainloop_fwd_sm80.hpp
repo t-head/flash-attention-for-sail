@@ -30,7 +30,7 @@ template <int kNWarps, int Stages, bool Q_in_regs, class TileShape_MNK_, int kHe
 #else
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool AppendKV_,
 #endif
-        bool PackGQA_, bool Split_, class ElementSAux_>
+        bool PackGQA_, bool Split_, class ElementSAux_, bool Is_QSA_=false>
 struct CollectiveMainloopFwdSm80 {
 
     static constexpr int kStages = Stages;
@@ -57,6 +57,10 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr bool AppendKV = AppendKV_;
     static constexpr bool PackGQA = PackGQA_;
     static constexpr bool Split = Split_;
+    static constexpr bool Is_QSA = Is_QSA_;
+    // QSA topk lists are pre-filtered for causality, and their column indices are positions within
+    // the sparse topk list rather than absolute token positions. Treat causal masking as a no-op.
+    static constexpr bool Effective_Is_causal = Is_causal && !Is_QSA;
     static constexpr bool V_colmajor = Is_FP8 && false;  // only col-major for now
     static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
 #if defined(USE_PPU) && USE_AIU && !defined(FLASHATTENTION_DISABLE_FP8)
@@ -86,7 +90,7 @@ struct CollectiveMainloopFwdSm80 {
 #endif
 
     using SeqlenInfo_t = flash::SeqlenInfoQKNewK<Varlen, AppendKV>;
-    using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split>;
+    using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split, Is_QSA>;
 
     using MMA_Atom_Arch =
 #ifdef USE_PPU
@@ -545,9 +549,13 @@ struct CollectiveMainloopFwdSm80 {
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
             params.qhead_per_khead_divmod);
         int const n_block_min = get<0>(n_block_min_max);
-        int const n_block_max = get<1>(n_block_min_max);
+        int n_block_max = get<1>(n_block_min_max);
+        // In QSA mode, cap n_block_max to the number of topk tiles
+        if constexpr (Is_QSA) {
+            n_block_max = std::min(n_block_max, cute::ceil_div(int(get<1>(params.shape_pagetable)), kBlockN));
+        }
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
-        if constexpr (Is_causal || Is_local || Varlen || Split) {
+        if constexpr (Is_causal || Is_local || Varlen || Split || Is_QSA) {
             if (n_block_max <= n_block_min) { return false; }
         }
 
@@ -720,15 +728,15 @@ struct CollectiveMainloopFwdSm80 {
             );
 #endif
         } else {
-            using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumMmaThreads, Element>;
+            using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumMmaThreads, Element, Is_QSA>;
             PackGQAt::load_Q(mQ, sQ, params.qhead_per_khead_divmod, thread_idx, seqlen_q, m_block);
         }
         cute::cp_async_fence();
 
 #if defined(USE_PPU) && USE_AIU
-        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumMmaThreads, Element, true /*KV_Same_Iter*/, 1 /*LoadsPerRow_LB*/, PagedKVAiu, kBlockNPagedPerAiuLoad>;
+        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumMmaThreads, Element, true /*KV_Same_Iter*/, 1 /*LoadsPerRow_LB*/, PagedKVAiu, kBlockNPagedPerAiuLoad, Is_QSA>;
 #else
-        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumMmaThreads, Element, true /*KV_Same_Iter*/>;
+        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumMmaThreads, Element, true /*KV_Same_Iter*/, 1 /*LoadsPerRow_LB*/, Is_QSA>;
 #endif
 #if defined(USE_PPU) && !defined(FLASHATTENTION_DISABLE_FP8)
         PagedKVManager_t paged_kv_manager = [&]() -> auto {
@@ -739,7 +747,8 @@ struct CollectiveMainloopFwdSm80 {
                     params.ptr_V, params.headdim_v, params.stride_V,
                     params.page_size_divmod, params.page_size_divmod,
                     bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k,
-                    0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/
+                    0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/,
+                    seqlen_info.offset_q, m_block
                 );
             } else {// not used, only for passing build check
                 return PagedKVManager_t(
@@ -748,7 +757,8 @@ struct CollectiveMainloopFwdSm80 {
                     params.ptr_V, params.headdim_v, params.stride_K,
                     params.page_size_divmod, params.page_size_divmod,
                     bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k,
-                    0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/
+                    0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/,
+                    seqlen_info.offset_q, m_block
                 );
             }
         }();
@@ -760,7 +770,8 @@ struct CollectiveMainloopFwdSm80 {
             params.page_size_divmod,
             params.page_size_divmod /*blockN_per_page_size_divmod, not used since we don't use TMA*/,
             bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k,
-            0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/
+            0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/,
+            seqlen_info.offset_q, m_block
         );
 #endif
 
@@ -943,7 +954,7 @@ struct CollectiveMainloopFwdSm80 {
 
         if constexpr (!Share_QV_Smem) { preprocess_Q(); }
 
-        flash::Mask<kBlockM, kBlockN, PackGQA, TiledMma> mask(
+        flash::Mask<kBlockM, kBlockN, PackGQA, TiledMma, false, Is_QSA> mask(
             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
             params.attention_chunk_divmod, params.qhead_per_khead_divmod
         );
@@ -1127,11 +1138,11 @@ struct CollectiveMainloopFwdSm80 {
             smem_pipe_read = smem_pipe_read < kStages - 1 ? smem_pipe_read + 1 : 0;
         };
 
-        auto first_iter_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+        auto first_iter_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<true /*Seqlenk_mask*/, Effective_Is_causal, Is_local>(tSrS, m_block, n_block); };
         fwd_step(n_block, first_iter_mask_fn, cute::true_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
         --n_block;
-        if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
-            auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+        if constexpr (Effective_Is_causal || Is_local) { // Separate iterations with causal or local masking
+            auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Effective_Is_causal, Is_local>(tSrS, m_block, n_block); };
             int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
                 seqlen_info, m_block, n_block_min, params.window_size_right,
                 params.attention_chunk_divmod, params.qhead_per_khead_divmod);
@@ -1180,6 +1191,7 @@ struct CollectiveMainloopFwdSm80 {
                  SeqlenInfo_t const& seqlen_info,
                  cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord
     ) {
+        static_assert(!(Is_QSA && AppendKV), "QSA mode does not support KV append");
         auto [m_block, bidh, bidb, split_idx] = block_coord;
         auto n_block_new_min_max = BlockMN_t::get_n_block_k_new_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,

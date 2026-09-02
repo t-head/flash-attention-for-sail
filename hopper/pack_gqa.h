@@ -15,7 +15,7 @@ namespace flash {
 
 using namespace cute;
 
-template <int kBlockM, int kHeadDim, int NumThreads, typename Element>
+template <int kBlockM, int kHeadDim, int NumThreads, typename Element, bool Is_QSA=false>
 struct PackGQAManager {
     // We use CpAsync for Q, since TMA doesn't work there
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
@@ -65,7 +65,7 @@ struct PackGQAManager {
         #pragma unroll
         for (int i = 0; i < NumPtrPerThread; ++i) {
             int const row = i * NumThreads + get<0>(tRows(thread_idx % NumThreadsPerRow));
-            int const idx = m_block * kBlockM + row;
+            int const idx = m_block * (Is_QSA ? qhead_per_khead_divmod.divisor : kBlockM) + row;
             int m_idx, h_idx;
             m_idx = qhead_per_khead_divmod.divmod(h_idx, idx);
             tPrPtr[i] = &tensor(make_coord(make_coord(h_idx, m_idx)));
@@ -105,9 +105,9 @@ struct PackGQAManager {
         int const qhead_per_khead = qhead_per_khead_divmod.divisor;
         #pragma unroll
         for (int m = 0; m < size<1>(tQsQ); ++m) {
-            int idx = m_block * kBlockM + get<0>(tQcQ(_0{}, m, _0{}));
+            int idx = m_block * (Is_QSA ? qhead_per_khead : kBlockM) + get<0>(tQcQ(_0{}, m, _0{}));
             Element const* q_ptr = reinterpret_cast<Element const*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrQPtr(m / kGmemThreadsPerRow)), m % kGmemThreadsPerRow, kGmemThreadsPerRow));
-            if (idx < seqlen_q * qhead_per_khead) {
+            if (Is_QSA ? get<0>(tQcQ(_0{}, m, _0{})) < qhead_per_khead : idx < seqlen_q * qhead_per_khead) {
                 // if (thread_idx == 0) { printf("m: %d, m_idx: %d, h_idx: %d, q_ptr = %p, q_ptr_og = %p\n", m, m_idx, h_idx, q_ptr, &mQ_copy(0, make_coord(h_idx, m_idx), 0));}
                 Tensor mQ_cur = make_tensor(make_gmem_ptr(q_ptr), Shape<Int<kHeadDim>>{});
                 Tensor mQ_cur_copy = cute::tiled_divide(mQ_cur, Shape<Int<kGmemElemsPerLoad>>{});
@@ -118,7 +118,12 @@ struct PackGQAManager {
                     // TODO: check this
                     cute::copy(gmem_tiled_copy_Q_cp_async.with(tQpQ(k)), mQ_cur_copy(_, ki), tQsQ(_, m, k));
                 }
-            } // Don't need to fill in 0s for sQ since we're not gonna write the output to gmem for those rows
+            } else if constexpr (Is_QSA) {
+                // For QSA, invalid rows still participate in the warp-collective softmax on sm89 (hdim256 fast path).
+                // Zero them so they don't poison the rescale decision for valid rows.
+                #pragma unroll
+                for (int k = 0; k < size<2>(tQsQ); ++k) { cute::clear(tQsQ(_, m, k)); }
+            }
         }
     };
 
@@ -149,9 +154,9 @@ struct PackGQAManager {
         int const qhead_per_khead = qhead_per_khead_divmod.divisor;
         #pragma unroll
         for (int mi = 0; mi < size(tLSErLSE); ++mi) {
-            int const row = m_block * kBlockM + get<0>(taccOcO_row(mi));
+            int const row = m_block * (Is_QSA ? qhead_per_khead : kBlockM) + get<0>(taccOcO_row(mi));
             float* ptr_LSE_cur = reinterpret_cast<float*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrLSEPtr[0]), mi % kMmaThreadsPerRow, kMmaThreadsPerRow));
-            if (get<1>(taccOcO_row(_0{})) == 0 && row < seqlen_o * qhead_per_khead) {
+            if (get<1>(taccOcO_row(_0{})) == 0 && (Is_QSA ? get<0>(taccOcO_row(mi)) < qhead_per_khead : row < seqlen_o * qhead_per_khead)) {
                 *ptr_LSE_cur = tLSErLSE(mi);
             }
         }
@@ -182,9 +187,9 @@ struct PackGQAManager {
         int const qhead_per_khead = qhead_per_khead_divmod.divisor;
         #pragma unroll
         for (int m = 0; m < size<1>(tOrO); ++m) {
-            int idx = m_block * kBlockM + get<0>(tOcO(_0{}, m, _0{}));
+            int idx = m_block * (Is_QSA ? qhead_per_khead : kBlockM) + get<0>(tOcO(_0{}, m, _0{}));
             Element* o_ptr = reinterpret_cast<Element*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrOPtr(m / kGmemThreadsPerRow)), m % kGmemThreadsPerRow, kGmemThreadsPerRow));
-            if (idx < seqlen_o * qhead_per_khead) {
+            if (Is_QSA ? get<0>(tOcO(_0{}, m, _0{})) < qhead_per_khead : idx < seqlen_o * qhead_per_khead) {
                 Tensor mO_cur = make_tensor(make_gmem_ptr(o_ptr), Shape<Int<kHeadDim>>{});
                 Tensor mO_cur_copy = cute::tiled_divide(mO_cur, Shape<Int<kGmemElemsPerStore>>{});
                 #pragma unroll
@@ -240,9 +245,9 @@ struct PackGQAManager {
         int const qhead_per_khead = qhead_per_khead_divmod.divisor;
         #pragma unroll
         for (int m = 0; m < size<1>(tOrO_copy); ++m) {
-            int row = m_block * kBlockM + get<0>(taccOcO_row(m));
+            int row = m_block * (Is_QSA ? qhead_per_khead : kBlockM) + get<0>(taccOcO_row(m));
             Element* o_ptr = reinterpret_cast<Element*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrOPtr[0]), m % kMmaThreadsPerRow, kMmaThreadsPerRow));
-            if (row < seqlen_o * qhead_per_khead) {
+            if (Is_QSA ? get<0>(taccOcO_row(m)) < qhead_per_khead : row < seqlen_o * qhead_per_khead) {
                 Tensor mO_cur = make_tensor(make_gmem_ptr(o_ptr), Shape<Int<kHeadDim>>{});
                 Tensor mO_cur_copy = cute::tiled_divide(mO_cur, Shape<Int<kGmemElemsPerStoreDirect>>{});
                 #pragma unroll
