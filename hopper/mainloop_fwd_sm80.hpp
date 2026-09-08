@@ -60,7 +60,10 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr bool PackGQA = PackGQA_;
     static constexpr bool Split = Split_;
     static constexpr bool Is_QSA = Is_QSA_;
-    static constexpr bool V_colmajor = Is_FP8 && false;  // only col-major for now
+    // QSA topk lists are pre-filtered for causality, and their column indices are positions within
+    // the sparse topk list rather than absolute token positions. Treat causal masking as a no-op.
+    static constexpr bool Effective_Is_causal = Is_causal && !Is_QSA;
+    static constexpr bool V_colmajor = Is_FP8 && false;  // only row-major for now
     static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
 #if defined(USE_PPU) && USE_AIU && !defined(FLASHATTENTION_DISABLE_FP8)
     // FP8 V register-direct path: assemble MMA B fragments straight from the
@@ -154,31 +157,24 @@ struct CollectiveMainloopFwdSm80 {
     // We want each "row" to have 64 elements (128 bytes, i.e. 1 cache line). E.g. if hdim=128, we want each
     // thread to have 4 loads in the M direction and 2 vectorized load in the K direction.
     static constexpr int kBytePerRow = kHeadDimGCD * sizeof(Element);
-    static constexpr int kBlockKGmem = (kBytePerRow % 128 == 0 ? 128 : (kBytePerRow % 64 == 0 ? 64 : 32)) / sizeof(Element);
+    static constexpr int kBytePerBlockK = kBytePerRow % 128 == 0 ? 128 : (kBytePerRow % 64 == 0 ? 64 : 32);
+    static_assert(!((kBytePerBlockK == 32) && Is_FP8), "kBytePerBlockK 32 not supported for FP8.");
+    static constexpr int kBlockKGmem = kBytePerBlockK / sizeof(Element);
 
     static constexpr int kSwizzle = kBlockKGmem == 128 ? 4 : (kBlockKGmem == 64 ? 3 : (kBlockKGmem == 32 ? 2 : 1));
     static constexpr int kSwizzleBase = sizeof(Element) == 4 ? 2 : (sizeof(Element) == 2 ? 3 : 4);
-#if defined(USE_PPU) && !defined(FLASHATTENTION_DISABLE_FP8)
-    static constexpr int vGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
-    static_assert(kBlockN % vGmemElemsPerLoad == 0, "Elem number of a row must be a multiple of vGmemElemsPerLoad");
-    static constexpr int vBytePerRow = kBlockN * sizeof(Element);
-    static constexpr int vBlockKGmem = (vBytePerRow % 128 == 0 ? 128 : (vBytePerRow % 64 == 0 ? 64 : 32)) / sizeof(Element);
-#endif
+    static constexpr int kSwizzleM = sizeof(Element) == 4 ? 2 : (sizeof(Element) == 2 ? 3 : 4); // M: 16B
+    // static constexpr int kSwizzleS = kBytePerBlockK == 128 ? 3 : 2;  // S: 128B / 64B
+    // static constexpr int kSwizzleB = kSwizzleS;                      // B = S to max swizzle
+    static constexpr int kSwizzleS = 3;  // we always want 128B swizzle
+    static constexpr int kSwizzleB = kBytePerBlockK == 128 ? 3 : (kBlockKGmem == 64 ? 2 : 1); // 8 rows in atom, so B=2 for 64B BlockK
+
 #if defined(USE_PPU) && USE_AIU
     using SmemLayoutAtomQKV = Layout<Shape<_8, Int<kBlockKGmem>>, Stride<Int<kBlockKGmem>, _1>>;
     using SmemLayoutAtomQKVSwizzle = decltype(
-        composition(Swizzle<kSwizzle, kSwizzleBase, kSwizzleBase>{},
+        composition(Swizzle<kSwizzleB, kSwizzleM, kSwizzleS>{},
                     Layout<Shape<_8, Int<kBlockKGmem>>,
                            Stride<Int<kBlockKGmem>, _1>>{}));
-#if !defined(FLASHATTENTION_DISABLE_FP8)
-    static constexpr int bits_cl = sizeof(Element) == 4 ? 5 : (sizeof(Element) == 2 ? 6 : 7);
-    static constexpr int bits_qkv_row = kBlockKGmem == 128 ? 7 : (kBlockKGmem == 64 ? 6 : 5);
-    static constexpr int qkv_swzl_b = 3 + bits_qkv_row - bits_cl;
-    using SmemLayoutAtomVSwizzle = decltype(
-        composition(Swizzle<qkv_swzl_b, kSwizzleBase, bits_cl - kSwizzleBase>{},
-                    Layout<Shape<_8, Int<kBlockKGmem>>,
-                           Stride<Int<kBlockKGmem>, _1>>{}));
-#endif
 #else
     using SmemLayoutAtomQKV = decltype(
         composition(Swizzle<kSwizzle, kSwizzleBase, kSwizzleBase>{},
@@ -187,33 +183,17 @@ struct CollectiveMainloopFwdSm80 {
     using SmemLayoutAtomQKVSwizzle = SmemLayoutAtomQKV;
 #endif
 
-#if defined(USE_PPU) && !defined(FLASHATTENTION_DISABLE_FP8)
-    using SmemLayoutQ = std::conditional_t<!PackGQA,
-        decltype(tile_to_shape(SmemLayoutAtomQKV{}, select<0, 2>(TileShape_MNK{}))),
-        std::conditional_t<Is_FP8,
-        decltype(tile_to_shape(SmemLayoutAtomVSwizzle{}, select<0, 2>(TileShape_MNK{}))),
-        decltype(tile_to_shape(SmemLayoutAtomQKVSwizzle{}, select<0, 2>(TileShape_MNK{})))>>;
-
-    using SmemLayoutK = std::conditional_t<!PagedKV || PagedKVAiu,
-        decltype(tile_to_shape(SmemLayoutAtomQKV{}, make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{}))),
-        std::conditional_t<Is_FP8,
-        decltype(tile_to_shape(SmemLayoutAtomVSwizzle{}, make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{}))),
-        decltype(tile_to_shape(SmemLayoutAtomQKVSwizzle{}, make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})))>>;
-#else
     using SmemLayoutQ = std::conditional_t<!PackGQA,
         decltype(tile_to_shape(SmemLayoutAtomQKV{}, select<0, 2>(TileShape_MNK{}))),
         decltype(tile_to_shape(SmemLayoutAtomQKVSwizzle{}, select<0, 2>(TileShape_MNK{})))>;
     using SmemLayoutK = std::conditional_t<!PagedKV || PagedKVAiu,
         decltype(tile_to_shape(SmemLayoutAtomQKV{}, make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{}))),
         decltype(tile_to_shape(SmemLayoutAtomQKVSwizzle{}, make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})))>;
-#endif
 
 #if defined(USE_PPU) && !defined(FLASHATTENTION_DISABLE_FP8)
     using SmemLayoutV_ROW = std::conditional_t<!PagedKV || PagedKVAiu,
         decltype(tile_to_shape(SmemLayoutAtomQKV{}, make_shape(shape<2>(TileShape_MNK_PV{}), shape<1>(TileShape_MNK_PV{}), Int<kStages>{}))),
-        std::conditional_t<Is_FP8,
-        decltype(tile_to_shape(SmemLayoutAtomVSwizzle{}, make_shape(shape<2>(TileShape_MNK_PV{}), shape<1>(TileShape_MNK_PV{}), Int<kStages>{}))),
-        decltype(tile_to_shape(SmemLayoutAtomQKVSwizzle{}, make_shape(shape<2>(TileShape_MNK_PV{}), shape<1>(TileShape_MNK_PV{}), Int<kStages>{})))>>;
+        decltype(tile_to_shape(SmemLayoutAtomQKVSwizzle{}, make_shape(shape<2>(TileShape_MNK_PV{}), shape<1>(TileShape_MNK_PV{}), Int<kStages>{})))>;
     // Transposed view of SmemLayoutV_ROW. Under FP8 (V-direct) it only shapes
     // the tOrV B fragment and tOsVt (never consumed); BF16 uses it for the
     // tOsVt smem reads.
@@ -298,6 +278,8 @@ struct CollectiveMainloopFwdSm80 {
                                Stride<_1,_1>>{},
                         Layout<Shape <Int<kBlockN>, Int<kBlockKGmem>>>{}));
 #if !defined(FLASHATTENTION_DISABLE_FP8)
+    static constexpr int vBytePerRow = kBlockN * sizeof(Element);
+    static constexpr int vBlockKGmem = (vBytePerRow % 128 == 0 ? 128 : (vBytePerRow % 64 == 0 ? 64 : 32)) / sizeof(Element);
     static constexpr int bits_per_aiu_Vt = kHeadDim * vBlockKGmem * sizeof(Element) * 8 ;
     using Gmem_copy_struct_Vt = std::conditional_t<
         ArchTag::kMinComputeCapability >= 89,
@@ -1078,16 +1060,9 @@ struct CollectiveMainloopFwdSm80 {
                 }
             }
 #endif
-            if constexpr (Is_FP8) {
-#ifndef USE_PPU
+            if constexpr (Fp8VDirect) {
                 // perform a swap about R1/R2
                 flash::permute_Cregs_fp8(tSrS);
-#else
-                // Fp8VDirect (zero-shfl pi_k/pi_n): permute the S fragment so
-                // that the plain acc->Aregs view below yields the pi_k A
-                // fragment by pure indexing (permute_Aregs_fp8 skipped).
-                if constexpr (Fp8VDirect) { flash::permute_Cregs_fp8(tSrS); }
-#endif
             }
 #ifdef USE_PPU
             Tensor tOrP_acc = [&]() -> auto {
@@ -1192,15 +1167,11 @@ struct CollectiveMainloopFwdSm80 {
         float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
         Tensor scores_scale = softmax_finalize_dispatch(v_descale);
         softmax.rescale_o(tOrO, scores_scale);
-        if constexpr (Is_FP8) {
-#ifndef USE_PPU
-            flash::permute_output_fp8(tOrO);
-#else
+        if constexpr (Fp8VDirect) {
             // Fp8VDirect: undo the lane-local part of pi_n (d1<->d4, d3<->d6).
             // The remaining cross-lane part is resolved by the epilogue
             // through TiledMmaOPerm's permuted CLayout.
-            if constexpr (Fp8VDirect) { flash::permute_output_fp8(tOrO); }
-#endif
+            flash::permute_output_fp8(tOrO);
         }
         return true;
     }
