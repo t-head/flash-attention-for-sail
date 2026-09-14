@@ -24,7 +24,9 @@ namespace flash {
 using namespace cute;
 
 template <class TileShape_MNK_PV_, class ClusterShape_, class Element_, class ArchTag_,
-          int NumEpilogueThreads_, bool Varlen_, bool PackGQA_, bool Split_, bool FP8PermuteCol=false, bool Is_QSA_=false>
+          int NumEpilogueThreads_, bool Varlen_, bool PackGQA_, bool Split_, bool FP8PermuteCol=false, bool Is_QSA_=false
+          , class QsaConfig = flash::QsaConfig
+          >
 struct CollectiveEpilogueFwd {
 
     using TileShape_MNK_PV = TileShape_MNK_PV_;
@@ -318,8 +320,12 @@ struct CollectiveEpilogueFwd {
         Tensor taccOcO_row = taccOcO_rowcol(_, _0{});
         CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));                     // MMA_M
 
-        using PackGQA_t = flash::PackGQAManager<get<0>(TileShape_MNK_PV{}), get<1>(TileShape_MNK_PV{}), NumEpilogueThreads, Element, Is_QSA>;
-        using PackGQApartial_t = flash::PackGQAManager<get<0>(TileShape_MNK_PV{}), get<1>(TileShape_MNK_PV{}), NumEpilogueThreads, ElementPartial, Is_QSA>;
+        using PackGQA_t = flash::PackGQAManager<get<0>(TileShape_MNK_PV{}), get<1>(TileShape_MNK_PV{}), NumEpilogueThreads, Element, Is_QSA
+            , QsaConfig
+            >;
+        using PackGQApartial_t = flash::PackGQAManager<get<0>(TileShape_MNK_PV{}), get<1>(TileShape_MNK_PV{}), NumEpilogueThreads, ElementPartial, Is_QSA
+            , QsaConfig
+            >;
 
         Tensor mLSE = make_tensor(make_gmem_ptr((!is_split ? params.ptr_LSE : params.ptr_LSE_partial) + offset_o * get<0>(!is_split ? params.stride_LSE : params.stride_LSE_partial)),
                                   params.shape_LSE_packed,
@@ -482,6 +488,10 @@ struct CollectiveEpilogueFwd {
             const int row = m_block * kBlockM + thread_idx;
             if constexpr (!PackGQA) {
                 if (row < seqlen_o) { mLSE(row) = -INFINITY; }
+            } else if constexpr (Is_QSA) {
+                if (m_block < seqlen_o && thread_idx < qhead_per_khead) {
+                    mLSE(make_coord(make_coord(thread_idx, m_block))) = -INFINITY;
+                }
             } else {
                 if (row < seqlen_o * qhead_per_khead) {
                     int m_idx, h_idx;
@@ -514,7 +524,9 @@ struct CollectiveEpilogueFwd {
                 );
             } else {
                 // If PackGQA, we split the work of compute O_ptr among threads in the same row
-                using PackGQA_t = flash::PackGQAManager<get<0>(TileShape_MNK_PV{}), get<1>(TileShape_MNK_PV{}), NumEpilogueThreads, Element, Is_QSA>;
+                using PackGQA_t = flash::PackGQAManager<get<0>(TileShape_MNK_PV{}), get<1>(TileShape_MNK_PV{}), NumEpilogueThreads, Element, Is_QSA
+            , QsaConfig
+            >;
                 Tensor tOrO = make_tensor<Element>(make_shape(Shape<_1, Int<kGmemElemsPerStore>>{}, size<1>(tOcO), size<2>(tOcO)));
                 cute::clear(tOrO);
                 PackGQA_t::store_O(mO, tOrO, params.qhead_per_khead_divmod, thread_idx, seqlen_o, m_block);

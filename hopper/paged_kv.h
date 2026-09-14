@@ -10,15 +10,20 @@
 #include "cutlass/fast_math.h"  // For cutlass::FastDivmod
 
 #include "utils.h"
+#include "qsa/dispatch.h"
 
 namespace flash {
 
 using namespace cute;
 
 #if defined(USE_PPU) && USE_AIU
-template <int kBlockN, int kHeadDim, int kHeadDimV, int NumThreads, typename Element, bool KV_Same_Iter=false, int LoadsPerRow_LB=1, bool PagedKVAiu=false, int kBlockNPagedPerAiuLoad=16, bool Is_QSA=false>
+template <int kBlockN, int kHeadDim, int kHeadDimV, int NumThreads, typename Element, bool KV_Same_Iter=false, int LoadsPerRow_LB=1, bool PagedKVAiu=false, int kBlockNPagedPerAiuLoad=16, bool Is_QSA=false
+          , class QsaConfig = flash::QsaConfig
+          >
 #else
-template <int kBlockN, int kHeadDim, int kHeadDimV, int NumThreads, typename Element, bool KV_Same_Iter=false, int LoadsPerRow_LB=1, bool Is_QSA=false>
+template <int kBlockN, int kHeadDim, int kHeadDimV, int NumThreads, typename Element, bool KV_Same_Iter=false, int LoadsPerRow_LB=1, bool Is_QSA=false
+          , class QsaConfig = flash::QsaConfig
+          >
 #endif
 struct PagedKVManager {
     // If KV_Same_Iter=false, then we do load_page_table(0), load_K(0), load_page_table(1), load_K(1), load_V(0),
@@ -39,7 +44,9 @@ struct PagedKVManager {
     // In the case of PackGQA, this reduces the number of times we need to call divmod.
     static_assert(kHeadDimGCD % LoadsPerRow_LB == 0, "Headdim and HeaddimV must be a multiple of LoadsPerRow_LB");
     static constexpr int kBytePerRow = kHeadDimGCD / LoadsPerRow_LB * sizeof(Element);
-    static constexpr int kBlockKGmem = (kBytePerRow % 128 == 0 ? 128 : (kBytePerRow % 64 == 0 ? 64 : 32)) / sizeof(Element);
+    // A wider per-row group keeps each async request on fewer random token rows.
+    static constexpr int kBlockKGmem = (QsaConfig::RowBytes ? QsaConfig::RowBytes
+        : (kBytePerRow % 128 == 0 ? 128 : (kBytePerRow % 64 == 0 ? 64 : 32))) / sizeof(Element);
     static constexpr int kGmemThreadsPerRow = kBlockKGmem / kGmemElemsPerLoad;
     static_assert(NumThreads % kGmemThreadsPerRow == 0, "NumThreads must be a multiple of kGmemThreadsPerRow");
     // We assume threads loading the same row are in the same warp. This is for an optimization in PagedKV where
@@ -369,9 +376,15 @@ struct PagedKVManager {
                 bool flag = ((i + 1) * NumThreads <= kBlockN || row < kBlockN) && (!Seqlenk_mask || row_idx < seqlen_k);
 #ifndef FA3_HLLM_BUILD
                 int const token_index = flag ? __ldg(&mPageTable[row_idx]) : 0;
-                int page_offset_local;
-                int const page = token_index >= 0 ? page_size_divmod.divmod(page_offset_local, token_index) : -1;
-                tPrPageOffset[i] = {page, page_offset_local};
+                // The QSA dispatcher requires contiguous physical K and V pages.
+                // Every QSA index is still loaded independently; no index continuity assumption.
+                if constexpr (QsaConfig::RowBytes) {
+                    tPrPageOffset[i] = {token_index >= 0 ? 0 : -1, token_index >= 0 ? token_index : 0};
+                } else {
+                    int page_offset_local = 0;
+                    int const page = token_index >= 0 ? page_size_divmod.divmod(page_offset_local, token_index) : -1;
+                    tPrPageOffset[i] = {page, page_offset_local};
+                }
 #else
 #ifndef FA3_HLLM_USE_ADDR
                 int const token_index_k = flag ? __ldg(&mPageTable[row_idx]) : 0;
@@ -468,7 +481,9 @@ struct PagedKVManager {
             auto [page, page_offset] = tPrHllmKPageOffset[i];
 #endif // FA3_HLLM_BUILD
             if constexpr (Is_QSA) {
-                tPrKPtr[i] = page >= 0 ? &mK_paged(page_offset, _0{}, page) : nullptr;
+                if constexpr (QsaConfig::DirectIndex) {
+                    tPrKPtr[i] = page >= 0 ? raw_pointer_cast(mK_paged.data()) + int64_t(page_offset) * QsaConfig::KVStride : nullptr;
+                } else { tPrKPtr[i] = page >= 0 ? &mK_paged(page_offset, _0{}, page) : nullptr; }
             } else {
                 tPrKPtr[i] = &mK_paged(page_offset, _0{}, page);
             }
@@ -497,7 +512,9 @@ struct PagedKVManager {
             auto [page, page_offset] = tPrHllmVPageOffset[i];
 #endif // FA3_HLLM_BUILD
             if constexpr (Is_QSA) {
-                tPrVPtr[i] = page >= 0 ? &mV_paged(page_offset, _0{}, page) : nullptr;
+                if constexpr (QsaConfig::DirectIndex) {
+                    tPrVPtr[i] = page >= 0 ? raw_pointer_cast(mV_paged.data()) + int64_t(page_offset) * QsaConfig::KVStride : nullptr;
+                } else { tPrVPtr[i] = page >= 0 ? &mV_paged(page_offset, _0{}, page) : nullptr; }
             } else {
                 tPrVPtr[i] = &mV_paged(page_offset, _0{}, page);
             }
@@ -568,17 +585,30 @@ struct PagedKVManager {
             bool const should_load = EvenN
                 ? (!Seqlenk_mask || get<0>(t0KcK(_0{}, m, _0{})) < seqlenk_row_limit)
                 : get<0>(t0KcK(_0{}, m, _0{})) < seqlenk_row_limit;
-            Element const* k_ptr = reinterpret_cast<Element const*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrKPtr(m / kGmemThreadsPerRow)), (m % kGmemThreadsPerRow), kGmemThreadsPerRow));
-            if constexpr (Is_QSA) {
+            Element const* k_ptr;
+            if constexpr (QsaConfig::DirectIndex) {
+                int const row_idx = n_block * kBlockN + get<0>(tKcK(_0{}, m, _0{}));
+                int token;
+                if constexpr (QsaConfig::RowBytes == 512) {
+                    // A whole warp copies one row; its index and predicate are uniform.
+                    static_assert(kGmemThreadsPerRow == 32);
+                    token = __ppu_read_firstlane(should_load)
+                        ? __ld_smem(&mPageTable[__ppu_read_firstlane(row_idx)]) : -1;
+                } else {
+                    token = should_load ? __ldg(&mPageTable[row_idx]) : -1;
+                }
+                k_ptr = token >= 0 ? raw_pointer_cast(mK_paged.data()) + int64_t(token) * QsaConfig::KVStride : nullptr;
+            } else { k_ptr = reinterpret_cast<Element const*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrKPtr(m / kGmemThreadsPerRow)), (m % kGmemThreadsPerRow), kGmemThreadsPerRow)); }
+            if constexpr (Is_QSA && !QsaConfig::RowBytes) {
                 if (k_ptr == nullptr) { continue; }
             }
             Tensor mK_paged_cur = make_tensor(make_gmem_ptr(k_ptr), Shape<Int<kHeadDim>>{});
             Tensor mK_paged_cur_copy = cute::tiled_divide(mK_paged_cur, Shape<Int<kGmemElemsPerLoad>>{});
-            if (should_load) {
+            if (QsaConfig::RowBytes || should_load) {
                 #pragma unroll
                 for (int k = 0; k < size<2>(tKsK); ++k) {
                     int const ki = get<1>(tKcK(_0{}, _0{}, k)) / kGmemElemsPerLoad;
-                    cute::copy(gmem_tiled_copy_kv.with(tKpK(_0{}, k)), mK_paged_cur_copy(_, ki), tKsK(_, m, k));
+                    cute::copy(gmem_tiled_copy_kv.with(QsaConfig::RowBytes ? should_load && (!Is_QSA || k_ptr != nullptr) : tKpK(_0{}, k)), mK_paged_cur_copy(_, ki), tKsK(_, m, k));
                 }
             }  // Don't need to clear out the rest of the smem since we'll mask out the scores anyway
         }
@@ -662,14 +692,26 @@ struct PagedKVManager {
             // If kBlockN doesn't evenly divide the tiled copy, only the last `m` needs to checked
             if (EvenN || m < size<1>(tVsV) - 1 || get<0>(tVcV(_0{}, m, _0{})) < kBlockN) {
                 bool const should_load = !Seqlenk_mask || get<0>(t0VcV(_0{}, m, _0{})) < seqlenk_row_limit;
-                Element const* v_ptr = reinterpret_cast<Element const*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrVPtr(m / kGmemThreadsPerRow)), m % kGmemThreadsPerRow, kGmemThreadsPerRow));
+                Element const* v_ptr;
+                if constexpr (QsaConfig::DirectIndex) {
+                    int const row_idx = n_block * kBlockN + get<0>(tVcV(_0{}, m, _0{}));
+                    int token;
+                    if constexpr (QsaConfig::RowBytes == 512) {
+                        static_assert(kGmemThreadsPerRow == 32);
+                        token = __ppu_read_firstlane(should_load)
+                            ? __ld_smem(&mPageTable[__ppu_read_firstlane(row_idx)]) : -1;
+                    } else {
+                        token = should_load ? __ldg(&mPageTable[row_idx]) : -1;
+                    }
+                    v_ptr = token >= 0 ? raw_pointer_cast(mV_paged.data()) + int64_t(token) * QsaConfig::KVStride : nullptr;
+                } else { v_ptr = reinterpret_cast<Element const*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrVPtr(m / kGmemThreadsPerRow)), m % kGmemThreadsPerRow, kGmemThreadsPerRow)); }
                 bool const qsa_valid = Is_QSA ? (v_ptr != nullptr) : true;
                 Tensor mV_paged_cur = make_tensor(make_gmem_ptr(v_ptr), Shape<Int<kHeadDimV>>{});
                 Tensor mV_paged_cur_copy = cute::tiled_divide(mV_paged_cur, Shape<Int<kGmemElemsPerLoad>>{});
                 #pragma unroll
                 for (int k = 0; k < size<2>(tVsV); ++k) {
                     int const ki = get<1>(tVcV(_0{}, _0{}, k)) / kGmemElemsPerLoad;
-                    cute::copy(gmem_tiled_copy_kv.with(tVpV(_0{}, k) && should_load && qsa_valid), mV_paged_cur_copy(_, ki), tVsV(_, m, k));
+                    cute::copy(gmem_tiled_copy_kv.with((QsaConfig::RowBytes || tVpV(_0{}, k)) && should_load && qsa_valid), mV_paged_cur_copy(_, ki), tVsV(_, m, k));
                 }
             }
         }

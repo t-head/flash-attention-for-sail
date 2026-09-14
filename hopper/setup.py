@@ -173,6 +173,9 @@ if not SKIP_CUDA_BUILD:
         sources += ["flash_fwd_combine.cu"]
     sources += ["flash_prepare_scheduler.cu"]
 
+    if ENABLE_QSA:
+        sources += ["qsa/dispatch.cu"]
+
     include_dirs = [
         str(Path(this_dir)),
         str(actlize_dir / "include"),

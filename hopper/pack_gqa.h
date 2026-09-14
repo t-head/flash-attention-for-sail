@@ -10,12 +10,15 @@
 #include "cutlass/fast_math.h"  // For cutlass::FastDivmod
 
 #include "utils.h"
+#include "qsa/dispatch.h"
 
 namespace flash {
 
 using namespace cute;
 
-template <int kBlockM, int kHeadDim, int NumThreads, typename Element, bool Is_QSA=false>
+template <int kBlockM, int kHeadDim, int NumThreads, typename Element, bool Is_QSA=false
+          , class QsaConfig = flash::QsaConfig
+          >
 struct PackGQAManager {
     // We use CpAsync for Q, since TMA doesn't work there
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
@@ -65,9 +68,9 @@ struct PackGQAManager {
         #pragma unroll
         for (int i = 0; i < NumPtrPerThread; ++i) {
             int const row = i * NumThreads + get<0>(tRows(thread_idx % NumThreadsPerRow));
-            int const idx = m_block * (Is_QSA ? qhead_per_khead_divmod.divisor : kBlockM) + row;
+            int const idx = m_block * (Is_QSA ? (QsaConfig::FixedGroup ? QsaConfig::Group : qhead_per_khead_divmod.divisor) : kBlockM) + row;
             int m_idx, h_idx;
-            m_idx = qhead_per_khead_divmod.divmod(h_idx, idx);
+            if constexpr (QsaConfig::FixedGroup) { m_idx = idx / QsaConfig::Group; h_idx = idx % QsaConfig::Group; } else { m_idx = qhead_per_khead_divmod.divmod(h_idx, idx); }
             tPrPtr[i] = &tensor(make_coord(make_coord(h_idx, m_idx)));
         }
         return tPrPtr;
@@ -102,7 +105,7 @@ struct PackGQAManager {
         Tensor mQ_0 = mQ(_, _0{});
         Tensor tQcQ_row = tQcQ(_0{}, _, _0{});
         Tensor tPrQPtr = compute_ptr(mQ_0, tQcQ_row, qhead_per_khead_divmod, thread_idx, m_block);
-        int const qhead_per_khead = qhead_per_khead_divmod.divisor;
+        int const qhead_per_khead = (QsaConfig::FixedGroup ? QsaConfig::Group : qhead_per_khead_divmod.divisor);
         #pragma unroll
         for (int m = 0; m < size<1>(tQsQ); ++m) {
             int idx = m_block * (Is_QSA ? qhead_per_khead : kBlockM) + get<0>(tQcQ(_0{}, m, _0{}));
@@ -116,7 +119,7 @@ struct PackGQAManager {
                     int ki = get<1>(tQcQ(_0{}, _0{}, k)) / kGmemElemsPerLoad;
                     // the "tiled_copy.with(tQpQ(k))"" will fill in zero for columns where tQpQ(k) is false
                     // TODO: check this
-                    cute::copy(gmem_tiled_copy_Q_cp_async.with(tQpQ(k)), mQ_cur_copy(_, ki), tQsQ(_, m, k));
+                    cute::copy(gmem_tiled_copy_Q_cp_async.with(QsaConfig::FixedGroup || tQpQ(k)), mQ_cur_copy(_, ki), tQsQ(_, m, k));
                 }
             } else if constexpr (Is_QSA) {
                 // For QSA, invalid rows still participate in the warp-collective softmax on sm89 (hdim256 fast path).
@@ -151,7 +154,7 @@ struct PackGQAManager {
 
         Tensor tPrLSEPtr = compute_ptr<kMmaThreadsPerRow>(mLSE, taccOcO_row, qhead_per_khead_divmod, thread_idx, m_block);
         static_assert(CUTE_STATIC_V(size(tPrLSEPtr)) == 1);
-        int const qhead_per_khead = qhead_per_khead_divmod.divisor;
+        int const qhead_per_khead = (QsaConfig::FixedGroup ? QsaConfig::Group : qhead_per_khead_divmod.divisor);
         #pragma unroll
         for (int mi = 0; mi < size(tLSErLSE); ++mi) {
             int const row = m_block * (Is_QSA ? qhead_per_khead : kBlockM) + get<0>(taccOcO_row(mi));
@@ -184,7 +187,7 @@ struct PackGQAManager {
         Tensor mO_0 = mO(_, _0{});
         Tensor tOcO_row = tOcO(_0{}, _, _0{});
         Tensor tPrOPtr = compute_ptr(mO_0, tOcO_row, qhead_per_khead_divmod, thread_idx, m_block);
-        int const qhead_per_khead = qhead_per_khead_divmod.divisor;
+        int const qhead_per_khead = (QsaConfig::FixedGroup ? QsaConfig::Group : qhead_per_khead_divmod.divisor);
         #pragma unroll
         for (int m = 0; m < size<1>(tOrO); ++m) {
             int idx = m_block * (Is_QSA ? qhead_per_khead : kBlockM) + get<0>(tOcO(_0{}, m, _0{}));
@@ -195,7 +198,7 @@ struct PackGQAManager {
                 #pragma unroll
                 for (int k = 0; k < size<2>(tOrO); ++k) {
                     int ki = get<1>(tOcO(_0{}, _0{}, k)) / kGmemElemsPerStore;
-                    if (tOpO(k)) {
+                    if (QsaConfig::FixedGroup || tOpO(k)) {
                         cute::copy(gmem_tiled_copy_O, tOrO(_, m, k), mO_cur_copy(_, ki));
                     }
                 }
@@ -242,7 +245,7 @@ struct PackGQAManager {
         Tensor tPrOPtr = compute_ptr<kMmaThreadsPerRow>(mO_0, taccOcO_row, qhead_per_khead_divmod, thread_idx, m_block);
         static_assert(CUTE_STATIC_V(size(tPrOPtr)) == 1);
 
-        int const qhead_per_khead = qhead_per_khead_divmod.divisor;
+        int const qhead_per_khead = (QsaConfig::FixedGroup ? QsaConfig::Group : qhead_per_khead_divmod.divisor);
         #pragma unroll
         for (int m = 0; m < size<1>(tOrO_copy); ++m) {
             int row = m_block * (Is_QSA ? qhead_per_khead : kBlockM) + get<0>(taccOcO_row(m));

@@ -461,11 +461,20 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, hggcStream_t stream) {
 }
 
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
+#include "qsa/dispatch.h"
+#endif
+
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
 // QSA is only verified for head dim 256 bf16/fp16, so only those kernels are instantiated.
 template <int Arch, int Split, bool PagedKVNonTMA, bool PackGQA, bool Has_softcap>
 void run_mha_fwd_qsa(Flash_fwd_params &params, hggcStream_t stream) {
 #ifndef FLASHATTENTION_DISABLE_HDIM256
     TORCH_CHECK(params.d == 256 && params.dv == 256, "QSA only supports head dim 256");
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
+    if constexpr (Arch == 89 && PagedKVNonTMA && PackGQA && !Has_softcap) {
+        if (run_qsa(params, stream)) { return; }
+    }
+#endif
     if (params.is_bf16) {
         return run_mha_fwd_<Arch, cutlass::bfloat16_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA, true>(params, stream);
     } else {
@@ -636,10 +645,24 @@ inline int get_num_splits(Flash_fwd_params const& params) {
         (params.d_rounded <= 64 ? (params.dv_rounded <= 64 ? 8 : (params.dv_rounded <= 256 ? 6 : 14)) : (params.d_rounded <= 96 ? 10 : (params.d_rounded <= 128 ? 8 : (params.d_rounded <= 192 ? 5 : 16))));
     // QSA maps one m_block to one query token, so total_mblocks above under-counts it by
     // kBlockM / qhead_per_khead and the generic heuristic below sizes the wrong M axis.
-    if (params.is_qsa && params.seqlen_q > 16) {
+    if (params.is_qsa) {
         int const qsa_mblocks = std::max(1, params.h_k * params.total_q);
         int const slots = std::max(1, params.num_sm * occ);
-        if (slots / qsa_mblocks > 1) { return std::min(128, slots / qsa_mblocks); }
+        // Long GQA8 gathers benefit from two-stage loading. Fill complete waves using
+        // the device's CU count, rounding down so a small remainder does not add a wave.
+        bool const long_gqa8 = params.arch == 89 && params.is_bf16
+            && params.d == 256 && params.dv == 256 && params.h == 8 * params.h_k
+            && params.k_row_stride == 512 && params.v_row_stride == 512
+            && (params.seqlen_k >= 8192 || (params.seqlen_q == 1 && params.seqlen_k >= 2048
+                && int64_t(params.num_pages) * params.page_size * params.k_row_stride * 2
+                   >= int64_t(params.b) * 128 * 1024 * 1024));
+        int const target_mblocks = long_gqa8 ? slots : (params.h / params.h_k <= 16 ? 512 : 256);
+        if (params.seqlen_q <= 16 && qsa_mblocks < target_mblocks) {
+            int const splits = long_gqa8 ? std::min(128, target_mblocks / qsa_mblocks)
+                                       : (target_mblocks + qsa_mblocks / 2) / qsa_mblocks;
+            return std::min(splits, std::max(1, num_n_blocks / 4));
+        }
+        if (params.seqlen_q > 16 && slots / qsa_mblocks > 1) { return std::min(128, slots / qsa_mblocks); }
         if (qsa_mblocks <= slots) { return 1; }
         // The combine pass costs an fp32 O write plus read per valid row, so its price scales
         // with qhead_per_khead; past the 16-wide tile no split pays for itself.
@@ -1053,8 +1076,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     // TODO: check this
     if (window_size_left >= seqlen_k - 1) { window_size_left = -1; }
     if (window_size_right >= seqlen_q - 1) { window_size_right = -1; }
-    // causal=true is the same as causal=false in this case
-    if (seqlen_q == 1 && window_size_left == -1 && window_size_right == -1 && attention_chunk == 0) {
+    // QSA must retain causal so seqused_k still bounds the topk columns.
+    if (!is_qsa && seqlen_q == 1 && window_size_left == -1 && window_size_right == -1 && attention_chunk == 0) {
         // Special case of hdim 128 where we want causal to have kBlockN=128, better for pagedKV and TMA
         if ((head_size <= 64 || head_size > 128) || !paged_KV) {
             is_causal = false;
@@ -1194,12 +1217,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     params.dv_rounded = head_size_v_rounded;
 #ifdef USE_PPU
     params.is_qsa = is_qsa;
-    // The AIU bulk load reads one table entry per 16-column group; only a caller-certified
-    // contiguous-run list may ride it, everything else takes the per-column load.
+    // Preserve the caller's AIU contract; causal QSA also needs the dense span.
     params.qsa_allow_aiu = is_qsa && qsa_allow_aiu;
-    if (is_qsa) {
-        // seqlen_k is already topk; seqused_k holds the dense span and would win in SeqlenInfo,
-        // inflating the n_block range that split-KV slices and the seqlen_k mask bound.
+    if (is_qsa && !params.is_causal) {
         params.seqused_k = nullptr;
     }
 #endif
@@ -1284,10 +1304,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 #endif // FA3_HLLM_BUILD
 
 #ifdef USE_PPU
-    // flash_prepare_scheduler.cu forces every batch's split to 1 once seqlen_q > 16, so for QSA
-    // prefill the dynamic path pays the fp32 partial write and combine pass without splitting.
+    // Keep QSA's host-selected split count instead of recomputing it with the dense heuristic.
     bool const use_dynamic_split = is_varlen && params.b <= 992 && params.b > 1 && num_splits <= 0
-        && !(params.is_qsa && params.seqlen_q > 16);
+        && !params.is_qsa;
     int const ttl_m = params.seqlen_q * params.h / params.h_k;
     int const m64_cnt = std::max(1, ttl_m / 64);
     float waves = std::max(1.0 * params.b * params.h_k * m64_cnt / params.num_sm, 1.0);
@@ -1345,7 +1364,16 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         ? (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen)
         : ((params.is_causal && !is_varlen) || (is_varlen && params.num_splits > 1));
 #endif
-    if (scheduler_needs_semaphore || use_dynamic_split) {
+    bool qsa_without_scheduler_metadata = false;
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
+    // These private QSA kernels launch each tile directly. Keep the eligibility guard
+    // shared with dispatch; the optional auxiliary pointers are assigned below.
+    qsa_without_scheduler_metadata = qsa_uses_single_tile(params)
+        && params.total_q == int64_t(params.b) * params.seqlen_q
+        && !rotary_cos_.has_value() && !rotary_sin_.has_value()
+        && !q_v_.has_value() && !s_aux_.has_value();
+#endif
+    if ((scheduler_needs_semaphore || use_dynamic_split) && !qsa_without_scheduler_metadata) {
 #ifdef USE_PPU
         int metadata_size = int(scheduler_needs_semaphore) * 32 + int(use_dynamic_split) * (params.b + 1);
         params.skip_scheduler_metadata_computation = false;
