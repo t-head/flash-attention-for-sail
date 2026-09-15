@@ -74,6 +74,7 @@ def _flash_attn_forward(
     pack_gqa: Optional[bool] = None,
     sm_margin: int = 0,
     s_aux: Optional[torch.Tensor] = None,
+    qsa_allow_aiu: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
@@ -122,6 +123,7 @@ def _flash_attn_forward(
         pack_gqa,
         sm_margin,
         s_aux,
+        qsa_allow_aiu,
     )
     # rest may contain out_accum, softmax_lse_accum
     out_accum = rest[0] if len(rest) > 0 and rest[0] is not None else torch.tensor([], device=out.device)
@@ -166,6 +168,7 @@ def _flash_attn_forward_fake(
     pack_gqa: Optional[bool] = None,
     sm_margin: int = 0,
     s_aux: Optional[torch.Tensor] = None,
+    qsa_allow_aiu: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Symbolic fake implementation of flash attention forward.
@@ -956,6 +959,7 @@ def flash_attn_with_kvcache(
     return_softmax_lse=False,
     max_seqlen_k: Optional[int] = None,
     s_aux=None,
+    qsa_allow_aiu: bool = False,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -1024,6 +1028,12 @@ def flash_attn_with_kvcache(
             Pass (total_q, 1, topk) instead to select query-sparse attention (QSA), where each row
             holds the token indices selected for one unpadded query token. Requires head dim 256,
             cu_seqlens_q, no cache_batch_idx, and a build with FLASH_ATTENTION_ENABLE_QSA.
+        qsa_allow_aiu: bool. QSA only: certify that every 16-column-aligned group of the
+            (total_q, 1, topk) table holds 16 pool-contiguous tokens, the layout the AIU
+            paged-KV bulk load assumes (one table entry read per group, 16 contiguous
+            tokens fetched). Defaults to False, which routes QSA through the per-column
+            load that honors each entry individually. A scattered top-k list MUST keep
+            this False or the kernel silently attends to the wrong K/V.
         softmax_scale: float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
@@ -1087,6 +1097,7 @@ def flash_attn_with_kvcache(
         pack_gqa,
         sm_margin,
         s_aux,
+        qsa_allow_aiu,
     )
     # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out

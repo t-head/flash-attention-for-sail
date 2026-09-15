@@ -21,17 +21,21 @@ from padding import pad_input, unpad_input
 from flash_attn_interface import flash_attn_with_kvcache, get_scheduler_metadata
 
 
-# The AIU paged-KV load path fetches kBlockNPagedPerAiuLoad *contiguous* tokens per page-table
-# entry it reads (16 when page_size % 16 == 0, 64 when page_size % 64 == 0), so the topk list must
-# be contiguous in aligned runs of that size; page_size % 16 != 0 disables AIU (arbitrary indices
-# OK). QSA is only instantiated for head dim 256, so other head dims must be rejected.
+# QSA takes the AIU paged-KV load path only when the caller passes qsa_allow_aiu=True,
+# certifying that every 16-column-aligned group of the top-k list is 16 pool-contiguous
+# tokens (the bulk load reads one table entry per group and fetches 16 contiguous tokens
+# from it, ignoring the other 15 entries). The default False routes QSA through the
+# per-column load, which honors each entry individually, so every list shape -- random
+# included -- must match the reference at any page size. qsa_allow_aiu=True cases pin the
+# contract from both sides: aligned 16-token runs match, a scattered list diverges.
+# QSA is only instantiated for head dim 256, so other head dims must be rejected.
 #
-# expect: "ok" output must match the reference, "mismatch" the documented AIU constraint must bite,
-# "reject" the call must raise.
+# expect: "ok" output must match the reference, "mismatch" the output must diverge as
+# documented, "reject" the call must raise.
 CASES = [
-    # name, seqlen_q, seqlen_k, d, topk, page_size, batch, nheads, nheads_k, topk_mode, expect
+    # name, seqlen_q, seqlen_k, d, topk, page_size, batch, nheads, nheads_k, topk_mode, expect, allow_aiu
     ("fa3_precision",        960,   1024,   256, 128,  544, 1,   16, 2, "structured", "ok"),
-    ("fa3_precision_rand",   960,   1024,   256, 128,  544, 1,   16, 2, "random",     "mismatch"),
+    ("fa3_precision_rand",   960,   1024,   256, 128,  544, 1,   16, 2, "random",     "ok"),
     ("probe_rand_noaiu",     960,   1024,   256, 128,  136, 1,   16, 2, "random",     "ok"),
     ("probe_block16",        960,   1024,   256, 128,  544, 1,   16, 2, "block16",    "ok"),
     ("hist_topk64",          2,     1024,   256, 64,   128, 1,   16, 2, "structured", "ok"),
@@ -42,15 +46,18 @@ CASES = [
     ("fa3_prefill",          16384, 131072, 256, 2048, 544, 1,   16, 1, "block16",    "ok"),
     ("sq1_decode",           1,     1024,   256, 128,  544, 4,   16, 2, "structured", "ok"),
     ("sq1_decode_h32_mqa",   1,     1024,   256, 128,  544, 4,   32, 1, "structured", "ok"),
-    # sq=1 with g<=16 now takes the AIU path too, so the run-contiguity constraint applies there
-    # as well: a random list must diverge, an aligned block16 list must not.
-    ("sq1_rand_aiu",         1,     8192,   256, 128,  544, 4,   16, 2, "random",     "mismatch"),
+    # sq=1 with g<=16 used to sit on the AIU path as well; off AIU, a random list is as
+    # valid as an aligned block16 list.
+    ("sq1_rand",             1,     8192,   256, 128,  544, 4,   16, 2, "random",     "ok"),
     ("sq1_block16",          1,     8192,   256, 128,  544, 4,   16, 2, "block16",    "ok"),
     ("sq1_g64_reject",       1,     1024,   256, 128,  544, 2,   64, 1, "structured", "reject"),
-    # topk not a multiple of the AIU run length: the rows past topk must be masked by seqlen_k.
-    ("tail_topk100_aiu16",   960,   1024,   256, 100,  544, 1,   16, 2, "block16tail", "ok"),
-    ("tail_topk100_aiu64",   960,   1024,   256, 100,  576, 1,   16, 2, "block64tail", "ok"),
+    # topk not a multiple of 16: the rows past topk must be masked by seqlen_k.
+    ("tail_topk100",         960,   1024,   256, 100,  544, 1,   16, 2, "block16tail", "ok"),
+    ("tail_topk100_ps576",   960,   1024,   256, 100,  576, 1,   16, 2, "block64tail", "ok"),
     ("tail_topk100_sq1_g32", 1,     8192,   256, 100,  544, 4,   32, 1, "block16tail", "ok"),
+    # qsa_allow_aiu=True pins the bulk-load contract from both sides.
+    ("run16_allow_aiu",      960,   1024,   256, 128,  544, 1,   16, 2, "block16",    "ok",       True),
+    ("rand_allow_aiu",       960,   1024,   256, 128,  544, 1,   16, 2, "random",     "mismatch", True),
 ]
 
 
@@ -138,11 +145,12 @@ VARLEN = False
 
 
 def run_case(name, seqlen_q, seqlen_k, d, topk, page_size, batch_size, nheads, nheads_k, mode,
-             expect="ok"):
+             expect="ok", allow_aiu=False):
     torch.random.manual_seed(0)
     device, dtype = "cuda", torch.bfloat16
     print(f"=== {name}: sq={seqlen_q} sk={seqlen_k} d={d} topk={topk} ps={page_size} "
-          f"b={batch_size} h={nheads} hk={nheads_k} topk_mode={mode} ===", flush=True)
+          f"b={batch_size} h={nheads} hk={nheads_k} topk_mode={mode} "
+          f"allow_aiu={allow_aiu} ===", flush=True)
 
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
     if VARLEN and seqlen_q > 1:
@@ -182,6 +190,7 @@ def run_case(name, seqlen_q, seqlen_k, d, topk, page_size, batch_size, nheads, n
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k_new=None, max_seqlen_q=max_seqlen_q,
         causal=True, window_size=(-1, -1), scheduler_metadata=scheduler_metadata,
         num_splits=1, pack_gqa=True, return_softmax_lse=True,
+        qsa_allow_aiu=allow_aiu,
     )
     torch.cuda.synchronize()
 
@@ -197,7 +206,8 @@ def run_case(name, seqlen_q, seqlen_k, d, topk, page_size, batch_size, nheads, n
         print("  FAILED (expected the call to be rejected)", flush=True)
         return False
     if expect == "mismatch":
-        # Pins the documented AIU constraint: a fully random topk list must diverge.
+        # Pins the AIU bulk-load contract: a scattered list riding the AIU path
+        # (qsa_allow_aiu=True) must diverge.
         print(f"  {'PASSED (mismatch as documented)' if not matches else 'FAILED (expected a mismatch)'}",
               flush=True)
         return not matches

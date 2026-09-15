@@ -171,6 +171,12 @@ struct Flash_fwd_params : public Qkv_params {
     bool use_kblockm_128;
     bool use_kblockn_16;
     bool is_qsa;
+    // QSA only: the caller certifies that every 16-column-aligned group of the (total_q, topk)
+    // table consists of 16 pool-contiguous tokens, the layout the AIU paged-KV bulk load
+    // assumes. False (the default) routes QSA onto the per-column load, which honors each
+    // table entry individually. Dense attention never reads this: a dense page table is
+    // per-page by construction, so the AIU bulk load is exact for it.
+    bool qsa_allow_aiu;
     // The S extra matrix, (num_heads)
     void *__restrict__ s_aux_ptr;
 

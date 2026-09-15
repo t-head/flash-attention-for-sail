@@ -910,6 +910,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         bool is_generation_phase = false
 #endif // FA3_HLLM_BUILD
         , std::optional<at::Tensor> s_aux_ = {} // (h)
+        , bool qsa_allow_aiu = false
         ) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm8x = dprops->major >= 8;
@@ -961,6 +962,10 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
             page_table = page_table.squeeze(1);
         }
     }
+    // qsa_allow_aiu certifies the QSA table as 16-token contiguous runs (the AIU bulk-load
+    // contract); it is meaningless for a dense per-page table and must not be passed there.
+    TORCH_CHECK(!qsa_allow_aiu || qsa_page_table,
+                "qsa_allow_aiu is only meaningful for a QSA page_table (total_q, 1, topk)");
 
     at::Tensor cu_seqlens_q;
     bool const is_varlen_q = cu_seqlens_q_.has_value();
@@ -1189,6 +1194,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     params.dv_rounded = head_size_v_rounded;
 #ifdef USE_PPU
     params.is_qsa = is_qsa;
+    // The AIU bulk load reads one table entry per 16-column group; only a caller-certified
+    // contiguous-run list may ride it, everything else takes the per-column load.
+    params.qsa_allow_aiu = is_qsa && qsa_allow_aiu;
     if (is_qsa) {
         // seqlen_k is already topk; seqused_k holds the dense span and would win in SeqlenInfo,
         // inflating the n_block range that split-KV slices and the seqlen_k mask bound.
@@ -2376,7 +2384,8 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
         "int sm_margin = 0,"
-        "Tensor? s_aux = None) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "Tensor? s_aux = None,"
+        "bool qsa_allow_aiu = False) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"

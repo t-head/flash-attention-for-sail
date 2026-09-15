@@ -326,9 +326,13 @@ void run_mha_fwd_(Flash_fwd_params &params, hggcStream_t stream) {
                             KBLOCKMN_SWITCH(params.use_kblockm_16, params.use_kblockm_128, params.use_kblockn_16, kBlockM16, kBlockM128, kBlockN16, [&] {
 #if USE_AIU
                                 if constexpr (PagedKVNonTMA) {
-                                    PAGEDKVAIU_SWITCH(!params.leftpad_k && params.page_size % 16 == 0, params.page_size, PagedKVAiu, kBlockNPagedPerAiuLoad, [&] {
-                                        // QSA's page table is per query token, so a per-row read would put a
-                                        // gmem load on the K/V address critical path; dense keeps the old tile.
+                                    // The AIU bulk load reads one table entry per 16-column group and
+                                    // fetches the 16 pool-contiguous tokens from it, which is exact for
+                                    // dense per-page tables and for a QSA list the caller certified as
+                                    // 16-token contiguous runs (qsa_allow_aiu). Any other QSA list is
+                                    // scattered per column and must take the per-column load, which
+                                    // honors every entry individually.
+                                    PAGEDKVAIU_SWITCH(!params.leftpad_k && (!Is_QSA || params.qsa_allow_aiu) && params.page_size % 16 == 0, params.page_size, PagedKVAiu, kBlockNPagedPerAiuLoad, [&] {
                                         if constexpr (kBlockM16 && (kBlockN16 || kBlockNPagedPerAiuLoad == 16)) {
                                             run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, true /*PagedKVNonTMA*/, Is_QSA && PagedKVAiu, Is_QSA ? kBlockNPagedPerAiuLoad : 1, !Is_QSA && AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, false /*kBlockM128*/, true /*kBlockM16*/, kBlockN16, Is_QSA>(params, stream);
                                         } else {
