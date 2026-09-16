@@ -1,0 +1,8 @@
+[submodule "csrc/composable_kernel"]
+	path = csrc/composable_kernel
+	url = https://github.com/ROCm/composable_kernel.git
+	branch = amd-master
+[submodule "csrc/actlize"]
+	path = csrc/actlize
+	url = https://github.com/t-head/actlize.git
+	branch = v1.0.0
