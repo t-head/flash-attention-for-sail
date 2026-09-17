@@ -130,6 +130,13 @@ constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_ppu(
                 return {128, 64, 8, 1, true};
             }
         } else {
+            // hdim 256: the kBlockM=128 arm mirrors the FA2 A100/PPU config
+            // (128x64, 8 warps, Q in smem) — halves the KV reread per Q row
+            // versus the default 64-wide tile.  Gated by the launch-template
+            // heuristic (FLASH_ATTENTION_ARB_FORCE_KBM64 falls back below).
+            if (kBlockM128) {
+                return {128, 64, 8, 1, false};
+            }
             return {64, arch == 89 ? 48 : 32, 4, 1, true};
         }
     } else {

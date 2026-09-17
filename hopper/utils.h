@@ -256,6 +256,19 @@ CUTLASS_DEVICE auto convert_layout_acc_Aregs(Layout0 acc_layout) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #ifdef USE_PPU
+// PPU TF32 (m16n16k8) fwd: reinterpret the fp32 accumulator fragment as A-regs.
+// For mma K=8 the SM80 branch of convert_layout_acc_Aregs keeps the layout as-is.
+// fp32 is not a supported/validated path (fp16/bf16 only); this exists purely so
+// that the opt-in f32 instantiations compile.
+template<typename TiledMma, typename Engine, typename Layout>
+CUTLASS_DEVICE auto convert_acc_to_tf32_Aregs(Tensor<Engine, Layout> const &acc) {
+    return make_tensor(acc.data(), flash::convert_layout_acc_Aregs<TiledMma>(acc.layout()));
+}
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#ifdef USE_PPU
 template <typename To_type, typename Engine, typename Layout>
 inline __device__ auto convert_acc(Tensor<Engine, Layout> const &tensor) {
     using From_type = typename Engine::value_type;
