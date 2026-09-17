@@ -213,9 +213,9 @@ hggcError_t launch_decomp_layout(
     int* vbatch_to_slice, int* row_to_slice, int* row_to_vb_start,
     int* row_to_vb_end, int* n_vb_p, int* supported_p, void* scratch,
     size_t scratch_bytes, hggcStream_t stream) {
-  if (seqlen_q <= 0 || kblock_m <= 0) return cudaErrorInvalidValue;
+  if (seqlen_q <= 0 || kblock_m <= 0) return hggcErrorInvalidValue;
   if (scratch_bytes < decomp_layout_scratch_size(seqlen_q, kblock_m))
-    return cudaErrorInvalidValue;
+    return hggcErrorInvalidValue;
   int const num_blocks = (seqlen_q + kblock_m - 1) / kblock_m;
   uintptr_t a = ((uintptr_t)scratch + 255) & ~(uintptr_t)255;
   int* block_counts = reinterpret_cast<int*>(a);
@@ -230,7 +230,7 @@ hggcError_t launch_decomp_layout(
                                         m_bw, n_merged_p, kblock_m, cap, q0,
                                         q1, k0, k1, ty, df, bw, n_frags_p,
                                         supported_p);
-  err = cudaMemsetAsync(block_counts, 0,
+  err = hggcMemsetAsync(block_counts, 0,
                         (size_t)(2 * num_blocks) * sizeof(int), stream);
   if (err != hggcSuccess) return err;
   int const nb_grid = (cap + kBlock - 1) / kBlock;

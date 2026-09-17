@@ -7,7 +7,7 @@
 namespace FLASH_NAMESPACE {
 
 template<>
-void run_mha_fwd_<cutlass::half_t, 64, true>(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd_<cutlass::half_t, 64, true>(Flash_fwd_params &params, hggcStream_t stream) {
     run_mha_fwd_hdim64<cutlass::half_t, true>(params, stream);
 }
 

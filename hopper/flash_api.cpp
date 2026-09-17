@@ -338,7 +338,7 @@ void set_params_dgrad(Flash_bwd_params &params,
 }
 
 template <int Arch, int Split, bool PagedKVNonTMA, bool PackGQA, bool Has_softcap>
-void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd_constexpr(Flash_fwd_params &params, hggcStream_t stream) {
     if (!params.is_e4m3) {
         if (params.is_bf16) {
             #ifndef FLASHATTENTION_DISABLE_HDIM64
@@ -459,7 +459,7 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
     }
 }
 
-void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd(Flash_fwd_params &params, hggcStream_t stream) {
     // HEADDIM_SWITCH(params.d, [&] {
     //     run_mha_fwd_<cutlass::half_t, kHeadSize>(params, stream);
     // });
@@ -487,7 +487,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     });
 }
 
-void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool enable_pdl=false) {
+void run_mha_fwd_combine(Flash_fwd_params &params, hggcStream_t stream, bool enable_pdl=false) {
     #ifndef FLASHATTENTION_DISABLE_SPLIT
     // If hdim is 96 or 192, it's faster to round them to 128 or 256 respectively
     // so that kBlockM is smaller and we have more parallelism.
@@ -799,7 +799,7 @@ mha_fwd_get_scheduler_metadata(
         auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, is_varlen && params.num_splits > 1, params.softcap > 0.f, params.knew_ptr);
         int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
         int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        hggcStream_t stream = (hggcStream_t)at::cuda::getCurrentCUDAStream().stream();
         prepare_varlen_num_blocks(params, stream, params.pack_gqa, kBlockM, kBlockN, false /*enable_pdl*/);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
@@ -1483,7 +1483,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 #endif // FA3_HLLM_BUILD
 #endif
     if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        hggcStream_t stream = (hggcStream_t)at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd(params, stream);
         if (params.num_splits > 1) {
             if (out_type == at::ScalarType::BFloat16) {
@@ -1521,12 +1521,12 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 }
 
 #ifdef FLASHATTENTION_DISABLE_BACKWARD
-void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
+void run_mha_bwd(Flash_bwd_params &params, hggcStream_t stream) {
     TORCH_CHECK(false, "Flash-Attention was built with backward disabled");
 }
 #else
 template <int Arch, bool Has_softcap>
-void run_mha_bwd_constexpr(Flash_bwd_params &params, cudaStream_t stream) {
+void run_mha_bwd_constexpr(Flash_bwd_params &params, hggcStream_t stream) {
     if (!params.is_bf16) {
         #ifndef FLASHATTENTION_DISABLE_FP16
         #ifndef FLASHATTENTION_DISABLE_HDIM64
@@ -1566,7 +1566,7 @@ void run_mha_bwd_constexpr(Flash_bwd_params &params, cudaStream_t stream) {
     }
 }
 
-void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
+void run_mha_bwd(Flash_bwd_params &params, hggcStream_t stream) {
         // FP16_SWITCH(!params.is_bf16, [&] {
         //     HEADDIM_SWITCH(params.d, [&] {
         //         run_mha_bwd_<elem_type, kHeadDim>(params, stream);
@@ -1961,7 +1961,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     #endif
 
     if (total_q > 0 && total_k > 0 && num_heads_k > 0) {
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        hggcStream_t stream = (hggcStream_t)at::cuda::getCurrentCUDAStream().stream();
         run_mha_bwd(params, stream);
     } else if (total_k > 0 && num_heads_k > 0) {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
@@ -2066,7 +2066,7 @@ mha_combine(at::Tensor out_partial,         // num_splits x batch_size x seqlen 
     params.arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
 
     if (seqlen > 0 && batch_size > 0) {
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        hggcStream_t stream = (hggcStream_t)at::cuda::getCurrentCUDAStream().stream();
         run_mha_fwd_combine(params, stream, false /*enable_pdl*/);
     }
 
@@ -2086,7 +2086,7 @@ mha_combine(at::Tensor out_partial,         // num_splits x batch_size x seqlen 
 #ifdef FA3_HOLMES_BUILD
 namespace holmes_fa3 {
 template <typename T>
-void mha_fwd_raw_impl(cudaStream_t cudaStream, T *devPtrQ,
+void mha_fwd_raw_impl(hggcStream_t cudaStream, T *devPtrQ,
                       const std::vector<int64_t> &q_shape,
                       const std::vector<int64_t> &q_strides, T *devPtrK,
                       const std::vector<int64_t> &k_shape,
@@ -2098,9 +2098,9 @@ void mha_fwd_raw_impl(cudaStream_t cudaStream, T *devPtrQ,
                       bool is_causal, void *workspace_ptr,
                       size_t workspace_size) {
   int device_id = -1;
-  auto err = cudaGetDevice(&device_id);
-  if (err != cudaSuccess) {
-    printf("cudaGetDevice failed: %d, %s", (int)err, cudaGetErrorString(err));
+  auto err = hggcGetDevice(&device_id);
+  if (err != hggcSuccess) {
+    printf("hggcGetDevice failed: %d, %s", (int)err, hggcGetErrorString(err));
     return;
   }
 
@@ -2112,7 +2112,7 @@ void mha_fwd_raw_impl(cudaStream_t cudaStream, T *devPtrQ,
   // stream on that device. CUDAStreamGuard will also restore the current device
   // and stream when it’s destroyed
   at::cuda::CUDAStreamGuard g(at::cuda::getStreamFromExternal(
-      static_cast<cudaStream_t>(cudaStream), device_index));
+      static_cast<hggcStream_t>(cudaStream), device_index));
 
   auto data_type = at::kHalf;
   if constexpr (std::is_same<T, cutlass::bfloat16_t>::value)
@@ -2172,7 +2172,7 @@ void mha_fwd_raw_impl(cudaStream_t cudaStream, T *devPtrQ,
 }
 
 template void mha_fwd_raw_impl(
-    cudaStream_t cudaStream, cutlass::half_t *devPtrQ,
+    hggcStream_t cudaStream, cutlass::half_t *devPtrQ,
     const std::vector<int64_t> &q_shape, const std::vector<int64_t> &q_strides,
     cutlass::half_t *devPtrK, const std::vector<int64_t> &k_shape,
     const std::vector<int64_t> &k_strides, cutlass::half_t *devPtrV,
@@ -2182,7 +2182,7 @@ template void mha_fwd_raw_impl(
     void *workspace_ptr, size_t workspace_size);
 
 template void mha_fwd_raw_impl(
-    cudaStream_t cudaStream, cutlass::bfloat16_t *devPtrQ,
+    hggcStream_t cudaStream, cutlass::bfloat16_t *devPtrQ,
     const std::vector<int64_t> &q_shape, const std::vector<int64_t> &q_strides,
     cutlass::bfloat16_t *devPtrK, const std::vector<int64_t> &k_shape,
     const std::vector<int64_t> &k_strides, cutlass::bfloat16_t *devPtrV,
@@ -2202,7 +2202,7 @@ void mha_fwd_raw(void *stream, void *devPtrQ,
                  const std::vector<int64_t> &out_strides, float scale,
                  bool is_causal, void *workspace_ptr, uint64_t workspace_size,
                  int32_t data_type) {
-  cudaStream_t cudaStream = reinterpret_cast<cudaStream_t>(stream);
+  hggcStream_t cudaStream = reinterpret_cast<hggcStream_t>(stream);
   if (data_type == 0) {
     auto devQ = reinterpret_cast<cutlass::half_t *>(devPtrQ);
     auto devK = reinterpret_cast<cutlass::half_t *>(devPtrK);

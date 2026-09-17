@@ -6,6 +6,6 @@
 
 #ifndef FLASHATTENTION_DISABLE_SM8x
 #ifndef FLASHATTENTION_DISABLE_HDIM192
-template void run_mha_fwd_<89, cutlass::float_e4m3_t, 192, 128, false, true, true, true>(Flash_fwd_params &params, cudaStream_t stream);
+template void run_mha_fwd_<89, cutlass::float_e4m3_t, 192, 128, false, true, true, true>(Flash_fwd_params &params, hggcStream_t stream);
 #endif
 #endif

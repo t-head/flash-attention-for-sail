@@ -41,7 +41,7 @@ template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element,
 #else
           bool PackGQA, bool Split, bool V_colmajor>
 #endif
-void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
     static_assert(!(Is_causal && Is_local), "Causal and Local cannot be enabled at the same time");
     static_assert(!(AppendKV && V_colmajor), "AppendKV and V_colmajor cannot be enabled at the same time");
     static_assert(!(AppendKV && !Varlen), "AppendKV requires Varlen");
@@ -248,7 +248,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     }
 
     int device;
-    CHECK_CUDA(cudaGetDevice(&device));
+    CHECK_CUDA(hggcGetDevice(&device));
     typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments({
         mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args
     });
@@ -265,7 +265,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 #ifndef FLASHATTENTION_DISABLE_SM90
         void const* kernel = (void const*) cutlass::device_kernel<AttnKernel>;
         if (smem_size >= 48 * 1024) {
-            CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            CHECK_CUDA(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
         dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));
         cutlass::ClusterLaunchParams launch_params{grid_dims, block_dims, cluster_dims, smem_size, stream};
@@ -274,16 +274,16 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     } else {
         auto kernel = cutlass::device_kernel<AttnKernel>;
         if (smem_size >= 48 * 1024) {
-            CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            CHECK_CUDA(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
 #ifdef USE_PPU
         int blocks_per_sm;
-        cudaError status_ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        hggcError status_ = hggcOccupancyMaxActiveBlocksPerMultiprocessor(
             &blocks_per_sm, kernel, block_dims.x * block_dims.y * block_dims.z, smem_size);
         grid_dims = AttnKernel::get_grid_shape(kernel_params, blocks_per_sm);
 
-        // cudaFuncAttributes attr;
-        // cudaFuncGetAttributes(&attr, kernel);
+        // hggcFuncAttributes attr;
+        // hggcFuncGetAttributes(&attr, kernel);
         // printf("vreg:%d, stack:%d\n", int(attr.numRegs), int(attr.localSizeBytes));
 #endif
         // kernel<<<grid_dims, block_dims, smem_size, stream>>>(kernel_params);
@@ -294,7 +294,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 template<int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>
-void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd_(Flash_fwd_params &params, hggcStream_t stream) {
     static_assert(sizeof(T) == 2 || sizeof(T) == 1, "Only 16bit and 8bit are supported");
     static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
     using T_out = std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>;

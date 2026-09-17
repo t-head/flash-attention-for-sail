@@ -209,7 +209,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
 
 } // flash
 
-void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bool packgqa,
+void prepare_varlen_num_blocks(Flash_fwd_params &params, hggcStream_t stream, bool packgqa,
                                int blockM, int blockN, bool enable_pdl) {
     // Only support batch <= 992 (32 warps, each with 31 batches)
     int qhead_per_khead = !packgqa ? 1 : cutlass::ceil_div(params.h, params.h_k);

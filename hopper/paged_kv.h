@@ -113,11 +113,11 @@ struct PagedKVManager {
 #endif // FA3_HLLM_BUILD
     TensorKVPtr tPrVPtr;
     int bidb_kv_idx, bidb_kv_idx_prev, n_block_idx, n_block_idx_prev;  // Only used for TMA
-#if defined(__CUDA_ARCH__) && defined(USE_PPU) && USE_AIU
+#if defined(__HGGC_ARCH__) && defined(USE_PPU) && USE_AIU
     static constexpr int bits_per_aiu_KV = kBlockNPagedPerAiuLoad * kBlockKGmem * sizeof(Element) * 8;
-#if __CUDA_ARCH__ == 800
+#if __HGGC_ARCH__ == 100
     using Gmem_copy_struct_KV = PPU0010_AIU_LOAD<cute::C<bits_per_aiu_KV>, Element, false>;
-#elif __CUDA_ARCH__ == 890
+#elif __HGGC_ARCH__ == 150
     using Gmem_copy_struct_KV = PPU0015_AIU_LOAD<cute::C<bits_per_aiu_KV>, Element, false, kBlockNPagedPerAiuLoad, kBlockKGmem>;
 #endif
     using GmemTiledCopyKVAiu = decltype(
@@ -176,7 +176,7 @@ struct PagedKVManager {
         , seqlen_k(seqlen_k)
         , leftpad_k(leftpad_k)
         , ptr_page_table(ptr_page_table_)
-#if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800 && defined(USE_PPU) && USE_AIU
+#if defined(__HGGC_ARCH__) &&  __HGGC_ARCH__ >= 100 && defined(USE_PPU) && USE_AIU
         , gmem_thr_copy_k_aiu(gmem_tiled_copy_k_aiu.get_thread_slice(thread_idx))
         , gmem_thr_copy_v_aiu(gmem_tiled_copy_v_aiu.get_thread_slice(thread_idx))
         , warp_idx(__ppu_read_firstlane(thread_idx / 32))
@@ -206,13 +206,13 @@ struct PagedKVManager {
         #pragma unroll
         for (int k = 0; k < size<1>(tVpV_); ++k) { tVpV_(_0{}, k) = get<1>(tVcV(_0{}, _0{}, k)) < get<1>(shape_V); }
         tVpV = cute::conditional_return<SameHeadDim>(tKpK, tVpV_);
-#if defined(__CUDA_ARCH__) && defined(USE_PPU) && USE_AIU
-#if __CUDA_ARCH__ == 800
+#if defined(__HGGC_ARCH__) && defined(USE_PPU) && USE_AIU
+#if __HGGC_ARCH__ == 100
         int aiu_offset_k = get<1>(shape_K) == kHeadDim ? 0 : (get<0>(stride_K) - get<1>(shape_K));
         int aiu_offset_v = get<1>(shape_V) == kHeadDimV ? 0 : (get<0>(stride_V) - get<1>(shape_V));
         gmem_tiled_copy_k_aiu.desc_ = AiuDesc{nullptr, kBlockNPagedPerAiuLoad, get<0>(stride_K), kBlockNPagedPerAiuLoad, kBlockKGmem, aiu_offset_k};
         gmem_tiled_copy_v_aiu.desc_ = AiuDesc{nullptr, kBlockNPagedPerAiuLoad, get<0>(stride_V), kBlockNPagedPerAiuLoad, kBlockKGmem, aiu_offset_v};
-#elif __CUDA_ARCH__ == 890
+#elif __HGGC_ARCH__ == 150
         gmem_tiled_copy_k_aiu.desc_.init(nullptr, kBlockNPagedPerAiuLoad, get<1>(shape_K), get<0>(stride_K));
         gmem_tiled_copy_v_aiu.desc_.init(nullptr, kBlockNPagedPerAiuLoad, get<1>(shape_V), get<0>(stride_V));
 #endif
@@ -224,7 +224,7 @@ struct PagedKVManager {
 #endif
     };
 
-#if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800 && defined(USE_PPU) && USE_AIU
+#if defined(__HGGC_ARCH__) &&  __HGGC_ARCH__ >= 100 && defined(USE_PPU) && USE_AIU
     CUTLASS_DEVICE
     TensorKVPtrAiu compute_K_ptr_aiu() {
 #if !(defined(FA3_HLLM_BUILD) && defined(FA3_HLLM_USE_ADDR))
@@ -260,7 +260,7 @@ struct PagedKVManager {
     };
 #endif
 
-#if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800 && defined(USE_PPU) && USE_AIU
+#if defined(__HGGC_ARCH__) &&  __HGGC_ARCH__ >= 100 && defined(USE_PPU) && USE_AIU
     CUTLASS_DEVICE
     void prefetch_page_table(const int n_block) {
 #ifndef FA3_HLLM_BUILD
@@ -286,7 +286,7 @@ struct PagedKVManager {
     template <bool Seqlenk_mask=false, bool First_iter=false>
     CUTLASS_DEVICE
     void load_page_table(const int n_block) {
-#if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800 && defined(USE_PPU) && USE_AIU
+#if defined(__HGGC_ARCH__) &&  __HGGC_ARCH__ >= 100 && defined(USE_PPU) && USE_AIU
         if constexpr (PagedKVAiu) {
             int const page_entry_idx = thread_idx % kPageEntryPerWarp;
             int const row = (page_entry_idx * kNWarps + warp_idx) * kBlockNPagedPerAiuLoad;
@@ -429,7 +429,7 @@ struct PagedKVManager {
     template <bool Seqlenk_mask=false, typename TensorK>
     CUTLASS_DEVICE
     void load_K(const int n_block, TensorK &&sK) {
-#if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800 && defined(USE_PPU) && USE_AIU
+#if defined(__HGGC_ARCH__) &&  __HGGC_ARCH__ >= 100 && defined(USE_PPU) && USE_AIU
         if constexpr (PagedKVAiu) {
             TensorKVPtrAiu tPrKPtrAiu = compute_K_ptr_aiu();
             Tensor tKsK = gmem_thr_copy_k_aiu.partition_D(sK);
@@ -488,7 +488,7 @@ struct PagedKVManager {
     template <bool Seqlenk_mask=false, typename TensorV>
     CUTLASS_DEVICE
     void load_V(const int n_block, TensorV &&sV) {
-#if defined(__CUDA_ARCH__) &&  __CUDA_ARCH__ >= 800 && defined(USE_PPU) && USE_AIU
+#if defined(__HGGC_ARCH__) &&  __HGGC_ARCH__ >= 100 && defined(USE_PPU) && USE_AIU
         if constexpr (PagedKVAiu) {
             if constexpr (KV_Same_Iter) { compute_V_ptr_aiu(); }
             Tensor tVsV = gmem_thr_copy_v_aiu.partition_D(sV);

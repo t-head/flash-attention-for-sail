@@ -207,7 +207,7 @@ struct PackGQAManager {
                    int const thread_idx, int const seqlen_o, int const m_block
                  )
     {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 800 && defined(USE_PPU)
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100 && defined(USE_PPU)
         static constexpr int kGmemElemsPerStoreDirect = 1;
         cute::Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<sizeof(Element) * 8>, Element> gmem_copy_direct;
 #else

@@ -539,7 +539,7 @@ hggcError_t launch_decomp_segment(int const* ks, int const* ke,
                                   int const* done, void* scratch,
                                   size_t scratch_bytes, hggcStream_t stream) {
   if (scratch_bytes < decomp_segment_scratch_bytes(seqlen_q > 1 ? seqlen_q : 2))
-    return cudaErrorInvalidValue;
+    return hggcErrorInvalidValue;
   if (seqlen_q <= 0) {
     write_int<<<1, 1, 0, stream>>>(n_segs_out, 0);
     return hggcGetLastError();
@@ -555,7 +555,7 @@ hggcError_t launch_decomp_segment(int const* ks, int const* ke,
     return hggcGetLastError();
   }
   int const n = seqlen_q;
-  if ((n + kBlock - 1) / kBlock > kMaxCascadeBlocks) return cudaErrorInvalidValue;
+  if ((n + kBlock - 1) / kBlock > kMaxCascadeBlocks) return hggcErrorInvalidValue;
 
   SegScratch sc = layout_scratch(scratch, seqlen_q);
   int const nb = (n + kBlock - 1) / kBlock;
@@ -568,7 +568,7 @@ hggcError_t launch_decomp_segment(int const* ks, int const* ke,
                                                   sc.changed);
   // Pass 2: candidates + exemption.
   scan_flags(sc.changed, n, done, sc.scan0, sc.scan0 + n, stream);
-  err = cudaMemsetAsync(sc.exempt, 0, n, stream);
+  err = hggcMemsetAsync(sc.exempt, 0, n, stream);
   if (err != hggcSuccess) return err;
   cand_flags_kernel<<<nb, kBlock, 0, stream>>>(sc.changed, ks, ke, seqlen_q,
                                                done, sc.scan0, sc.cand,

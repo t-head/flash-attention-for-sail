@@ -6,6 +6,6 @@
 
 #ifndef FLASHATTENTION_DISABLE_SM90
 #ifndef FLASHATTENTION_DISABLE_HDIM64
-template void run_mha_fwd_<90, cutlass::half_t, 64, 512, true, true, true, true>(Flash_fwd_params &params, cudaStream_t stream);
+template void run_mha_fwd_<90, cutlass::half_t, 64, 512, true, true, true, true>(Flash_fwd_params &params, hggcStream_t stream);
 #endif
 #endif

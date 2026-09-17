@@ -48,7 +48,7 @@ struct PPU0015_TSM_LD_SWZL_CVT_LOCAL<Element, CUBE_H, CUBE_W, BlockH, BlockW,
   CUTE_HOST_DEVICE static void
   copy(void *frag_ptr, void *smem_base, int coord_w, int coord_h, int cube_in_stage = 0, int stage = 0)
   {
-#if defined(__CUDA_ARCH__) && ACOMPUTE_VERSION >= 10500
+#if defined(__HGGC_ARCH__) && ACOMPUTE_VERSION >= 10500
     Element *stage_base = reinterpret_cast<Element*>(smem_base);
     const int lbo = SHUFFLING_GAIT ? (cube_in_stage & 1 ? LBO-1 : LBO+1) : LBO;
     {
@@ -85,7 +85,7 @@ struct PPU0015_TSM_LD_SWZL_CVT_LOCAL<Element, CUBE_H, CUBE_W, BlockH, BlockW,
   CUTE_HOST_DEVICE static void
   copy(void *frag_ptr, void *smem_base, int coord_h, int coord_w, int cube_in_stage = 0, int stage = 0)
   {
-#if defined(__CUDA_ARCH__) && ACOMPUTE_VERSION >= 10500
+#if defined(__HGGC_ARCH__) && ACOMPUTE_VERSION >= 10500
     Element *stage_base = reinterpret_cast<Element*>(smem_base);
     const int sbo = SHUFFLING_GAIT ? (coord_h >= 64 ? SBO - (CUBE_H * BlockW * (int)sizeof(Element) >> 4) : SBO + (CUBE_H * BlockW * (int)sizeof(Element) >> 4)) : SBO;
     if constexpr (Cvt) {
@@ -167,13 +167,13 @@ struct Copy_Traits<PPU0015_TSM_LD_SWZL_CVT_LOCAL<Element, CUBE_H, CUBE_W, BlockH
 #endif // defined(USE_PPU) && USE_AIU
 // ============================================================================
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 800) && defined(USE_PPU) && USE_AIU
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ == 100) && defined(USE_PPU) && USE_AIU
 #define PPU1v0_R2S_SLICE_LAYOUT 1
 #else
 #define PPU1v0_R2S_SLICE_LAYOUT 0
 #endif
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 890) && defined(USE_PPU) && USE_AIU
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ == 150) && defined(USE_PPU) && USE_AIU
 #define PPU1v5_R2S_SLICE_LAYOUT 1
 #else
 #define PPU1v5_R2S_SLICE_LAYOUT 0

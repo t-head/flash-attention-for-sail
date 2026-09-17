@@ -7,7 +7,7 @@
 namespace FLASH_NAMESPACE {
 
 template<>
-void run_mha_bwd_<cutlass::bfloat16_t, 32, false>(Flash_bwd_params &params, cudaStream_t stream) {
+void run_mha_bwd_<cutlass::bfloat16_t, 32, false>(Flash_bwd_params &params, hggcStream_t stream) {
     run_mha_bwd_hdim32<cutlass::bfloat16_t, false>(params, stream);
 }
 

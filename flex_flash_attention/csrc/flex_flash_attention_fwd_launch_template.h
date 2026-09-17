@@ -184,11 +184,11 @@ void run_flex_flash_attention_fwd(FlexFlashAttentionFwdParams &params, hggcStrea
         char const* e = getenv("FLASH_ATTENTION_ARB_DBG");
         if (e == nullptr || e[0] != '1') { return (unsigned long long*)nullptr; }
         unsigned long long* p = nullptr;
-        cudaMalloc(&p, 8 * sizeof(unsigned long long));
+        hggcMalloc(&p, 8 * sizeof(unsigned long long));
         return p;
     }();
     if (dbg_counters) {
-        cudaMemset(dbg_counters, 0, 8 * sizeof(unsigned long long));
+        hggcMemset(dbg_counters, 0, 8 * sizeof(unsigned long long));
         params.slices.dbg_counters = dbg_counters;
     }
 
@@ -243,9 +243,9 @@ void run_flex_flash_attention_fwd(FlexFlashAttentionFwdParams &params, hggcStrea
     CHECK_CUDA_KERNEL_LAUNCH();
 
     if (dbg_counters) {
-        cudaDeviceSynchronize();
+        hggcDeviceSynchronize();
         unsigned long long c[8] = {0};
-        cudaMemcpy(c, dbg_counters, sizeof(c), cudaMemcpyDeviceToHost);
+        hggcMemcpy(c, dbg_counters, sizeof(c), hggcMemcpyDeviceToHost);
         fprintf(stderr, "[ARB_DBG] kbm=%d kbn=%d steps=%llu masked=%llu cycles=%llu "
                 "cycles/step=%.0f\n",
                 kBlockM128 ? 128 : 64, kBlockN,

@@ -35,7 +35,7 @@ template <int Arch, int kHeadDim, int kBlockM, int kBlockN, typename Element,
           bool SdP_swapAB=true, bool dKV_swapAB=false, bool dQ_swapAB=false,
           int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1,
           bool V_in_regs=false>
-void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
+void run_flash_bwd(Flash_bwd_params &params, hggcStream_t stream) {
     static_assert(!(Is_causal && Is_local), "Is_causal and Is_local cannot be true at the same time.");
     using ElementAccum = float;
 #ifdef USE_PPU
@@ -215,7 +215,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     };
 
     int device;
-    cudaGetDevice(&device);
+    hggcGetDevice(&device);
     typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments({
         mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args
     });
@@ -242,7 +242,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 #ifndef FLASHATTENTION_DISABLE_SM90
         void const* kernel = (void const*) cutlass::device_kernel<AttnKernel>;
         if (smem_size >= 48 * 1024) {
-            CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            CHECK_CUDA(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
         dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));
         cutlass::ClusterLauncher::launch(
@@ -252,13 +252,13 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         if (smem_size >= 48 * 1024) {
             // Check if smem_size exceeds device max; skip kernel if so
             int max_smem = 0;
-            cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+            hggcDeviceGetAttribute(&max_smem, hggcDevAttrMaxSharedMemoryPerBlockOptin, device);
             if (smem_size > max_smem) {
                 printf("[SKIP] BWD kernel smem_size=%d exceeds device max=%d, skipping launch (M=%d, N=%d)\n",
                        smem_size, max_smem, int(get<0>(TileShape_MNK{})), int(get<1>(TileShape_MNK{})));
                 return;
             }
-            CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<AttnKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            CHECK_CUDA(hggcFuncSetAttribute(cutlass::device_kernel<AttnKernel>, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
         cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params, false /*launch_with_pdl*/);
     }
@@ -285,7 +285,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     dim3 grid_m_postprocess(num_m_block_postprocess, params.h, params.b);
     int smem_size_postprocess = PostprocessKernel::SharedStorageSize;
     if (smem_size_postprocess >= 48 * 1024) {
-        CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<PostprocessKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
+        CHECK_CUDA(hggcFuncSetAttribute(cutlass::device_kernel<PostprocessKernel>, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
     }
     cutlass::kernel_launch<PostprocessKernel>(grid_m_postprocess, PostprocessKernel::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_params, false /*launch_with_pdl*/);
     CHECK_CUDA_KERNEL_LAUNCH();
@@ -328,7 +328,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         dim3 grid_n_postprocess(num_n_block_postprocess, params.h_k, params.b);
         int smem_size_postprocess = PostprocessKerneldKV::SharedStorageSize;
         if (smem_size_postprocess >= 48 * 1024) {
-            CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<PostprocessKerneldKV>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
+            CHECK_CUDA(hggcFuncSetAttribute(cutlass::device_kernel<PostprocessKerneldKV>, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
         }
         cutlass::kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dK_params, false /*launch_with_pdl*/);
         CHECK_CUDA_KERNEL_LAUNCH();
@@ -343,7 +343,7 @@ template<int Arch, typename T, int kBlockM, int kBlockN, int kHeadDim, bool Is_c
          bool SdP_swapAB=true, bool dKV_swapAB=false, bool dQ_swapAB=false,
          int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1,
          bool V_in_regs=false>
-void run_mha_bwd_dispatch(Flash_bwd_params &params, cudaStream_t stream) {
+void run_mha_bwd_dispatch(Flash_bwd_params &params, hggcStream_t stream) {
     VARLEN_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
         BOOL_SWITCH(params.h != params.h_k, GQA, [&] {
 //             BOOL_SWITCH(params.deterministic, Deterministic, [&] {
@@ -356,7 +356,7 @@ void run_mha_bwd_dispatch(Flash_bwd_params &params, cudaStream_t stream) {
 
 
 template<int Arch, typename T, bool Has_softcap>
-void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
+void run_mha_bwd_hdim64(Flash_bwd_params &params, hggcStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
 #ifdef USE_PPU
         if constexpr (Arch == 80) {
@@ -386,7 +386,7 @@ void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
 }
 
 template<int Arch, typename T, bool Has_softcap>
-void run_mha_bwd_hdim96(Flash_bwd_params &params, cudaStream_t stream) {
+void run_mha_bwd_hdim96(Flash_bwd_params &params, hggcStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
 #ifdef USE_PPU
         if constexpr (Arch == 80) {
@@ -407,7 +407,7 @@ void run_mha_bwd_hdim96(Flash_bwd_params &params, cudaStream_t stream) {
 }
 
 template<int Arch, typename T, bool Has_softcap>
-void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
+void run_mha_bwd_hdim128(Flash_bwd_params &params, hggcStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
 #ifdef USE_PPU
         if constexpr (Arch == 80) {
@@ -432,7 +432,7 @@ void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
 }
 
 template<int Arch, typename T, bool Has_softcap>
-void run_mha_bwd_hdim192(Flash_bwd_params &params, cudaStream_t stream) {
+void run_mha_bwd_hdim192(Flash_bwd_params &params, hggcStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
 #ifdef USE_PPU
         if constexpr (Arch == 80) {
@@ -453,7 +453,7 @@ void run_mha_bwd_hdim192(Flash_bwd_params &params, cudaStream_t stream) {
 }
 
 template<int Arch, typename T, bool Has_softcap>
-void run_mha_bwd_hdim256(Flash_bwd_params &params, cudaStream_t stream) {
+void run_mha_bwd_hdim256(Flash_bwd_params &params, hggcStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
 #ifdef USE_PPU
         if constexpr (Arch == 80) {

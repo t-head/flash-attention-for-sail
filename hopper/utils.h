@@ -8,10 +8,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#include <cuda_fp16.h>
+#include <hggc_fp16.h>
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-#include <cuda_bf16.h>
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 100
+#include <hggc_bf16.h>
 #endif
 
 #include <cute/tensor.hpp>
@@ -61,7 +61,7 @@ template <typename Kernel>
 struct enable_sm90_or_later : Kernel {
     template <typename... Args>
     CUTLASS_DEVICE void operator()(Args&&... args) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 900)
         Kernel::operator()(std::forward<Args>(args)...);
 #endif
     }
@@ -71,7 +71,7 @@ template <typename Kernel>
 struct enable_sm80_to_sm89 : Kernel {
     template <typename... Args>
     CUTLASS_DEVICE void operator()(Args&&... args) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ <= 890)
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ >= 100) && (__HGGC_ARCH__ <= 890)
         Kernel::operator()(std::forward<Args>(args)...);
 #endif
     }
@@ -82,7 +82,7 @@ template <typename Kernel>
 struct enable_sm80 : Kernel {
     template <typename... Args>
     CUTLASS_DEVICE void operator()(Args&&... args) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 800)
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ == 100)
         Kernel::operator()(std::forward<Args>(args)...);
 #endif
     }
@@ -92,7 +92,7 @@ template <typename Kernel>
 struct enable_sm89 : Kernel {
     template <typename... Args>
     CUTLASS_DEVICE void operator()(Args&&... args) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 890)
+#if defined(__HGGC_ARCH__) && (__HGGC_ARCH__ == 150)
         Kernel::operator()(std::forward<Args>(args)...);
 #endif
     }

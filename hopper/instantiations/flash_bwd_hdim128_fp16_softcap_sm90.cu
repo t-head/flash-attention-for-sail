@@ -7,7 +7,7 @@
 #ifndef FLASHATTENTION_DISABLE_SM90
 #ifndef FLASHATTENTION_DISABLE_HDIM128
 template<>
-void run_mha_bwd_<90, cutlass::half_t, 128, true>(Flash_bwd_params &params, cudaStream_t stream) {
+void run_mha_bwd_<90, cutlass::half_t, 128, true>(Flash_bwd_params &params, hggcStream_t stream) {
     run_mha_bwd_hdim128<90, cutlass::half_t, true>(params, stream);
 }
 #endif

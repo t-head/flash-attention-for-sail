@@ -14,7 +14,7 @@
 namespace FLASH_NAMESPACE {
 
 // Determine if the architecture supports FLASH and define a macro to handle parameter modifiers
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 100
 #define ARCH_SUPPORTS_FLASH
 #define KERNEL_PARAM_MODIFIER __grid_constant__
 #else
@@ -52,7 +52,7 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_combine_kernel, int kBlockM, int L
 }
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
-void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
     // printf("smem_size = %d\n", smem_size);
 
@@ -81,11 +81,11 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                             // printf("IsEvenMNConst = %d, IsEvenKConst = %d, Is_local = %d, Is_causal = %d, ReturnSoftmaxConst = %d, Is_dropout = %d\n", int(IsEvenMNConst), int(IsEvenKConst), int(Is_local), int(Is_causal), int(ReturnSoftmaxConst), int(Is_dropout));
                             // auto kernel = &flash_fwd_kernel<Kernel_traits, false, Is_causal, false, true, true, false>;
                             if (smem_size >= 48 * 1024) {
-                                C10_CUDA_CHECK(cudaFuncSetAttribute(
-                                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+                                C10_CUDA_CHECK(hggcFuncSetAttribute(
+                                    kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
                             }
                             // int ctas_per_sm;
-                            // cudaError status_ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                            // hggcError status_ = hggcOccupancyMaxActiveBlocksPerMultiprocessor(
                             //     &ctas_per_sm, kernel, Kernel_traits::kNThreads, smem_size);
                             // printf("smem_size = %d, CTAs per SM = %d\n", int(smem_size), ctas_per_sm);
                             kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
@@ -99,7 +99,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 template<typename Kernel_traits, bool Is_causal>
-void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+void run_flash_splitkv_fwd(Flash_fwd_params &params, hggcStream_t stream) {
     static_assert(!Kernel_traits::Is_Q_in_regs, "SplitKV implementation does not support Is_Q_in_regs");
     static_assert(!Kernel_traits::Share_Q_K_smem, "SplitKV implementation does not support Share_Q_K_smem");
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
@@ -121,8 +121,8 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, true, Split, Append_KV>;
                                 // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, IsEvenKConst>;
                                 if (smem_size >= 48 * 1024) {
-                                    C10_CUDA_CHECK(cudaFuncSetAttribute(
-                                        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+                                    C10_CUDA_CHECK(hggcFuncSetAttribute(
+                                        kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
                                 }
                                 kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
                                 C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -162,7 +162,7 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, int Headdim, bool Is_causal>
-void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, hggcStream_t stream) {
     constexpr static int kBlockM = 64;  // Fixed for all head dimensions
     // TD [2023-08-28]: nvcc segfaults for headdim 96 with block size 64 x 256,
     // and for headdim 192 with block size 64 x 128.
@@ -184,7 +184,7 @@ void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream)
 }
 
 template<typename T, bool Is_causal>
-void run_mha_fwd_hdim32(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd_hdim32(Flash_fwd_params &params, hggcStream_t stream) {
     constexpr static int Headdim = 32;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
@@ -192,7 +192,7 @@ void run_mha_fwd_hdim32(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, bool Is_causal>
-void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd_hdim64(Flash_fwd_params &params, hggcStream_t stream) {
     constexpr static int Headdim = 64;
     auto dprops = at::cuda::getCurrentDeviceProperties();
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
@@ -218,7 +218,7 @@ void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, bool Is_causal>
-void run_mha_fwd_hdim96(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd_hdim96(Flash_fwd_params &params, hggcStream_t stream) {
     constexpr static int Headdim = 96;
     auto dprops = at::cuda::getCurrentDeviceProperties();
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
@@ -256,7 +256,7 @@ void run_mha_fwd_hdim96(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, bool Is_causal>
-void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd_hdim128(Flash_fwd_params &params, hggcStream_t stream) {
     constexpr static int Headdim = 128;
     auto dprops = at::cuda::getCurrentDeviceProperties();
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
@@ -301,7 +301,7 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, bool Is_causal>
-void run_mha_fwd_hdim192(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd_hdim192(Flash_fwd_params &params, hggcStream_t stream) {
     constexpr static int Headdim = 192;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         if constexpr(!Is_dropout) {
@@ -318,16 +318,16 @@ void run_mha_fwd_hdim192(Flash_fwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, bool Is_causal>
-void run_mha_fwd_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
+void run_mha_fwd_hdim256(Flash_fwd_params &params, hggcStream_t stream) {
     constexpr static int Headdim = 256;
     int device;
-    cudaGetDevice(&device);
+    hggcGetDevice(&device);
     int max_smem_per_sm, max_smem_per_block;
-    cudaError status_ = cudaDeviceGetAttribute(
-        &max_smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
-    status_ = cudaDeviceGetAttribute(
-        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    if (status_ != cudaSuccess) {
+    hggcError status_ = hggcDeviceGetAttribute(
+        &max_smem_per_sm, hggcDevAttrMaxSharedMemoryPerMultiprocessor, device);
+    status_ = hggcDeviceGetAttribute(
+        &max_smem_per_block, hggcDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (status_ != hggcSuccess) {
       C10_CUDA_CHECK(status_);
     }
     // printf("max_smem_per_sm = %d, max_smem_per_block = %d\n", max_smem_per_sm, max_smem_per_block);

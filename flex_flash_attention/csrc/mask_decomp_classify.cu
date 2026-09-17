@@ -347,9 +347,9 @@ hggcError_t launch_decomp_classify(
     void* scratch, size_t scratch_bytes, hggcStream_t stream) {
   if (seqlen_q <= 0) return hggcSuccess;
   if (scratch_bytes < decomp_classify_scratch_bytes(seqlen_q))
-    return cudaErrorInvalidValue;
+    return hggcErrorInvalidValue;
   if ((seqlen_q + kBlock - 1) / kBlock > kMaxCascadeBlocks)
-    return cudaErrorInvalidValue;
+    return hggcErrorInvalidValue;
 
   char* p = reinterpret_cast<char*>(scratch);
   uintptr_t a = (uintptr_t)p;

@@ -1,5 +1,5 @@
 #pragma once
-#include <nvtx3/nvToolsExt.h>
+#include <hgtx3/hgToolsExt.h>
 #include <string>
 #include <iostream>
 
@@ -156,7 +156,7 @@ public:
   }
 
   bool get_op_info() {
-    return show_params_ || use_nvtx_;
+    return show_params_ || use_hgtx_;
   }
 
   void instrument(bool start, FmhaProfParam &fmha_params) {
@@ -169,16 +169,16 @@ public:
       if (show_params_) {
         std::cout << op_name << std::endl;
       }
-      if (use_nvtx_) {
-        nvtxEventAttributes_t eventAttrib = {0};
-        eventAttrib.version = NVTX_VERSION;
-        eventAttrib.messageType = NVTX_MESSAGE_TYPE_ASCII;
+      if (use_hgtx_) {
+        hgtxEventAttributes_t eventAttrib = {0};
+        eventAttrib.version = HGTX_VERSION;
+        eventAttrib.messageType = HGTX_MESSAGE_TYPE_ASCII;
         eventAttrib.message.ascii = op_name.c_str();
-        nvtxDomainRangePushEx(domain_, &eventAttrib);
+        hgtxDomainRangePushEx(domain_, &eventAttrib);
       }
     } else {
-      if (use_nvtx_) {
-        nvtxDomainRangePop(domain_);
+      if (use_hgtx_) {
+        hgtxDomainRangePop(domain_);
       }
     } // if start
 
@@ -187,17 +187,17 @@ public:
 private:
   ProfilingInterface() {
     // TODO: add print log
-    domain_ = nvtxDomainCreateA("fmha");
-    use_nvtx_ = false;
+    domain_ = hgtxDomainCreateA("fmha");
+    use_hgtx_ = false;
     show_params_ = false;
 
     char *pEnv_perf = std::getenv("PPU_LIB_PERF_INSTRUMENT");
     if (pEnv_perf && isdigit(*pEnv_perf)) {
       int value = std::stoi(std::string(pEnv_perf));
       if (value == 0) {
-        use_nvtx_ = false;
+        use_hgtx_ = false;
       } else if (value == 1) {
-        use_nvtx_ = true;
+        use_hgtx_ = true;
       } else {
         printf("Invalid value for PPU_LIB_PERF_INSTRUMENT : %d\n", value);
       }
@@ -217,12 +217,12 @@ private:
   }
 
   ~ProfilingInterface() {
-    nvtxDomainDestroy(domain_);
+    hgtxDomainDestroy(domain_);
   }
 
-  bool use_nvtx_;
+  bool use_hgtx_;
   bool show_params_;
-  nvtxDomainHandle_t domain_;
+  hgtxDomainHandle_t domain_;
 
 };
 

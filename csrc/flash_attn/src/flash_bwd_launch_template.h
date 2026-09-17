@@ -16,7 +16,7 @@
 namespace FLASH_NAMESPACE {
 
 // Determine if the architecture supports FLASH and define a macro to handle parameter modifiers
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 100
 #define ARCH_SUPPORTS_FLASH
 #define KERNEL_PARAM_MODIFIER __grid_constant__
 #else
@@ -70,7 +70,7 @@ __global__ void flash_bwd_convert_dkv_kernel(const Flash_bwd_params params) {
 }
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
-void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream) {
+void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, hggcStream_t stream) {
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
     dim3 grid_m(num_m_block, params.b, params.h);
     const int num_n_block = (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
@@ -105,8 +105,8 @@ void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream) 
                         auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, Is_dropout && !Is_softcap, Is_causal, Is_local && !Is_causal, Has_alibi, IsEvenMNConst && IsEvenKConst && !Is_local && !Has_alibi && Kernel_traits::kHeadDim <= 128, IsEvenKConst && !Has_alibi, Is_softcap>;
                         // auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, false, Is_causal, false, false, true, true>;
                         if (smem_size_dq_dk_dv >= 48 * 1024)  {
-                            C10_CUDA_CHECK(cudaFuncSetAttribute(
-                                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_dq_dk_dv));
+                            C10_CUDA_CHECK(hggcFuncSetAttribute(
+                                kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size_dq_dk_dv));
                         }
                         kernel<<<grid_n, Kernel_traits::kNThreads, smem_size_dq_dk_dv, stream>>>(params);
                         C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -118,29 +118,29 @@ void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream) 
 
     auto kernel_dq = &flash_bwd_convert_dq_kernel<Kernel_traits>;
     if (Kernel_traits::kSmemdQSize >= 48 * 1024)  {
-        C10_CUDA_CHECK(cudaFuncSetAttribute(
-            kernel_dq, cudaFuncAttributeMaxDynamicSharedMemorySize, Kernel_traits::kSmemdQSize));
+        C10_CUDA_CHECK(hggcFuncSetAttribute(
+            kernel_dq, hggcFuncAttributeMaxDynamicSharedMemorySize, Kernel_traits::kSmemdQSize));
     }
     kernel_dq<<<grid_m, Kernel_traits::kNThreads, Kernel_traits::kSmemdQSize, stream>>>(params, !params.deterministic ? 1 : gridDimx);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
-void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
+void run_flash_bwd(Flash_bwd_params &params, hggcStream_t stream) {
 #ifndef FLASHATTENTION_DISABLE_BACKWARD
     run_flash_bwd_seqk_parallel<Kernel_traits, Is_dropout, Is_causal>(params, stream);
 #endif
 }
 
 template<typename T, bool Is_causal>
-void run_mha_bwd_hdim32(Flash_bwd_params &params, cudaStream_t stream) {
+void run_mha_bwd_hdim32(Flash_bwd_params &params, hggcStream_t stream) {
     constexpr static int Headdim = 32;
     int device;
-    cudaGetDevice(&device);
+    hggcGetDevice(&device);
     int max_smem_per_block;
-    cudaError status_ = cudaDeviceGetAttribute(
-        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    if (status_ != cudaSuccess) {
+    hggcError status_ = hggcDeviceGetAttribute(
+        &max_smem_per_block, hggcDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (status_ != hggcSuccess) {
       C10_CUDA_CHECK(status_);
     }
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
@@ -161,14 +161,14 @@ void run_mha_bwd_hdim32(Flash_bwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, bool Is_causal>
-void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
+void run_mha_bwd_hdim64(Flash_bwd_params &params, hggcStream_t stream) {
     constexpr static int Headdim = 64;
     int device;
-    cudaGetDevice(&device);
+    hggcGetDevice(&device);
     int max_smem_per_block;
-    cudaError status_ = cudaDeviceGetAttribute(
-        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    if (status_ != cudaSuccess) {
+    hggcError status_ = hggcDeviceGetAttribute(
+        &max_smem_per_block, hggcDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (status_ != hggcSuccess) {
       C10_CUDA_CHECK(status_);
     }
     // printf("max_smem_per_block = %d\n", max_smem_per_block);
@@ -210,14 +210,14 @@ void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, bool Is_causal>
-void run_mha_bwd_hdim96(Flash_bwd_params &params, cudaStream_t stream) {
+void run_mha_bwd_hdim96(Flash_bwd_params &params, hggcStream_t stream) {
     constexpr static int Headdim = 96;
     int device;
-    cudaGetDevice(&device);
+    hggcGetDevice(&device);
     int max_smem_per_block;
-    cudaError status_ = cudaDeviceGetAttribute(
-        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    if (status_ != cudaSuccess) {
+    hggcError status_ = hggcDeviceGetAttribute(
+        &max_smem_per_block, hggcDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (status_ != hggcSuccess) {
       C10_CUDA_CHECK(status_);
     }
     // printf("max_smem_per_block = %d\n", max_smem_per_block);
@@ -236,14 +236,14 @@ void run_mha_bwd_hdim96(Flash_bwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, bool Is_causal>
-void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
+void run_mha_bwd_hdim128(Flash_bwd_params &params, hggcStream_t stream) {
     constexpr static int Headdim = 128;
     int device;
-    cudaGetDevice(&device);
+    hggcGetDevice(&device);
     int max_smem_per_block;
-    cudaError status_ = cudaDeviceGetAttribute(
-        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    if (status_ != cudaSuccess) {
+    hggcError status_ = hggcDeviceGetAttribute(
+        &max_smem_per_block, hggcDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (status_ != hggcSuccess) {
       C10_CUDA_CHECK(status_);
     }
     // printf("max_smem_per_block = %d\n", max_smem_per_block);
@@ -283,14 +283,14 @@ void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, bool Is_causal>
-void run_mha_bwd_hdim192(Flash_bwd_params &params, cudaStream_t stream) {
+void run_mha_bwd_hdim192(Flash_bwd_params &params, hggcStream_t stream) {
     constexpr static int Headdim = 192;
     int device;
-    cudaGetDevice(&device);
+    hggcGetDevice(&device);
     int max_smem_per_block;
-    cudaError status_ = cudaDeviceGetAttribute(
-        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    if (status_ != cudaSuccess) {
+    hggcError status_ = hggcDeviceGetAttribute(
+        &max_smem_per_block, hggcDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (status_ != hggcSuccess) {
       C10_CUDA_CHECK(status_);
     }
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
@@ -307,14 +307,14 @@ void run_mha_bwd_hdim192(Flash_bwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, bool Is_causal>
-void run_mha_bwd_hdim256(Flash_bwd_params &params, cudaStream_t stream) {
+void run_mha_bwd_hdim256(Flash_bwd_params &params, hggcStream_t stream) {
     constexpr static int Headdim = 256;
     int device;
-    cudaGetDevice(&device);
+    hggcGetDevice(&device);
     int max_smem_per_block;
-    cudaError status_ = cudaDeviceGetAttribute(
-        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    if (status_ != cudaSuccess) {
+    hggcError status_ = hggcDeviceGetAttribute(
+        &max_smem_per_block, hggcDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (status_ != hggcSuccess) {
       C10_CUDA_CHECK(status_);
     }
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
