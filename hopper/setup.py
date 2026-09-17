@@ -274,7 +274,7 @@ class PerSourceBuildExtension(BuildExtension):
             lines = f.read().splitlines()
 
         new_lines = []
-        margin_flags = "-mllvm -ppu-register-margin=2"
+        margin_flags = f"-mllvm -ppu-register-margin=1"
         for line in lines:
             new_lines.append(line)
             # Match build statements for cuda_compile rules (e.g. cuda_compile,

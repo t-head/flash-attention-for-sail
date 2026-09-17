@@ -80,8 +80,8 @@ struct CollectiveEpilogueBwd {
     // Also requires kBlockN >= 128 (the CVT register permutation assumes 64 accum elements/thread).
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
 #if defined(USE_PPU) && USE_AIU
-    // static constexpr bool Use_CVT_SWZL_LD = false;
-    static constexpr bool Use_CVT_SWZL_LD = ArchTag::kMinComputeCapability >= 89 && (kHeadDim == 128 || kHeadDim == 256) && (kBlockN >= 128);
+    // Must stay in sync with CollectiveMainloopBwdSm80::Use_CVT_SWZL_LD (kHeadDim == 256 excluded there).
+    static constexpr bool Use_CVT_SWZL_LD = ArchTag::kMinComputeCapability >= 89 && (kHeadDim == 128) && (kBlockN >= 128);
 #else
     static constexpr bool Use_CVT_SWZL_LD = false;
 #endif
@@ -440,7 +440,8 @@ struct CollectiveEpilogueBwdGQA {
     // (baseline layout) r2g partitioning is used to write dKaccum / dVaccum.
     // Also requires kBlockN >= 128 (the CVT register permutation assumes 64 accum elements/thread).
 #if defined(USE_PPU) && USE_AIU
-    static constexpr bool Use_CVT_SWZL_LD = ArchTag::kMinComputeCapability >= 89 && (kHeadDim == 128 || kHeadDim == 256) && (kBlockN >= 128);
+    // Must stay in sync with CollectiveMainloopBwdSm80::Use_CVT_SWZL_LD (kHeadDim == 256 excluded there).
+    static constexpr bool Use_CVT_SWZL_LD = ArchTag::kMinComputeCapability >= 89 && (kHeadDim == 128) && (kBlockN >= 128);
 #else
     static constexpr bool Use_CVT_SWZL_LD = false;
 #endif

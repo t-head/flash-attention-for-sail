@@ -46,15 +46,17 @@ struct PPU0015_TSM_LD_SWZL_CVT_BWD<Element, CUBE_H, CUBE_W, BlockH, BlockW,
   copy(void *frag_ptr, void *smem_base, int coord_w, int coord_h, int cube_in_stage = 0, int stage = 0)
   {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
-    Element *stage_base = reinterpret_cast<Element*>(smem_base);
     const int lbo = SHUFFLING_GAIT ? (cube_in_stage & 1 ? LBO-1 : LBO+1) : LBO;
+    // Accumulate the element offset in 32-bit, then form the address once, so the
+    // hoisted per-copy addresses cost one sreg instead of an sreg pair.
+    int offset_elems = 0;
     {
-      stage_base += CUBE_H * CUBE_W * InstNum * stage;
-      stage_base += (cube_in_stage >> 1) * (CUBE_H * CUBE_W * (InstNum >> 1));
-      stage_base += (cube_in_stage & 1) << 3;
-      stage_base += coord_h * BlockW + coord_w;
+      offset_elems += CUBE_H * CUBE_W * InstNum * stage;
+      offset_elems += (cube_in_stage >> 1) * (CUBE_H * CUBE_W * (InstNum >> 1));
+      offset_elems += (cube_in_stage & 1) << 3;
+      offset_elems += coord_h * BlockW + coord_w;
     }
-    int tsm_add = reinterpret_cast<uintptr_t>(stage_base) / 16;
+    int tsm_add = reinterpret_cast<uintptr_t>(reinterpret_cast<Element*>(smem_base) + offset_elems) / 16;
     int *vreg = reinterpret_cast<int *>(frag_ptr);
     PPU0015_TSM_LD_SWZL_IMPL<Element, false, false>()(vreg, tsm_add, lbo, SBO, swzl_mode);
 #else
@@ -75,27 +77,29 @@ struct PPU0015_TSM_LD_SWZL_CVT_BWD<Element, CUBE_H, CUBE_W, BlockH, BlockW,
   copy(void *frag_ptr, void *smem_base, int coord_h, int coord_w, int cube_in_stage = 0, int stage = 0)
   {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
-    Element *stage_base = reinterpret_cast<Element*>(smem_base);
     const int sbo = SHUFFLING_GAIT ? (coord_h >= 64 ? SBO - (CUBE_H * BlockW * (int)sizeof(Element) >> 4) : SBO + (CUBE_H * BlockW * (int)sizeof(Element) >> 4)) : SBO;
+    // Accumulate the element offset in 32-bit, then form the address once, so the
+    // hoisted per-copy addresses cost one sreg instead of an sreg pair.
+    int offset_elems = 0;
     if constexpr (Cvt) {
       {
         if constexpr (BlockH == 128) {
-          stage_base += CUBE_H * CUBE_W * (stage * InstNum);
-          stage_base += (cube_in_stage >> 1) * (CUBE_H * CUBE_W * (InstNum >> 1));
-          stage_base += (cube_in_stage & 1) << 3;
-          stage_base += ((coord_h & 63) + ((coord_h >> 3) & 8)) * BlockW + coord_w;
+          offset_elems += CUBE_H * CUBE_W * (stage * InstNum);
+          offset_elems += (cube_in_stage >> 1) * (CUBE_H * CUBE_W * (InstNum >> 1));
+          offset_elems += (cube_in_stage & 1) << 3;
+          offset_elems += ((coord_h & 63) + ((coord_h >> 3) & 8)) * BlockW + coord_w;
         } else {
-          stage_base += CUBE_H * CUBE_W * InstNum * stage;
-          stage_base += (cube_in_stage >> 1) * (CUBE_H * CUBE_W * (InstNum >> 1));
-          stage_base += (cube_in_stage & 1) << 3;
-          stage_base += coord_h * BlockW + coord_w;
+          offset_elems += CUBE_H * CUBE_W * InstNum * stage;
+          offset_elems += (cube_in_stage >> 1) * (CUBE_H * CUBE_W * (InstNum >> 1));
+          offset_elems += (cube_in_stage & 1) << 3;
+          offset_elems += coord_h * BlockW + coord_w;
         }
       }
     } else {
-      stage_base += CUBE_H * CUBE_W * (cube_in_stage + stage * InstNum);
-      stage_base += coord_h * BlockW + coord_w;
+      offset_elems += CUBE_H * CUBE_W * (cube_in_stage + stage * InstNum);
+      offset_elems += coord_h * BlockW + coord_w;
     }
-    int tsm_add = reinterpret_cast<uintptr_t>(stage_base) / 16;
+    int tsm_add = reinterpret_cast<uintptr_t>(reinterpret_cast<Element*>(smem_base) + offset_elems) / 16;
     int *vreg = reinterpret_cast<int *>(frag_ptr);
     PPU0015_TSM_LD_SWZL_IMPL<Element, true, false>()(vreg, tsm_add, LBO, sbo, swzl_mode);
 #else
@@ -209,7 +213,9 @@ struct CollectiveMainloopBwdSm80 {
     // The CVT + swizzled path requires kBlockN >= 128 because:
     //  1. PdS copy atoms (Trans=false) need BlockW >= 2*CUBE_W = 128
     //  2. Epilogue register permutation assumes 64 accumulator elements/thread (= kBlockN*kHeadDim/NumThreads with kBlockN=128)
-    static constexpr bool Use_CVT_SWZL_LD = ArchTag::kMinComputeCapability >= 89 && (kHeadDim == 128 || kHeadDim == 256) && (kBlockN >= 128);
+    // kHeadDim == 256 is excluded: the permuted accumulator layout is not undone correctly on the dQ
+    // path there (dQ comes out wrong by O(1) while dK/dV stay correct).
+    static constexpr bool Use_CVT_SWZL_LD = ArchTag::kMinComputeCapability >= 89 && (kHeadDim == 128) && (kBlockN >= 128);
 #else
     static constexpr bool Use_CVT_SWZL_LD = false;
 #endif
@@ -260,6 +266,44 @@ struct CollectiveMainloopBwdSm80 {
     static_assert(NumMmaWarps % AtomLayoutMdQ == 0);
     static constexpr bool Mma_dKV_is_RS = AtomLayoutMSdP == 1 && AtomLayoutNdKV == NumMmaWarps && SdP_swapAB && !dKV_swapAB;
     static constexpr bool Mma_dQ_is_RS = AtomLayoutMSdP == NumMmaWarps && AtomLayoutMdQ == NumMmaWarps && !SdP_swapAB && !dQ_swapAB;  // If dQ_swapAB we can't use RS
+
+    // Reorder the gemms to [dK][dQ][dV] and run dQ against dV on the two halves of the MMA warps in
+    // opposite order. Each MMA accumulator is private to its warp, so the staggering only reorders
+    // instructions: every thread ends up with the exact same values.
+    //
+    // What the reorder buys is prefetch cover, not mma-core overlap. dK is the last reader of sQ,
+    // so hoisting it to the front means the Q load for the next iteration -- issued from dQ's hook --
+    // is no longer trailing the last gemm: it gets the rest of dQ plus the whole of dV to land in.
+    // dV moves to the tail; it is the last reader of sdO, and Load_dO_in_S below covers the dO load
+    // that would otherwise be stranded there. The two are a matched pair, so the reorder asserts
+    // Load_dO_in_S. Only relevant when the mma core is saturated by all warps at once, i.e.
+    // headdim 256.
+    //
+    // Gated to PPU1.5 (PPU0015, cc 89): the same hdim256 tile also instantiates for PPU1.0
+    // (PPU0010, Arch 80/86), and only there the schedule was never a win. On PPU1.0 this falls
+    // back to the original [dV][dK][dQ] order (Load_dO_in_S stays on, so the tail dO load is still
+    // covered and the static_assert below is satisfied).
+    static constexpr bool Stagger_dQ_dV =
+        ArchTag::kMinComputeCapability >= 89 && kHeadDim == 256 && kStages == 1 && NumMmaWarps == 16 && !Mma_dKV_is_RS;
+
+    // Load the dO that this iteration's dP gemm will consume from this iteration's S-gemm hook,
+    // instead of prefetching the next iteration's dO from the tail. With single-buffered sdO
+    // (kStages_dO == 1) "issue from the next iter's Gemm0" is the same as "issue this iter's own dO
+    // from Gemm0": the hook fires at i==0 of the S gemm, so the load's address calc and issue
+    // overhead overlap the rest of that gemm's smem loads instead of sitting exposed at the tail
+    // while the mma core idles across the iteration boundary.
+    //
+    // The write to buffer 0 is separated from the previous iteration's dV (the last reader of the
+    // old contents) by the loop-top barrier, so it stays WAR-safe with no extra smem. Q and dO are
+    // then never simultaneously outstanding, so both the loop-top wait and the pre-dP wait fall back
+    // to wait<0>. hdim256-only, same saturated mma-core regime as the reorder above.
+    static constexpr bool Load_dO_in_S =
+        kHeadDim == 256 && kStages == 1 && kStages_dO == 1 && NumMmaWarps == 16 && !Mma_dKV_is_RS;
+
+    // The reorder moves dV (the last reader of sdO) to the tail, which is only legal because the dO
+    // it would strand is instead loaded from the S-gemm hook. Keep the two locked together.
+    static_assert(!Stagger_dQ_dV || Load_dO_in_S,
+                  "the [dK][dQ][dV] reorder assumes dO is loaded from the S-gemm hook (single-buffered sdO)");
 
     using AtomLayoutSdP = std::conditional_t<
         !SdP_swapAB,
@@ -1456,7 +1500,7 @@ struct CollectiveMainloopBwdSm80 {
             // We want the fence outside the if statement to have a fixed number of cp.async commits.
             // so that we can wait with the correct number of outstanding commits.
             cute::cp_async_fence();
-            if constexpr (stage < kStages_dO) {
+            if constexpr (stage < kStages_dO && !Load_dO_in_S) {
                 if (Is_first_stage || m_block + stage < m_block_max) {
                     load_dO_dPsum(m_block + stage, stage);
                 }
@@ -1483,12 +1527,22 @@ struct CollectiveMainloopBwdSm80 {
             cute::cp_async_fence();
         };
 
+        // With Load_dO_in_S, each iteration loads the dO its own dP gemm consumes (block m_block)
+        // into the single sdO buffer from the S-gemm hook. No guard: m_block is always < m_block_max.
+        auto load_dO_cur = [&] {
+            load_dO_dPsum(m_block, 0);
+            cute::cp_async_fence();
+        };
+
         clear(tdKrdK);
         clear(tdVrdV);
 
         auto bwd_step = [&](int m_block, auto mask_fn) {
             Tensor tSrS = partition_fragment_C(tiled_mma_SdP, select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
             clear(tSrS);
+            // Single-buffered head dims (hdim256) drain everything here: dO is loaded from the
+            // S-gemm hook (Load_dO_in_S), not prefetched at the tail, so it is never outstanding at
+            // the loop top. Multi-stage head dims keep one Q group in flight, hence wait<1>.
             flash::cp_async_wait<(kStages > 1) ? 1 : 0>();
             __syncthreads();
             Tensor tSrQ = mma_partition_fragment_AB</*A=*/!SdP_swapAB>(thr_mma_SdP, sQ(_, _, _0{}));
@@ -1497,7 +1551,7 @@ struct CollectiveMainloopBwdSm80 {
             /** recompute s=Q*K^T */
             flash::gemm_sm80<false /*A_in_regs*/, false /*B_in_regs*/, SdP_swapAB>(
                 tSrS, tSrQ, tSrK, tSsQ(_, _, _, kStages > 1 ? smem_pipe_read : 0), tSsK,
-                tiled_mma_SdP, smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV, nullptr /*hook*/);
+                tiled_mma_SdP, smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV, cute::conditional_return<Load_dO_in_S>(load_dO_cur, nullptr) /*hook*/);
             Tensor tLSErLSE = cute::conditional_return<!ShuffleLSE>(make_fragment_like(tSsLSE(_, _0{})), make_tensor<ElementAccum>(Int<kStatsPerThread>{}));
             if constexpr (!ShuffleLSE) {
                 cute::copy(tSsLSE(_, kStages > 1 ? smem_pipe_read : 0), tLSErLSE);
@@ -1578,42 +1632,46 @@ struct CollectiveMainloopBwdSm80 {
             }
             Tensor rdS = make_tensor_like<Element>(tdPrdP);
             flash::convert_type_out(tdPrdP, rdS);
-            if constexpr (!Mma_dKV_is_RS) { __syncthreads(); }  // Make sure P is written
+            if constexpr (!Mma_dKV_is_RS && !Stagger_dQ_dV) { __syncthreads(); }  // Make sure P is written
             // For hdim 64, It's faster to write to smem_dS first before the dV gemm
             Tensor tdSadS = r2s_thr_copy_PdS.retile_S(rdS);   // ((Atom,AtomNum), MMA_N, MMA_N)
             cute::copy(r2s_tiled_copy_PdS, tdSadS, tdSsdS);
+            // sP and sdS live in separate smem arrays, so one barrier can cover both. We need it here
+            // rather than after the dV gemm because dK now runs first and reads sdS.
+            if constexpr (Stagger_dQ_dV) { __syncthreads(); }
 
             /** dV = P^T*dO */
-            Tensor tdVrdO = mma_partition_fragment_AB</*A=*/dKV_swapAB>(thr_mma_dKV, sdOt(_, _, _0{}));
-            Tensor tdVsdO_cur = tdVsdOt(_, _, _, kStages_dO > 1 ? smem_pipe_read_do_cur : 0);
-            if constexpr (Mma_dKV_is_RS) {
+            auto do_mma_dV = [&] (auto hook) {
+                Tensor tdVrdO = mma_partition_fragment_AB</*A=*/dKV_swapAB>(thr_mma_dKV, sdOt(_, _, _0{}));
+                Tensor tdVsdO_cur = tdVsdOt(_, _, _, kStages_dO > 1 ? smem_pipe_read_do_cur : 0);
+                if constexpr (Mma_dKV_is_RS) {
 #ifdef USE_PPU
-                Tensor tdVrP_acc = [&]() -> auto {
-                    if constexpr (ArchTag::kMinComputeCapability >= 89) {
-                        return make_tensor_like<Element>(tSrS);
-                    } else {
-                        return flash::convert_acc<Element>(tSrS);
-                    }
-                }();
-                Tensor tdVrP = [&]() -> auto {
-                    if constexpr (ArchTag::kMinComputeCapability >= 89) {
-                        return make_tensor(rP.data(), convert_layout_acc_Aregs<TiledMmadKV>(tSrS.layout()));
-                    } else {
-                        return make_tensor(tdVrP_acc.data(), make_layout(get<0>(tSrQ.layout()), get<1>(tSrS.layout()), get<2>(tSrS.layout())));
-                    }
-                }();
+                    Tensor tdVrP_acc = [&]() -> auto {
+                        if constexpr (ArchTag::kMinComputeCapability >= 89) {
+                            return make_tensor_like<Element>(tSrS);
+                        } else {
+                            return flash::convert_acc<Element>(tSrS);
+                        }
+                    }();
+                    Tensor tdVrP = [&]() -> auto {
+                        if constexpr (ArchTag::kMinComputeCapability >= 89) {
+                            return make_tensor(rP.data(), convert_layout_acc_Aregs<TiledMmadKV>(tSrS.layout()));
+                        } else {
+                            return make_tensor(tdVrP_acc.data(), make_layout(get<0>(tSrQ.layout()), get<1>(tSrS.layout()), get<2>(tSrS.layout())));
+                        }
+                    }();
 #else
-                Tensor tdVrP = make_tensor(rP.data(), convert_layout_acc_Aregs<TiledMmadKV>(tSrS.layout()));
+                    Tensor tdVrP = make_tensor(rP.data(), convert_layout_acc_Aregs<TiledMmadKV>(tSrS.layout()));
 #endif
-                flash::gemm_rs_sm80(tdVrdV, tdVrP, tdVrdO, tdVsdO_cur, tiled_mma_dKV, smem_tiled_copy_QdOt, smem_thr_copy_QdOt);
-            } else {
-                Tensor tdVrP = mma_partition_fragment_AB</*A=*/!dKV_swapAB>(thr_mma_dKV, sPt);
-                flash::gemm_sm80<false /*A_in_regs*/, false /*B_in_regs*/, /*SwapAB=*/dKV_swapAB>(
-                    tdVrdV, tdVrP, tdVrdO, tdVsPt, tdVsdO_cur,
-                    tiled_mma_dKV, smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt, nullptr);
-            }
-            // if (cute::thread0()) { print_tensor(tdVrdV); }
-            __syncthreads();  // make sure sdS is written
+                    flash::gemm_rs_sm80(tdVrdV, tdVrP, tdVrdO, tdVsdO_cur, tiled_mma_dKV, smem_tiled_copy_QdOt, smem_thr_copy_QdOt);
+                } else {
+                    Tensor tdVrP = mma_partition_fragment_AB</*A=*/!dKV_swapAB>(thr_mma_dKV, sPt);
+                    flash::gemm_sm80<false /*A_in_regs*/, false /*B_in_regs*/, /*SwapAB=*/dKV_swapAB>(
+                        tdVrdV, tdVrP, tdVrdO, tdVsPt, tdVsdO_cur,
+                        tiled_mma_dKV, smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt, hook);
+                }
+                // if (cute::thread0()) { print_tensor(tdVrdV); }
+            };
             /** dQ = dS*K */
             auto do_mma_dQ = [&] (auto hook) {
                 Tensor tdQrdQ = partition_fragment_C(tiled_mma_dQ, select<!dQ_swapAB ? 0 : 2, !dQ_swapAB ? 2 : 0>(TileShape_MNK{}));
@@ -1674,40 +1732,62 @@ struct CollectiveMainloopBwdSm80 {
                     }
                 }
             };
-            // If kStages == 1, we want to do Mma_dK first so we can start loading Q for the next iteration
-            if constexpr (kStages > 1) { do_mma_dQ(load_dO_next); }
             /** dK = dS^T * Q */
-            Tensor tdKrQ = mma_partition_fragment_AB</*A=*/dKV_swapAB>(thr_mma_dKV, sQt(_, _, _0{}));
-            Tensor tdKsQ_cur = tdKsQt(_, _, _, kStages > 1 ? smem_pipe_read : 0);
-            if constexpr (Mma_dKV_is_RS) {
+            auto do_mma_dK = [&] (auto hook) {
+                Tensor tdKrQ = mma_partition_fragment_AB</*A=*/dKV_swapAB>(thr_mma_dKV, sQt(_, _, _0{}));
+                Tensor tdKsQ_cur = tdKsQt(_, _, _, kStages > 1 ? smem_pipe_read : 0);
+                if constexpr (Mma_dKV_is_RS) {
 #ifdef USE_PPU
-                Tensor tdKrdS_acc = [&]() -> auto {
-                    if constexpr (ArchTag::kMinComputeCapability >= 89) {
-                        return make_tensor_like<Element>(tdPrdP);
-                    } else {
-                        return flash::convert_acc<Element>(tdPrdP);
-                    }
-                }();
-                Tensor tdKrdS = [&]() -> auto {
-                    if constexpr (ArchTag::kMinComputeCapability >= 89) {
-                        return make_tensor(rdS.data(), convert_layout_acc_Aregs<TiledMmadKV>(tdPrdP.layout()));
-                    } else {
-                        return make_tensor(tdKrdS_acc.data(), make_layout(get<0>(tdPrdO.layout()), get<1>(tdPrdP.layout()), get<2>(tdPrdP.layout())));
-                    }
-                }();
+                    Tensor tdKrdS_acc = [&]() -> auto {
+                        if constexpr (ArchTag::kMinComputeCapability >= 89) {
+                            return make_tensor_like<Element>(tdPrdP);
+                        } else {
+                            return flash::convert_acc<Element>(tdPrdP);
+                        }
+                    }();
+                    Tensor tdKrdS = [&]() -> auto {
+                        if constexpr (ArchTag::kMinComputeCapability >= 89) {
+                            return make_tensor(rdS.data(), convert_layout_acc_Aregs<TiledMmadKV>(tdPrdP.layout()));
+                        } else {
+                            return make_tensor(tdKrdS_acc.data(), make_layout(get<0>(tdPrdO.layout()), get<1>(tdPrdP.layout()), get<2>(tdPrdP.layout())));
+                        }
+                    }();
 #else
-                Tensor tdKrdS = make_tensor(rdS.data(), convert_layout_acc_Aregs<TiledMmadKV>(tdPrdP.layout()));
+                    Tensor tdKrdS = make_tensor(rdS.data(), convert_layout_acc_Aregs<TiledMmadKV>(tdPrdP.layout()));
 #endif
-                flash::gemm_rs_sm80(tdKrdK, tdKrdS, tdKrQ, tdKsQ_cur, tiled_mma_dKV, smem_tiled_copy_QdOt, smem_thr_copy_QdOt);
-            } else {
-                Tensor tdKrdS = mma_partition_fragment_AB</*A=*/!dKV_swapAB>(thr_mma_dKV, sdSt);
-                flash::gemm_sm80<false /*A_in_regs*/, false /*B_in_regs*/, /*SwapAB=*/dKV_swapAB>(
-                    tdKrdK, tdKrdS, tdKrQ, tdKsdSt, tdKsQ_cur,
-                    tiled_mma_dKV, smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt, cute::conditional_return<(kStages > 1)>(nullptr, load_dO_next));
-            }
-            if constexpr (kStages == 1) {
+                    flash::gemm_rs_sm80(tdKrdK, tdKrdS, tdKrQ, tdKsQ_cur, tiled_mma_dKV, smem_tiled_copy_QdOt, smem_thr_copy_QdOt);
+                } else {
+                    Tensor tdKrdS = mma_partition_fragment_AB</*A=*/!dKV_swapAB>(thr_mma_dKV, sdSt);
+                    flash::gemm_sm80<false /*A_in_regs*/, false /*B_in_regs*/, /*SwapAB=*/dKV_swapAB>(
+                        tdKrdK, tdKrdS, tdKrQ, tdKsdSt, tdKsQ_cur,
+                        tiled_mma_dKV, smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt, hook);
+                }
+            };
+            if constexpr (Stagger_dQ_dV) {
+                // dK first: it is the last reader of sQ, so once every warp is past it the Q load for
+                // the next iteration can be issued from inside the staggered region's first gemm.
+                do_mma_dK(nullptr);
                 __syncthreads();
-                do_mma_dQ(load_Q_next);
+                if (thread_idx >= NumMmaThreads / 2) {
+                    do_mma_dQ(load_Q_next);
+                    do_mma_dV(nullptr);
+                } else {
+                    do_mma_dV(load_Q_next);
+                    do_mma_dQ(nullptr);
+                }
+                // Both halves are done reading sdO before the next iteration reuses the buffer. dO
+                // itself is loaded from the S-gemm hook (Load_dO_in_S), not prefetched here.
+                __syncthreads();
+            } else {
+                do_mma_dV(nullptr);
+                __syncthreads();  // make sure sdS is written
+                // If kStages == 1, we want to do Mma_dK first so we can start loading Q for the next iteration
+                if constexpr (kStages > 1) { do_mma_dQ(load_dO_next); }
+                do_mma_dK(cute::conditional_return<(kStages > 1)>(nullptr, load_dO_next));
+                if constexpr (kStages == 1) {
+                    __syncthreads();
+                    do_mma_dQ(load_Q_next);
+                }
             }
             // if (cute::thread0()) { print_tensor(tdKrdK); }
 
