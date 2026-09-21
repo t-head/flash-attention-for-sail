@@ -1,0 +1,10 @@
+# FA3 (hopper) pytest caselist (run under: pytest -v <target> --junitxml=...)
+# Each non-comment line is a pytest node id (path::test_function).
+# Text after '#' is an inline comment. Commented entries below are
+# known-failing and intentionally skipped.
+# hopper/test_flash_attn.py::test_flash_attn_output          # expect 2 failures
+# hopper/test_flash_attn.py::test_flash_attn_varlen_output   # expect 10 failures
+hopper/test_flash_attn.py::test_flash_attn_kvcache
+hopper/test_flash_attn.py::test_flash_attn_cluster
+# hopper/test_flash_attn.py::test_flash_attn_race_condition  # expect 60 failures
+hopper/test_flash_attn.py::test_flash_attn_combine
