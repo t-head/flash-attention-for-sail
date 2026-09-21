@@ -1,0 +1,169 @@
+name: flash-attention fa272 checkin     # ① Workflow 名称（显示在 Actions 页面）
+
+# ② 触发条件
+on:
+  workflow_call:                                           # 由 ci-flash-attention.yaml 按 PR 目标分支调用
+    inputs:
+      matrix:
+        required: false
+        type: string
+        default: '["OAM-810E","ZW-M890P"]'
+      source_mode:
+        description: "Source layout mode. Supported values: flash-attention, actlize0.8.0."
+        required: false
+        type: string
+        default: flash-attention
+  workflow_dispatch:                                       # 支持手动触发（网页/API）
+
+permissions:                    # ③ Token 权限
+  contents: read
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: ci-ppu-fa272-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true                 # 新运行自动取消旧的
+
+env:
+  PPU_BASE_IMAGE: ${{ secrets.PPU_BASE_IMAGE }}
+  SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
+
+jobs:
+  build-test:
+    name: Build & Test (FA2 / ${{ matrix.runner }})
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJson(inputs.matrix || '["OAM-810E","ZW-M890P"]') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the base..head diff below resolves both ends.
+          fetch-depth: 0
+          # Fetch submodules (csrc/actlize provides cutlass headers) at checkout time, recursively.
+          submodules: recursive
+          persist-credentials: false
+      - name: Build and Test FA2 on ${{ matrix.runner }}
+        id: ppu-test
+        uses: t-head/ppu-scheduler-action@main
+        with:
+          image: ${{ env.SAIL_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: "board-type=${{ matrix.runner }}"
+          namespace: ppu-sched
+          timeout_minutes: 300
+          command: |
+            set -ex
+            # The image points pip and github.com at unreachable internal mirrors. Fix these
+            # before source_mode handling because actlize mode clones the FA repository.
+            unset PIP_INDEX_URL
+            git config --global --unset-all url.https://ai-gerrit.eng.t-head.cn/Public/Github/.insteadOf 2>/dev/null || true
+            SOURCE_MODE='${{ inputs.source_mode }}'
+            case "$SOURCE_MODE" in
+              ""|flash-attention)
+                cd /workspace/source
+                ;;
+              actlize|actlize0.8.0)
+                cd /workspace
+                FA272_SOURCE=$(mktemp -d /workspace/fa272-source.XXXXXX)
+                rmdir "$FA272_SOURCE"
+                git config --global --add safe.directory '*'
+                git clone --recurse-submodules -b feature/add-ci-fa2.7.2 \
+                  https://github.com/t-head/flash-attention-for-sail.git "$FA272_SOURCE"
+                ACTLIZE_V080_SOURCE=$(mktemp -d /workspace/actlize-v080-source.XXXXXX)
+                rmdir "$ACTLIZE_V080_SOURCE"
+                mv /workspace/source "$ACTLIZE_V080_SOURCE"
+                rm -rf "$FA272_SOURCE/csrc/actlize"
+                mkdir -p "$FA272_SOURCE/csrc"
+                mv "$ACTLIZE_V080_SOURCE" "$FA272_SOURCE/csrc/actlize"
+                mv "$FA272_SOURCE" /workspace/source
+                cd /workspace/source
+                ;;
+              *)
+                echo "Unsupported source_mode for FA272: $SOURCE_MODE"
+                exit 1
+                ;;
+            esac
+            # PPU SDK and torch are pre-installed in the docker image
+            source /usr/local/PPU_SDK/envsetup.sh
+            # Drop any pre-installed flash-attn so the freshly built wheel takes effect.
+            pip uninstall -y flash-attn flash-attn-3 || true
+            export MAX_JOBS=20
+            export PYTORCH_SAIL_ARCH="ppu_10;ppu_15"
+            export FLASH_ATTENTION_FORCE_BUILD="TRUE"
+            # Submodules are initialized by checkout or the source_mode clone above.
+            # Pin build dependencies to avoid legacy fetching and old-packaging incompatibilities.
+            pip install "setuptools==75.8.0" "packaging==24.2" psutil ninja
+            echo "START TO BUILD FA2 WHEEL"
+            LOG_FILE="build_fa2.log"
+            ERROR_LOG="error_fa2.log"
+            # The build may stay silent for a long time; print a heartbeat every 10 minutes.
+            python ./setup.py bdist_wheel > "$LOG_FILE" 2> "$ERROR_LOG" &
+            BUILD_PID=$!
+            echo "FA2 build started in background, pid=$BUILD_PID"
+            set +x
+            ELAPSED=0
+            while kill -0 "$BUILD_PID" 2>/dev/null; do
+                sleep 10
+                ELAPSED=$((ELAPSED + 10))
+                if (( ELAPSED % 600 == 0 )); then
+                    echo "----- [$(date '+%F %T')] FA2 build still running ($((ELAPSED / 60)) min), last 100 lines of $LOG_FILE -----"
+                    tail -n 100 "$LOG_FILE" || true
+                fi
+            done
+            set -x
+            EXIT_CODE=0
+            wait "$BUILD_PID" || EXIT_CODE=$?
+            echo "FA2 build finished after ~$((ELAPSED / 60)) min, exit code $EXIT_CODE"
+            if [[ "$EXIT_CODE" -ne 0 ]]; then
+                echo "FA2 build failed with exit code $EXIT_CODE"
+                cat "$ERROR_LOG"
+                echo "----- last 1000 lines of $LOG_FILE -----"
+                tail -n 1000 "$LOG_FILE"
+                exit 1
+            fi
+            echo "✅ FA2 构建成功！"
+            echo "----- last 200 lines of $LOG_FILE -----"
+            tail -n 200 "$LOG_FILE"
+            pip install ./dist/*.whl
+            echo "START TO INSTALL TEST DEPS"
+            pip install numpy==1.26.4 junit-xml einops
+            pip install --upgrade pytest
+            echo "START TO TEST FA2 CASES"
+            set +e
+            python .github/workflows/scripts/pr-run-fa-ut.py \
+              --caselist .github/workflows/scripts/fa2_pytest.list \
+              --output test-results-fa2.xml
+            FA2_EXIT_CODE=$?
+            # Record the runtime environment alongside the JUnit report.
+            python3 .github/workflows/scripts/generate-env-info.py \
+              --docker-image "${{ env.SAIL_IMAGE }}" \
+              --output env_info.json
+            # Copy the JUnit report and runtime information to NAS for the runner.
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/flash-attention-ci/fa272/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+            mkdir -p "$NAS_RESULT_DIR"
+            cp test-results-fa2.xml "$NAS_RESULT_DIR/" 2>/dev/null || true
+            cp env_info.json "$NAS_RESULT_DIR/" 2>/dev/null || true
+            # Fail the job if FA2 tests failed.
+            exit "$FA2_EXIT_CODE"
+          cleanup_policy: on_success
+
+      - name: Test summary (FA2 / ${{ matrix.runner }})
+        if: always()
+        shell: bash
+        run: |
+          NAS_RESULT_DIR="/wl_nas/devops/flash-attention-ci/fa272/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+          XML_FILE="$NAS_RESULT_DIR/test-results-fa2.xml"
+          ENV_FILE="$NAS_RESULT_DIR/env_info.json"
+          echo "## FA272 FA2 results (${{ matrix.runner }})" >> "$GITHUB_STEP_SUMMARY"
+          if [[ ! -f "$XML_FILE" ]]; then
+            echo "JUnit report not found: $XML_FILE" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          python3 .github/workflows/scripts/display-test-summary.py \
+            "$XML_FILE" --env-info "$ENV_FILE"
