@@ -1,0 +1,161 @@
+name: flash-attention fa282 checkin
+
+on:
+  workflow_call:
+    inputs:
+      matrix:
+        required: false
+        type: string
+        default: '["OAM-810E","ZW-M890P"]'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: ci-ppu-fa282-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PPU_BASE_IMAGE: ${{ secrets.PPU_BASE_IMAGE }}
+  SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
+
+jobs:
+  build-test:
+    name: Build & Test (${{ matrix.variant }} / ${{ matrix.runner }})
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 420
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJson(inputs.matrix || '["OAM-810E","ZW-M890P"]') }}
+        variant: [fa2, fa3]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false     # csrc/actlize provides cutlass headers
+      - name: Build and Test ${{ matrix.variant }} on ${{ matrix.runner }}
+        id: ppu-test
+        uses: t-head/ppu-scheduler-action@main
+        with:
+          image: ${{ env.SAIL_IMAGE }}
+          container_options: |
+            cpus: "30"
+            memory: "240g"
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: "board-type=${{ matrix.runner }}"
+          namespace: ppu-sched
+          timeout_minutes: 420
+          command: |
+            set -ex
+            cd /workspace/source
+            # The image points pip and github.com at unreachable internal mirrors.
+            unset PIP_INDEX_URL
+            git config --global --unset-all url.https://ai-gerrit.eng.t-head.cn/Public/Github/.insteadOf 2>/dev/null || true
+            source /usr/local/PPU_SDK/envsetup.sh
+            # Make sure the freshly built wheels take effect.
+            pip uninstall -y flash-attn flash-attn-3 || true
+            export MAX_JOBS=20
+            export PYTORCH_SAIL_ARCH="ppu_10;ppu_15"
+            export FLASH_ATTENTION_FORCE_BUILD="TRUE"
+            echo "START TO INIT SUBMODULES"
+            git config --global --add safe.directory /workspace/source
+            # Pre-install setup_requires to avoid setuptools' legacy fetcher; pin a compatible
+            # setuptools/packaging pair (the image's old packaging breaks wheel metadata).
+            pip install "setuptools==75.8.0" "packaging==24.2" psutil ninja
+            git submodule update --init --recursive
+            VARIANT="${{ matrix.variant }}"
+            VARIANT_UPPER="${VARIANT^^}"
+            if [[ "$VARIANT" == "fa3" ]]; then
+              BUILD_DIR="/workspace/source/hopper"
+            else
+              BUILD_DIR="/workspace/source"
+            fi
+            LOG_FILE="$BUILD_DIR/build_${VARIANT}.log"
+            ERROR_LOG="$BUILD_DIR/error_${VARIANT}.log"
+            echo "START TO BUILD ${VARIANT_UPPER} WHEEL IN $BUILD_DIR"
+            # Builds may stay silent for a long time; print a heartbeat every 10 minutes.
+            cd "$BUILD_DIR"
+            python ./setup.py bdist_wheel > "$LOG_FILE" 2> "$ERROR_LOG" &
+            BUILD_PID=$!
+            echo "${VARIANT_UPPER} build started in background, pid=$BUILD_PID"
+            set +x
+            ELAPSED=0
+            while kill -0 "$BUILD_PID" 2>/dev/null; do
+                sleep 10
+                ELAPSED=$((ELAPSED + 10))
+                if (( ELAPSED % 600 == 0 )); then
+                    echo "----- [$(date '+%F %T')] ${VARIANT_UPPER} build still running ($((ELAPSED / 60)) min), last 100 lines of $LOG_FILE -----"
+                    tail -n 100 "$LOG_FILE" || true
+                fi
+            done
+            set -x
+            EXIT_CODE=0
+            wait "$BUILD_PID" || EXIT_CODE=$?
+            echo "${VARIANT_UPPER} build finished after ~$((ELAPSED / 60)) min, exit code $EXIT_CODE"
+            if [[ "$EXIT_CODE" -ne 0 ]]; then
+                echo "${VARIANT_UPPER} build failed with exit code $EXIT_CODE"
+                cat "$ERROR_LOG"
+                echo "----- last 100 lines of $LOG_FILE -----"
+                tail -n 100 "$LOG_FILE"
+                exit 1
+            fi
+            echo "✅ ${VARIANT_UPPER} 构建成功！"
+            echo "----- last 200 lines of $LOG_FILE -----"
+            tail -n 200 "$LOG_FILE"
+            # bdist_wheel leaves <pkg>.egg-info in BUILD_DIR; if it is on sys.path pip treats the
+            # package as already installed and silently skips the wheel (so flash_attn_3._C is missing).
+            rm -rf "$BUILD_DIR"/*.egg-info
+            pip install "$BUILD_DIR"/dist/*.whl
+            if [[ "$VARIANT" == "fa3" ]]; then
+              # Check the compiled extension from the installed wheel before running any case.
+              (cd /tmp && python -c "import flash_attn_3._C; print(flash_attn_3._C.__file__)")
+              pip show -f flash-attn-3 || true
+              export PYTHONPATH="/workspace/source/hopper"
+            else
+              pip show -f flash-attn || true
+            fi
+            echo "START TO INSTALL TEST DEPS"
+            pip install numpy==1.26.4 junit-xml einops
+            pip install --upgrade pytest
+            CASELIST=".github/workflows/scripts/${VARIANT}_pytest.list"
+            RESULT_FILE="test-results-${VARIANT}.xml"
+            echo "START TO TEST ${VARIANT_UPPER} CASES FROM $CASELIST"
+            cd /workspace/source
+            # Keep going on test failures so the report is still copied to NAS for the summary.
+            set +e
+            python .github/workflows/scripts/pr-run-fa-ut.py \
+              --caselist "$CASELIST" --output "$RESULT_FILE"
+            TEST_EXIT_CODE=$?
+            python3 .github/workflows/scripts/generate-env-info.py \
+              --docker-image "${{ env.SAIL_IMAGE }}" \
+              --output env_info.json
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/flash-attention-ci/fa282/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${{ matrix.variant }}"
+            mkdir -p "$NAS_RESULT_DIR"
+            cp "$RESULT_FILE" "$NAS_RESULT_DIR/" 2>/dev/null || true
+            cp env_info.json "$NAS_RESULT_DIR/" 2>/dev/null || true
+            exit "$TEST_EXIT_CODE"
+          cleanup_policy: on_success
+
+      - name: Test summary (${{ matrix.variant }} / ${{ matrix.runner }})
+        if: always()
+        shell: bash
+        run: |
+          VARIANT="${{ matrix.variant }}"
+          NAS_RESULT_DIR="/wl_nas/devops/flash-attention-ci/fa282/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${{ matrix.variant }}"
+          XML_FILE="$NAS_RESULT_DIR/test-results-${VARIANT}.xml"
+          ENV_FILE="$NAS_RESULT_DIR/env_info.json"
+          echo "## FA282 ${VARIANT^^} results (${{ matrix.runner }})" >> "$GITHUB_STEP_SUMMARY"
+          if [[ ! -f "$XML_FILE" ]]; then
+            echo "JUnit report not found: $XML_FILE" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          python3 .github/workflows/scripts/display-test-summary.py \
+            "$XML_FILE" --env-info "$ENV_FILE"

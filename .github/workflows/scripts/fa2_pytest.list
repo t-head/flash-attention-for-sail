@@ -1,0 +1,18 @@
+# FA2 pytest caselist (run under: pytest -v <target> --junitxml=...)
+# Each non-comment line is a pytest node id (path::test_function).
+# Text after '#' is an inline comment. Commented entries below are
+# known-failing and intentionally skipped.
+tests/test_flash_attn.py::test_flash_attn_bwd_overflow
+tests/test_flash_attn.py::test_flash_attn_bwd_transpose
+tests/test_flash_attn.py::test_flash_attn_bwd_varlen_overflow
+tests/test_flash_attn.py::test_flash_attn_causal
+tests/test_flash_attn.py::test_flash_attn_deterministic
+tests/test_flash_attn.py::test_flash_attn_kvcache
+# tests/test_flash_attn.py::test_flash_attn_output          # expect 4 failures
+tests/test_flash_attn.py::test_flash_attn_qkvpacked
+tests/test_flash_attn.py::test_flash_attn_race_condition
+# tests/test_flash_attn.py::test_flash_attn_splitkv         # expect 8 failures
+tests/test_flash_attn.py::test_flash_attn_varlen_causal
+tests/test_flash_attn.py::test_flash_attn_varlen_deterministic
+tests/test_flash_attn.py::test_flash_attn_varlen_output
+tests/test_flash_attn.py::test_flash_attn_varlen_qkvpacked
