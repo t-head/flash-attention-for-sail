@@ -167,7 +167,7 @@ struct CollectiveMainloopFwdSm80 {
     // static constexpr int kSwizzleS = kBytePerBlockK == 128 ? 3 : 2;  // S: 128B / 64B
     // static constexpr int kSwizzleB = kSwizzleS;                      // B = S to max swizzle
     static constexpr int kSwizzleS = 3;  // we always want 128B swizzle
-    static constexpr int kSwizzleB = kBytePerBlockK == 128 ? 3 : (kBlockKGmem == 64 ? 2 : 1); // 8 rows in atom, so B=2 for 64B BlockK
+    static constexpr int kSwizzleB = kBytePerBlockK == 128 ? 3 : (kBytePerBlockK == 64 ? 2 : 1); // 8 rows in atom, so B=2 for 64B BlockK
 
 #if defined(USE_PPU) && USE_AIU
     using SmemLayoutAtomQKV = Layout<Shape<_8, Int<kBlockKGmem>>, Stride<Int<kBlockKGmem>, _1>>;
