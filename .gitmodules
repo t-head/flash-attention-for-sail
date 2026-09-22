@@ -1,0 +1,4 @@
+[submodule "csrc/actlize"]
+	path = csrc/actlize
+	url = https://github.com/t-head/actlize.git
+	branch = v1.0.0
