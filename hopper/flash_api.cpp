@@ -1217,8 +1217,15 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     params.dv_rounded = head_size_v_rounded;
 #ifdef USE_PPU
     params.is_qsa = is_qsa;
-    // Preserve the caller's AIU contract; causal QSA also needs the dense span.
     params.qsa_allow_aiu = is_qsa && qsa_allow_aiu;
+    // Causal QSA needs seqused_k for the real KV length. Without it, seqlen_k
+    // falls back to the topk width and incorrectly truncates most query rows.
+    if (is_qsa && params.is_causal && !seqused_k_.has_value()) {
+        params.is_causal = false;
+        params.is_local = false;
+        params.window_size_left = -1;
+        params.window_size_right = -1;
+    }
     if (is_qsa && !params.is_causal) {
         params.seqused_k = nullptr;
     }

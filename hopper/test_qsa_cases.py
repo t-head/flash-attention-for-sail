@@ -286,5 +286,58 @@ def main():
     return bool(failures)
 
 
+# ---------------------------------------------------------------------------
+# fwd-direct path: torch.ops.flash_attn_3.fwd called with a 3-D QSA page_table
+# ---------------------------------------------------------------------------
+
+def _fwd_direct(q, k, v, page_table_3d, cu_seqlens_q, seqused_k, max_seqlen_q,
+                causal=True, num_splits=1, pack_gqa=True):
+    """Call the C++ fwd op directly, bypassing flash_attn_with_kvcache."""
+    import flash_attn_3._C
+    scale = q.shape[-1] ** -0.5
+    return torch.ops.flash_attn_3.fwd(
+        q, k, v,
+        None, None, None, None,                    # k_new, v_new, qv, out
+        cu_seqlens_q, None, None,                  # cu_seqlens_q/k/k_new
+        None, seqused_k,                           # seqused_q, seqused_k
+        max_seqlen_q, None,                        # max_seqlen_q/k
+        page_table_3d,                             # page_table (3-D triggers QSA)
+        None, None,                                # kv_batch_idx, leftpad_k
+        None, None, None,                          # rotary
+        None, None, None,                          # descale
+        scale,                                     # softmax_scale
+        causal, -1, -1, 0, 0.0, True,             # causal, window, chunk, softcap, rot_interl
+        None, num_splits, pack_gqa, 0,             # scheduler, splits, pack_gqa, sm_margin
+        None, False,                               # s_aux, qsa_allow_aiu
+    )
+
+
+def test_qsa_fwd_direct_causal_no_seqused_k_falls_back():
+    """Causal QSA without seqused_k silently drops causal (== explicit causal=False)."""
+    case = Case("_fwd_fallback", 960, 1024, 256, 128, 544, 1, 16, 2, "structured")
+    q, k, v, topk, cu, cache = build_inputs(case, torch.bfloat16)
+    pt3d = topk.unsqueeze(1)
+    out_causal_no_sk, *_ = _fwd_direct(q, k, v, pt3d, cu, None, case.sq, causal=True)
+    out_noncausal, *_ = _fwd_direct(q, k, v, pt3d, cu, None, case.sq, causal=False)
+    assert torch.equal(out_causal_no_sk, out_noncausal), \
+        f"max diff {(out_causal_no_sk.float() - out_noncausal.float()).abs().max().item()}"
+
+
+def test_qsa_fwd_direct_causal_matches_kvcache():
+    """fwd-direct with seqused_k must produce the same output as flash_attn_with_kvcache."""
+    from flash_attn_interface import flash_attn_with_kvcache
+    case = Case("_fwd_match", 960, 1024, 256, 128, 544, 1, 16, 2, "structured")
+    q, k, v, topk, cu, cache = build_inputs(case, torch.bfloat16)
+    pt3d = topk.unsqueeze(1)
+    scale = case.dim ** -0.5
+    out_kv = flash_attn_with_kvcache(
+        q, k, v, cache_seqlens=cache, page_table=pt3d, cu_seqlens_q=cu,
+        max_seqlen_q=case.sq, causal=True, softmax_scale=scale,
+        num_splits=1, pack_gqa=True)
+    out_fwd, *_ = _fwd_direct(q, k, v, pt3d, cu, cache, case.sq)
+    assert torch.equal(out_fwd, out_kv), \
+        f"max diff {(out_fwd.float() - out_kv.float()).abs().max().item()}"
+
+
 if __name__ == "__main__":
     sys.exit(main())
