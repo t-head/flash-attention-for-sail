@@ -207,8 +207,13 @@ public:
                 if (bidb >= params.num_batch) return false;
                 int seqlen = params.seqused ? __ld_smem(&params.seqused[bidb]) : (params.cu_seqlens ? __ld_smem(&params.cu_seqlens[bidb + 1]) - __ld_smem(&params.cu_seqlens[bidb]): params.seqlen);
                 int num_blocks = Is_QSA ? seqlen : cute::ceil_div((PackGQA ? params.qhead_per_khead : 1) * seqlen, kBlock);
+                // Keep walking while the current batch is zero-length (num_blocks == 0, i.e. two
+                // equal values in cu_seqlens_q). Such a batch owns no dense tiles; without this the
+                // walk can stop on it the instant tile_idx reaches tile_idx_next and drop the next
+                // real batch's first tile. At an empty batch block_idx is 0, so the remaining-tile
+                // count is 0 and the skip branch below (distance >= 0) just advances bidb.
                 #pragma clang loop licm(disable)
-                while (tile_idx < tile_idx_next) {
+                while (tile_idx < tile_idx_next || num_blocks == 0) {
                     int tile_idx_distance = tile_idx_next - tile_idx;
                     if (tile_idx_distance >= (params.num_head - bidh - 1) * max_num_splits_dynamic * num_blocks + (max_num_splits_dynamic - split_idx - 1) * num_blocks + num_blocks - block_idx) {
                         tile_idx += ((params.num_head - bidh - 1) * max_num_splits_dynamic * num_blocks + (max_num_splits_dynamic - split_idx - 1) * num_blocks + num_blocks - block_idx);
