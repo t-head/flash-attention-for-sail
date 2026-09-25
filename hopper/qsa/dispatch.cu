@@ -17,6 +17,17 @@ struct Gqa8Direct : Gqa8 {
     static constexpr bool DirectIndex = true, SingleTile = true;
 };
 struct Gqa8Varlen : Gqa8Direct { static constexpr bool SingleTile = false; };
+// Qwen3.8 TP8/TP4/TP2/TP1 use groups 3/6/12/12 respectively.
+// Keep the 16-row MMA tile but avoid computing a runtime head divmod, and
+// address each selected token directly when the physical KV row stride fits.
+struct Gqa3Direct : Gqa8Direct { static constexpr int Group = 3, KVStride = 256; };
+struct Gqa6Direct : Gqa8Direct { static constexpr int Group = 6, KVStride = 256; };
+struct Gqa12Direct256 : Gqa8Direct { static constexpr int Group = 12, KVStride = 256; };
+struct Gqa12Direct512 : Gqa8Direct { static constexpr int Group = 12; };
+struct Gqa3Varlen : Gqa3Direct { static constexpr bool SingleTile = false; };
+struct Gqa6Varlen : Gqa6Direct { static constexpr bool SingleTile = false; };
+struct Gqa12Varlen256 : Gqa12Direct256 { static constexpr bool SingleTile = false; };
+struct Gqa12Varlen512 : Gqa12Direct512 { static constexpr bool SingleTile = false; };
 struct Gqa8Wide : Gqa8Varlen { static constexpr int RowBytes = 512; };
 struct Gqa8ShortWide : Gqa8Wide { static constexpr bool SingleTile = true; };
 struct Gqa8Long : Gqa8Direct { static constexpr int Stages = 2, RowBytes = 256; };
@@ -86,6 +97,30 @@ bool run_qsa(Flash_fwd_params &p, hggcStream_t stream) {
     if (!qsa_config_supported(p)) { return false; }
     const bool split = p.num_splits > 1;
     const bool uniform_q = p.total_q == int64_t(p.b) * p.seqlen_q;
+    const bool direct_grid = uniform_q && p.b <= 65535
+        && int64_t(p.h_k) * p.num_splits <= 65535;
+    if (p.h == 3 * p.h_k && p.k_row_stride == 256 && p.v_row_stride == 256) {
+        if (direct_grid) { launch<Gqa3Direct>(p, stream); }
+        else { launch<Gqa3Varlen>(p, stream); }
+        return true;
+    }
+    if (p.h == 6 * p.h_k && p.k_row_stride == 256 && p.v_row_stride == 256) {
+        if (direct_grid) { launch<Gqa6Direct>(p, stream); }
+        else { launch<Gqa6Varlen>(p, stream); }
+        return true;
+    }
+    if (p.h == 12 * p.h_k && p.k_row_stride == p.v_row_stride) {
+        if (p.k_row_stride == 256) {
+            if (direct_grid) { launch<Gqa12Direct256>(p, stream); }
+            else { launch<Gqa12Varlen256>(p, stream); }
+            return true;
+        }
+        if (p.k_row_stride == 512) {
+            if (direct_grid) { launch<Gqa12Direct512>(p, stream); }
+            else { launch<Gqa12Varlen512>(p, stream); }
+            return true;
+        }
+    }
     if (p.h == 8 * p.h_k) {
         if (p.k_row_stride != 512 || p.v_row_stride != 512) {
             launch<Gqa8>(p, stream);

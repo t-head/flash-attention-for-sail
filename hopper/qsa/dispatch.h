@@ -56,7 +56,11 @@ inline bool qsa_gqa32_uses_single_tile(Flash_fwd_params const& p) {
 
 inline bool qsa_uses_single_tile(Flash_fwd_params const& p) {
     return qsa_config_supported(p)
-        && ((p.h == 8 * p.h_k && p.k_row_stride == 512 && p.v_row_stride == 512
+        && (((p.h == 3 * p.h_k || p.h == 6 * p.h_k || p.h == 12 * p.h_k)
+             && p.k_row_stride == p.v_row_stride
+             && (p.k_row_stride == 256 || (p.h == 12 * p.h_k && p.k_row_stride == 512))
+             && p.b <= 65535 && int64_t(p.h_k) * p.num_splits <= 65535)
+            || (p.h == 8 * p.h_k && p.k_row_stride == 512 && p.v_row_stride == 512
              && (p.seqlen_k < 2048 || qsa_uses_long_pipeline(p) || qsa_uses_small_wide_tile(p)))
             || (p.h > 16 * p.h_k && p.h < 32 * p.h_k && p.seqlen_q <= 16
                 && p.b <= 65535 && int64_t(p.h_k) * p.num_splits <= 65535)
