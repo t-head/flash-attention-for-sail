@@ -238,7 +238,9 @@ public:
                 float const k_descale = params.mainloop.ptr_k_descale == nullptr ? 1.0f : params.mainloop.ptr_k_descale[bidb * get<0>(params.mainloop.stride_k_descale) + bidh_kv * get<1>(params.mainloop.stride_k_descale)];
                 softmax_scale_log2 *= q_descale * k_descale;
             }
-            flash::Softmax<2 * (2 * kBlockM / NumThreads), /*Max_offset=*/!Is_FP8 ? 0 : 8> softmax(softmax_scale_log2);
+            flash::Softmax<CollectiveMainloop::QsaReplicateQK
+                               ? 2 : 2 * (2 * kBlockM / NumThreads),
+                           /*Max_offset=*/!Is_FP8 ? 0 : 8> softmax(softmax_scale_log2);
 
             SeqlenInfo_t seqlen_info{
                 bidb,

@@ -7,6 +7,7 @@ struct QsaConfig {
     static constexpr int RowBytes = 0, KVStride = 0;
     static constexpr bool QRegs = false, TsmQ = false, TsmKV = false;
     static constexpr bool FixedGroup = false, DirectIndex = false, SingleTile = false;
+    static constexpr bool QueryFirst = false;
 };
 }
 
@@ -69,3 +70,6 @@ inline bool qsa_uses_single_tile(Flash_fwd_params const& p) {
 
 // Returns false without launching when this is not an eligible QSA request.
 bool run_qsa(Flash_fwd_params&, hggcStream_t);
+// A head-parallel SplitKV merge for short QSA decode. Returns false for
+// unsupported shapes so the generic combine kernel remains available.
+bool run_qsa_decode_combine(Flash_fwd_params const&, hggcStream_t);

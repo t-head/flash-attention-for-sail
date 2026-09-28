@@ -53,9 +53,18 @@ struct BlockMN {
             int num_splits_dynamic = reinterpret_cast<int&>(num_splits_dynamic_u);
             int split_idx_actual = split_idx & 0x0000FFFF;
             int num_splits_actual = num_splits_dynamic > 0 ? num_splits_dynamic : num_splits;
-            int num_n_blocks_per_split = n_block_max <= n_block_min ? 0 : cute::ceil_div(n_block_max - n_block_min, num_splits_actual);
-            n_block_min = n_block_min + split_idx_actual * num_n_blocks_per_split;
-            n_block_max = std::min(n_block_min + num_n_blocks_per_split, n_block_max);
+            if (Is_QSA && (num_splits_actual == 64 || num_splits_actual == 128)
+                && seqlen_k_topk >= 2048 && seqlen_k_topk <= 2051) {
+                // Spread sparse N16 tiles over all split CTAs, including the tail.
+                int const total_blocks = std::max(0, n_block_max - n_block_min);
+                int const base = n_block_min;
+                n_block_min = base + split_idx_actual * total_blocks / num_splits_actual;
+                n_block_max = base + (split_idx_actual + 1) * total_blocks / num_splits_actual;
+            } else {
+                int const num_n_blocks_per_split = n_block_max <= n_block_min ? 0 : cute::ceil_div(n_block_max - n_block_min, num_splits_actual);
+                n_block_min = n_block_min + split_idx_actual * num_n_blocks_per_split;
+                n_block_max = std::min(n_block_min + num_n_blocks_per_split, n_block_max);
+            }
             // if (threadIdx.x == 128) { printf("Inside, bid.x = %d, bid.y = %d, bid.z = %d, split_idx = %d, num_splits_dynamic = %d, num_splits_actual = %d, num_n_blocks_per_split = %d, n_block_min: %d, n_block_max: %d\n", blockIdx.x, blockIdx.y, blockIdx.z, split_idx, num_splits_dynamic, num_splits_actual, num_n_blocks_per_split, n_block_min, n_block_max); }
         }
         // if (threadIdx.x == 128) { printf("After split, inside, bid.y = %d, bid.z = %d, split_idx = %d, n_block_min: %d, n_block_max: %d\n", blockIdx.y, blockIdx.z, split_idx, n_block_min, n_block_max); }

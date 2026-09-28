@@ -85,6 +85,20 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
 
 #ifdef USE_PPU
+    // All four warps already execute QK. Give each warp the same valid score
+    // tile, while PV continues to distribute its output columns across warps.
+    static constexpr bool QsaReplicateQK = Is_QSA && PackGQA && PagedKV
+        && QsaConfig::DirectIndex && QsaConfig::SingleTile
+        && ArchTag::kMinComputeCapability == 89
+        && std::is_same_v<Element, cutlass::bfloat16_t>
+        && kNWarps == 4 && kBlockM == 16 && kBlockN == 16
+        && kHeadDim == 256 && kHeadDimV == 256
+        && !Q_in_regs && !PagedKVAiu && !AppendKV && !Is_local;
+#else
+    static constexpr bool QsaReplicateQK = false;
+#endif
+
+#ifdef USE_PPU
     static constexpr bool FA4SkipRescaleO = !Is_FP8 && (   // determined by performance test.
         (kBlockM >  16 && (ArchTag::kMinComputeCapability >= 89 || (kHeadDim != 64 && kHeadDim != 192))) ||   // prefill
         (kBlockM == 16 && (ArchTag::kMinComputeCapability >= 89 && kHeadDim == 256))  // decode
@@ -125,10 +139,14 @@ struct CollectiveMainloopFwdSm80 {
     >;
     using TiledMma = TiledMMA<
         MMA_Atom_Arch,
-        Layout<Shape<Int<kNWarps>,_1,_1>>,  // 4x1x1 or 8x1x1 thread group
+        std::conditional_t<QsaReplicateQK,
+                           Layout<Shape<_1, Int<kNWarps>, _1>>,
+                           Layout<Shape<Int<kNWarps>,_1,_1>>>,
+        std::conditional_t<QsaReplicateQK,
+                           Tile<_16, Int<16 * kNWarps>, _16>,
         std::conditional_t<std::is_same_v<Element, cutlass::float_e4m3_t>,
                            Tile<Int<16 * kNWarps>, _16, _32>,
-                           Tile<Int<16 * kNWarps>, _16, _16>>>;
+                           Tile<Int<16 * kNWarps>, _16, _16>>>>;
 
 #if defined(USE_PPU) && !defined(FLASHATTENTION_DISABLE_FP8)
     // Epilogue twin of TiledMma for the zero-shfl FP8 V-direct PV path
@@ -592,9 +610,11 @@ struct CollectiveMainloopFwdSm80 {
 
         TiledMma tiled_mma;
         auto thr_mma = tiled_mma.get_slice(thread_idx);
+        int const qk_thread_idx = QsaReplicateQK ? (thread_idx & 31) : thread_idx;
+        auto thr_mma_qk = tiled_mma.get_slice(qk_thread_idx);
 
         // Allocate "fragments/descriptors"
-        Tensor tSrQ = thr_mma.partition_fragment_A(sQ);
+        Tensor tSrQ = thr_mma_qk.partition_fragment_A(sQ);
 
 #if defined(USE_PPU) && USE_AIU
         if constexpr (ArchTag::kMinComputeCapability >= 89) {
@@ -622,16 +642,18 @@ struct CollectiveMainloopFwdSm80 {
 #else
         const int tid_thread_slice = thread_idx;
 #endif
+        // TSM uses a warp-uniform descriptor; LDSM uses lane-local addresses.
+        int const qk_tid_thread_slice = QsaReplicateQK ? 0 : tid_thread_slice;
         // Copy Atom retiling
         auto smem_tiled_copy_Q = make_tiled_copy_A(SmemCopyAtomQ{}, tiled_mma);
-        auto smem_thr_copy_Q = !PackGQA || QsaTsmQ ? smem_tiled_copy_Q.get_thread_slice(tid_thread_slice) : smem_tiled_copy_Q.get_thread_slice(thread_idx);
+        auto smem_thr_copy_Q = !PackGQA || QsaTsmQ ? smem_tiled_copy_Q.get_thread_slice(qk_tid_thread_slice) : smem_tiled_copy_Q.get_thread_slice(qk_thread_idx);
         auto smem_tiled_copy_K = make_tiled_copy_B(SmemCopyAtomK{}, tiled_mma);
         auto smem_tiled_copy_V = make_tiled_copy_B(SmemCopyAtomKVt{}, tiled_mma);
 #if defined(USE_PPU) && USE_AIU
-        auto smem_thr_copy_K = !PagedKV || PagedKVAiu || QsaTsmKV ? smem_tiled_copy_K.get_thread_slice(tid_thread_slice) : smem_tiled_copy_K.get_thread_slice(thread_idx);
+        auto smem_thr_copy_K = !PagedKV || PagedKVAiu || QsaTsmKV ? smem_tiled_copy_K.get_thread_slice(qk_tid_thread_slice) : smem_tiled_copy_K.get_thread_slice(qk_thread_idx);
         auto smem_thr_copy_V = (!PagedKV || PagedKVAiu || QsaTsmKV) ? smem_tiled_copy_V.get_thread_slice(tid_thread_slice) : smem_tiled_copy_V.get_thread_slice(thread_idx);
 #else
-        auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(thread_idx);
+        auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(qk_thread_idx);
         auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(thread_idx);
 #endif
         Tensor tSsQ = [&]() -> auto {
@@ -951,7 +973,7 @@ struct CollectiveMainloopFwdSm80 {
         if constexpr (!Share_QV_Smem) { preprocess_Q(); }
 
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMma, false, Is_QSA> mask(
-            thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
+            qk_thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
             params.attention_chunk_divmod, params.qhead_per_khead_divmod
         );
 
@@ -995,8 +1017,8 @@ struct CollectiveMainloopFwdSm80 {
                 }
                 cute::cp_async_fence();
             };
-            Tensor tSrQ_cur = cute::conditional_return<Q_in_regs>(tSrQ, thr_mma.partition_fragment_A(sQ));
-            Tensor tSrK = thr_mma.partition_fragment_B(sK(_, _, _0{}));
+            Tensor tSrQ_cur = cute::conditional_return<Q_in_regs>(tSrQ, thr_mma_qk.partition_fragment_A(sQ));
+            Tensor tSrK = thr_mma_qk.partition_fragment_B(sK(_, _, _0{}));
 #ifdef USE_PPU
             if constexpr (PagedKVAiu && (kBlockN != kBlockNPagedPerAiuLoad)) {
                 flash::gemm_sm80_kv_paged_aiu<kBlockN, kBlockNPagedPerAiuLoad, kHeadDim, kBlockKGmem, Q_in_regs>(
@@ -1128,9 +1150,9 @@ struct CollectiveMainloopFwdSm80 {
         };
 
         auto first_iter_mask_fn = [&](auto& tSrS, int n_block) {
-            if constexpr (Is_QSA && Is_causal) {
+            if constexpr (Is_QSA && (Is_causal || QsaConfig::DirectIndex)) {
                 flash::Mask<kBlockM, kBlockN, PackGQA, TiledMma, false, Is_QSA> topk_mask(
-                    thread_idx, seqlen_q, int(get<1>(params.shape_pagetable)), params.window_size_left, params.window_size_right, 0,
+                    qk_thread_idx, seqlen_q, int(get<1>(params.shape_pagetable)), params.window_size_left, params.window_size_right, 0,
                     params.attention_chunk_divmod, params.qhead_per_khead_divmod);
                 topk_mask.template apply<true, false, false>(tSrS, m_block, n_block);
             }

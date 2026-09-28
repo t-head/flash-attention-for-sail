@@ -79,6 +79,12 @@ CASES = [
     Case("sq1_decode_h32_mqa",       1,   1024, 256,  128, 544,   4, 32, 1, "structured"),
     Case("sq1_rand",                 1,   8192, 256,  128, 544,   4, 16, 2, "random"),
     Case("sq1_block16",              1,   8192, 256,  128, 544,   4, 16, 2, "block16"),
+    # Four-warp decode: independent rows, partial score tiles, and both KV strides.
+    Case("sq1_g3_b2_fourwarp",       1,   4893, 256, 2051,  16,   2,  3, 1, "random", cache_length="topk"),
+    Case("sq1_g3_b3_fourwarp",       1,   4893, 256, 2051,  16,   3,  3, 1, "random", cache_length="topk"),
+    Case("sq1_g6_fourwarp",          1,   4893, 256, 2051,  16,   2,  6, 1, "random", cache_length="topk"),
+    Case("sq1_g12_fourwarp",         1,   4893, 256, 2051,  16,   1, 12, 1, "random", cache_length="topk"),
+    Case("sq1_g12_two_kv_fourwarp",  1,   4893, 256, 2051,  16,   2, 24, 2, "random", cache_length="topk"),
     Case("sq1_g64_reject",           1,   1024, 256,  128, 544,   2, 64, 1, "structured", error="QSA supports at most 32 query heads per KV head"),
     Case("tail_topk100",            960,   1024, 256,  100, 544,   1, 16, 2, "block16tail"),
     Case("tail_topk100_ps576",      960,   1024, 256,  100, 576,   1, 16, 2, "block64tail"),

@@ -525,6 +525,9 @@ void run_mha_fwd(Flash_fwd_params &params, hggcStream_t stream) {
 
 void run_mha_fwd_combine(Flash_fwd_params &params, hggcStream_t stream, bool enable_pdl=false) {
     #ifndef FLASHATTENTION_DISABLE_SPLIT
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
+    if (params.is_qsa && run_qsa_decode_combine(params, stream)) { return; }
+#endif
     // If hdim is 96 or 192, it's faster to round them to 128 or 256 respectively
     // so that kBlockM is smaller and we have more parallelism.
     if (params.is_fp32) {
@@ -648,6 +651,32 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     if (params.is_qsa) {
         int const qsa_mblocks = std::max(1, params.h_k * params.total_q);
         int const slots = std::max(1, params.num_sm * occ);
+        // Small group12 decode uses four-warp CTAs and a head-parallel split merge.
+        if (params.arch == 89 && params.is_bf16 && params.seqlen_q == 1
+            && !params.qsa_allow_aiu && params.is_causal && !params.is_local && params.softcap == 0.f
+            && params.total_q == params.b && params.h == 12 * params.h_k
+            && ((params.b <= 4 && params.h_k == 1 && params.k_row_stride == 256)
+                || (params.b <= 2 && params.h_k == 2 && params.k_row_stride == 512))
+            && params.seqlen_k >= 2048 && params.seqlen_k <= 2051
+            && params.d == 256 && params.dv == 256
+            && params.k_row_stride == params.v_row_stride) {
+            // Four query/KV-head groups need fewer splits to limit launch and workspace overhead.
+            return params.b * params.h_k == 4 ? 32 : 64;
+        }
+        // TP8/TP4 Q1 with one KV head have too few one-warp CTAs.
+        // OpForge's 2048-token selector produces a 2051-entry QSA table.
+        // B=1 uses 128 splits. Group3 B=4..7 uses fewer splits to limit CTA waves.
+        // The QSA combine below keeps the additional merge cost small.
+        if (params.arch == 89 && params.is_bf16 && params.seqlen_q == 1
+            && !params.qsa_allow_aiu && params.is_causal && !params.is_local && params.softcap == 0.f
+            && params.total_q == params.b && params.b <= (params.h == 3 ? 7 : 5)
+            && params.h_k == 1 && (params.h == 3 || params.h == 6)
+            && params.seqlen_k >= 2048 && params.seqlen_k <= 2051
+            && params.d == 256 && params.dv == 256
+            && params.k_row_stride == 256 && params.v_row_stride == 256) {
+            if (params.h == 3 && params.b >= 4) { return params.b == 7 ? 16 : 32; }
+            return params.b == 1 ? 128 : 64;
+        }
         // Long GQA8 gathers benefit from two-stage loading. Fill complete waves using
         // the device's CU count, rounding down so a small remainder does not add a wave.
         bool const long_gqa8 = params.arch == 89 && params.is_bf16
