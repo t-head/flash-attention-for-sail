@@ -68,9 +68,16 @@ struct PackGQAManager {
         #pragma unroll
         for (int i = 0; i < NumPtrPerThread; ++i) {
             int const row = i * NumThreads + get<0>(tRows(thread_idx % NumThreadsPerRow));
-            int const idx = m_block * (Is_QSA ? (QsaConfig::FixedGroup ? QsaConfig::Group : qhead_per_khead_divmod.divisor) : kBlockM) + row;
             int m_idx, h_idx;
-            if constexpr (QsaConfig::FixedGroup) { m_idx = idx / QsaConfig::Group; h_idx = idx % QsaConfig::Group; } else { m_idx = qhead_per_khead_divmod.divmod(h_idx, idx); }
+            if constexpr (Is_QSA && QsaConfig::DirectGroupIndex) {
+                // One QSA CTA handles one query; only rows below group are valid.
+                m_idx = m_block;
+                h_idx = row < qhead_per_khead_divmod.divisor ? row : 0;
+            } else {
+                int const idx = m_block * (Is_QSA ? (QsaConfig::FixedGroup ? QsaConfig::Group : qhead_per_khead_divmod.divisor) : kBlockM) + row;
+                if constexpr (QsaConfig::FixedGroup) { m_idx = idx / QsaConfig::Group; h_idx = idx % QsaConfig::Group; }
+                else { m_idx = qhead_per_khead_divmod.divmod(h_idx, idx); }
+            }
             tPrPtr[i] = &tensor(make_coord(make_coord(h_idx, m_idx)));
         }
         return tPrPtr;
@@ -110,7 +117,16 @@ struct PackGQAManager {
         for (int m = 0; m < size<1>(tQsQ); ++m) {
             int idx = m_block * (Is_QSA ? qhead_per_khead : kBlockM) + get<0>(tQcQ(_0{}, m, _0{}));
             Element const* q_ptr = reinterpret_cast<Element const*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrQPtr(m / kGmemThreadsPerRow)), m % kGmemThreadsPerRow, kGmemThreadsPerRow));
-            if (Is_QSA ? get<0>(tQcQ(_0{}, m, _0{})) < qhead_per_khead : idx < seqlen_q * qhead_per_khead) {
+            if constexpr (Is_QSA && QsaConfig::DirectGroupIndex && QsaConfig::Warps == 1 && QsaConfig::PredicatedQ) {
+                Tensor mQ_cur = make_tensor(make_gmem_ptr(q_ptr), Shape<Int<kHeadDim>>{});
+                Tensor mQ_cur_copy = cute::tiled_divide(mQ_cur, Shape<Int<kGmemElemsPerLoad>>{});
+                bool const valid_row = get<0>(tQcQ(_0{}, m, _0{})) < qhead_per_khead;
+                #pragma unroll
+                for (int k = 0; k < size<2>(tQsQ); ++k) {
+                    int ki = get<1>(tQcQ(_0{}, _0{}, k)) / kGmemElemsPerLoad;
+                    cute::copy(gmem_tiled_copy_Q_cp_async.with(valid_row), mQ_cur_copy(_, ki), tQsQ(_, m, k));
+                }
+            } else if (Is_QSA ? get<0>(tQcQ(_0{}, m, _0{})) < qhead_per_khead : idx < seqlen_q * qhead_per_khead) {
                 // if (thread_idx == 0) { printf("m: %d, m_idx: %d, h_idx: %d, q_ptr = %p, q_ptr_og = %p\n", m, m_idx, h_idx, q_ptr, &mQ_copy(0, make_coord(h_idx, m_idx), 0));}
                 Tensor mQ_cur = make_tensor(make_gmem_ptr(q_ptr), Shape<Int<kHeadDim>>{});
                 Tensor mQ_cur_copy = cute::tiled_divide(mQ_cur, Shape<Int<kGmemElemsPerLoad>>{});
@@ -119,7 +135,7 @@ struct PackGQAManager {
                     int ki = get<1>(tQcQ(_0{}, _0{}, k)) / kGmemElemsPerLoad;
                     // the "tiled_copy.with(tQpQ(k))"" will fill in zero for columns where tQpQ(k) is false
                     // TODO: check this
-                    cute::copy(gmem_tiled_copy_Q_cp_async.with(QsaConfig::FixedGroup || tQpQ(k)), mQ_cur_copy(_, ki), tQsQ(_, m, k));
+                    cute::copy(gmem_tiled_copy_Q_cp_async.with(QsaConfig::FixedGroup || QsaConfig::DirectGroupIndex || tQpQ(k)), mQ_cur_copy(_, ki), tQsQ(_, m, k));
                 }
             } else if constexpr (Is_QSA) {
                 // For QSA, invalid rows still participate in the warp-collective softmax on sm89 (hdim256 fast path).
@@ -198,7 +214,7 @@ struct PackGQAManager {
                 #pragma unroll
                 for (int k = 0; k < size<2>(tOrO); ++k) {
                     int ki = get<1>(tOcO(_0{}, _0{}, k)) / kGmemElemsPerStore;
-                    if (QsaConfig::FixedGroup || tOpO(k)) {
+                    if (QsaConfig::FixedGroup || QsaConfig::DirectGroupIndex || tOpO(k)) {
                         cute::copy(gmem_tiled_copy_O, tOrO(_, m, k), mO_cur_copy(_, ki));
                     }
                 }

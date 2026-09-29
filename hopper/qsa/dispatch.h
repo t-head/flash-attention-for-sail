@@ -7,6 +7,8 @@ struct QsaConfig {
     static constexpr int RowBytes = 0, KVStride = 0;
     static constexpr bool QRegs = false, TsmQ = false, TsmKV = false;
     static constexpr bool FixedGroup = false, DirectIndex = false, SingleTile = false;
+    static constexpr bool DirectGroupIndex = false;
+    static constexpr bool PredicatedQ = true;
     static constexpr bool QueryFirst = false;
 };
 }

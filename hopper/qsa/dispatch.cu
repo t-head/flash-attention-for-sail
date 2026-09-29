@@ -20,8 +20,19 @@ struct Gqa8Varlen : Gqa8Direct { static constexpr bool SingleTile = false; };
 // Qwen3.8 TP8/TP4/TP2/TP1 use groups 3/6/12/12 respectively.
 // Keep the 16-row MMA tile but avoid computing a runtime head divmod, and
 // address each selected token directly when the physical KV row stride fits.
+struct GqaSharedDirect256 : Gqa8Direct { static constexpr int KVStride = 256; static constexpr bool FixedGroup = false, DirectGroupIndex = true; };
+// Large unsplit query batches avoid predicated async copies for unused Q rows.
+struct GqaSharedLong256 : GqaSharedDirect256 { static constexpr int RowBytes = 256; static constexpr bool PredicatedQ = false; };
+struct GqaSharedVarlen256 : GqaSharedDirect256 { static constexpr bool SingleTile = false; };
+struct GqaSharedDirect512 : Gqa8Direct { static constexpr bool FixedGroup = false, DirectGroupIndex = true; };
+struct GqaSharedVarlen512 : GqaSharedDirect512 { static constexpr bool SingleTile = false; };
+struct GqaSharedWarpN : GqaSharedDirect256 {
+    static constexpr int Warps = 4, Stages = 2;
+    static constexpr bool QRegs = false;
+};
+// Single-query decode can share a noncausal instance across groups 3, 6, and 12.
+struct GqaSharedWarpNShort : GqaSharedWarpN { static constexpr int Stages = 1; };
 struct Gqa3Direct : Gqa8Direct { static constexpr int Group = 3, KVStride = 256; };
-struct Gqa6Direct : Gqa8Direct { static constexpr int Group = 6, KVStride = 256; };
 struct Gqa3WarpN : Gqa3Direct {
     static constexpr int Warps = 4;
     static constexpr int Stages = 2;
@@ -29,10 +40,6 @@ struct Gqa3WarpN : Gqa3Direct {
 };
 struct Gqa3WarpNShort : Gqa3WarpN { static constexpr int Stages = 1; };
 struct Gqa3WarpNQueryFirst : Gqa3WarpNShort { static constexpr bool QueryFirst = true; };
-struct Gqa6WarpN : Gqa6Direct {
-    static constexpr int Warps = 4;
-    static constexpr bool QRegs = false;
-};
 struct Gqa12Direct256 : Gqa8Direct { static constexpr int Group = 12, KVStride = 256; };
 struct Gqa12WarpN : Gqa12Direct256 {
     static constexpr int Warps = 4;
@@ -40,12 +47,7 @@ struct Gqa12WarpN : Gqa12Direct256 {
     static constexpr bool QRegs = false;
 };
 struct Gqa12WarpNShort : Gqa12WarpN { static constexpr int Stages = 1; };
-struct Gqa12Direct512 : Gqa8Direct { static constexpr int Group = 12; };
 struct Gqa12WarpN512 : Gqa12WarpNShort { static constexpr int KVStride = 512; };
-struct Gqa3Varlen : Gqa3Direct { static constexpr bool SingleTile = false; };
-struct Gqa6Varlen : Gqa6Direct { static constexpr bool SingleTile = false; };
-struct Gqa12Varlen256 : Gqa12Direct256 { static constexpr bool SingleTile = false; };
-struct Gqa12Varlen512 : Gqa12Direct512 { static constexpr bool SingleTile = false; };
 struct Gqa8Wide : Gqa8Varlen { static constexpr int RowBytes = 512; };
 struct Gqa8ShortWide : Gqa8Wide { static constexpr bool SingleTile = true; };
 struct Gqa8Long : Gqa8Direct { static constexpr int Stages = 2, RowBytes = 256; };
@@ -305,10 +307,11 @@ bool run_qsa(Flash_fwd_params &p, hggcStream_t stream) {
             && p.seqlen_k >= 2048 && p.seqlen_k <= 2051) {
             // Nearby query CTAs improve shared-KV reuse in short MTP groups.
             if (p.b >= 3 && p.b <= 6) { launch<Gqa3WarpNQueryFirst, true>(p, stream); }
-            else if (p.b == 2) { launch<Gqa3WarpNShort, true>(p, stream); }
-            else { launch<Gqa3WarpN, true>(p, stream); }
-        } else if (direct_grid) { launch<Gqa3Direct>(p, stream); }
-        else { launch<Gqa3Varlen>(p, stream); }
+            else if (p.b == 2) { launch<GqaSharedWarpNShort, true, false>(p, stream); }
+            else { launch<GqaSharedWarpN, true>(p, stream); }
+        } else if (direct_grid && !split && p.total_q > 2048) { launch<GqaSharedLong256, false>(p, stream); }
+        else if (direct_grid) { launch<GqaSharedDirect256>(p, stream); }
+        else { launch<GqaSharedVarlen256>(p, stream); }
         return true;
     }
     if (p.h == 6 * p.h_k && p.k_row_stride == 256 && p.v_row_stride == 256) {
@@ -316,27 +319,32 @@ bool run_qsa(Flash_fwd_params &p, hggcStream_t stream) {
         // length and topk-width masks still handle the tail.
         if (direct_grid && split && p.seqlen_q == 1 && p.b <= 2
             && p.seqlen_k >= 2048 && p.seqlen_k <= 2051) {
-            launch<Gqa6WarpN, true, false>(p, stream);
-        } else if (direct_grid) { launch<Gqa6Direct>(p, stream); }
-        else { launch<Gqa6Varlen>(p, stream); }
+            launch<GqaSharedWarpNShort, true, false>(p, stream);
+        } else if (direct_grid && !split && p.total_q > 2048) { launch<GqaSharedLong256, false>(p, stream); }
+        else if (direct_grid) { launch<GqaSharedDirect256>(p, stream); }
+        else { launch<GqaSharedVarlen256>(p, stream); }
         return true;
     }
     if (p.h == 12 * p.h_k && p.k_row_stride == p.v_row_stride) {
         if (p.k_row_stride == 256) {
             if (direct_grid && split && p.seqlen_q == 1 && p.b <= 4
                 && p.seqlen_k >= 2048 && p.seqlen_k <= 2051) {
-                if (p.b >= 2 && p.b <= 3) { launch<Gqa12WarpNShort, true>(p, stream); }
-                else { launch<Gqa12WarpN, true>(p, stream); }
-            } else if (direct_grid) { launch<Gqa12Direct256>(p, stream); }
-            else { launch<Gqa12Varlen256>(p, stream); }
+                if (p.b >= 2 && p.b <= 3) { launch<GqaSharedWarpNShort, true, false>(p, stream); }
+                else { launch<GqaSharedWarpN, true>(p, stream); }
+            } else if (direct_grid && !split && p.total_q <= 2048) {
+                // Small GQA12 prefill benefits from its fixed-group Q addressing.
+                launch<Gqa12Direct256, false>(p, stream);
+            } else if (direct_grid && !split && p.total_q > 2048) { launch<GqaSharedLong256, false>(p, stream); }
+            else if (direct_grid) { launch<GqaSharedDirect256>(p, stream); }
+            else { launch<GqaSharedVarlen256>(p, stream); }
             return true;
         }
         if (p.k_row_stride == 512) {
             if (direct_grid && split && p.seqlen_q == 1 && p.b <= 2 && p.h_k == 2
                 && p.seqlen_k >= 2048 && p.seqlen_k <= 2051) {
                 launch<Gqa12WarpN512, true>(p, stream);
-            } else if (direct_grid) { launch<Gqa12Direct512>(p, stream); }
-            else { launch<Gqa12Varlen512>(p, stream); }
+            } else if (direct_grid) { launch<GqaSharedDirect512>(p, stream); }
+            else { launch<GqaSharedVarlen512>(p, stream); }
             return true;
         }
     }
@@ -350,9 +358,9 @@ bool run_qsa(Flash_fwd_params &p, hggcStream_t stream) {
         } else if (uniform_q && p.seqlen_k >= 2048) {
             launch<Gqa8Wide>(p, stream);
         } else if (p.seqlen_k >= 2048) {
-            launch<Gqa8Varlen>(p, stream);
+            launch<GqaSharedVarlen512>(p, stream);
         } else {
-            launch<Gqa8Direct>(p, stream);
+            launch<GqaSharedDirect512>(p, stream);
         }
         return true;
     }
