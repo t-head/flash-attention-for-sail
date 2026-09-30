@@ -259,11 +259,12 @@ __global__ void decode_combine_kernel(Flash_fwd_params p) {
 }  // namespace qsa
 
 bool run_qsa_decode_combine(Flash_fwd_params const& p, hggcStream_t stream) {
+    bool const small_decode_2048 = qsa_small_decode_2048(p);
     bool const group12_small = p.h == 12 * p.h_k
         && ((p.b <= 6 && p.h_k == 1 && p.k_row_stride == 256)
             || (p.b <= 2 && p.h_k == 2 && p.k_row_stride == 512))
         && p.k_row_stride == p.v_row_stride
-        && p.seqlen_k >= 2048 && p.seqlen_k <= 2051
+        && small_decode_2048
         && (p.num_splits == 32 || p.num_splits == 64);
     if (!qsa_config_supported(p) || p.d != 256 || p.dv != 256
         || p.seqlen_q != 1 || p.total_q != p.b || p.b > 16
@@ -271,7 +272,7 @@ bool run_qsa_decode_combine(Flash_fwd_params const& p, hggcStream_t stream) {
         || (!group12_small && (p.h_k != 1 || (p.h != 3 && p.h != 6)))
         || p.o_head_stride != 256 || p.oaccum_row_stride != 256) { return false; }
     dim3 grid(p.total_q, p.h, 256 / 64);
-    if (p.b == 1 && (p.h == 3 || p.h == 6) && p.seqlen_k >= 2048 && p.seqlen_k <= 2051
+    if (p.b == 1 && (p.h == 3 || p.h == 6) && small_decode_2048
         && p.num_splits_dynamic_ptr == nullptr && p.num_splits == 128) {
         qsa::decode_combine_kernel<128, 16, true><<<grid, 512, 0, stream>>>(p);
     } else if (p.num_splits_dynamic_ptr == nullptr && p.num_splits == 128) {
@@ -281,7 +282,7 @@ bool run_qsa_decode_combine(Flash_fwd_params const& p, hggcStream_t stream) {
     } else if (((group12_small && p.b == 1 && p.h_k == 1)
                 || (p.h == 3 && p.h_k == 1 && p.b == 2
                     && p.k_row_stride == 256 && p.v_row_stride == 256
-                    && p.seqlen_k >= 2048 && p.seqlen_k <= 2051))
+                    && small_decode_2048))
                && p.num_splits_dynamic_ptr == nullptr && p.num_splits == 64) {
         qsa::decode_combine_kernel<64, 8, true><<<grid, 256, 0, stream>>>(p);
     } else if (p.num_splits_dynamic_ptr == nullptr && p.num_splits == 64) {
@@ -302,9 +303,9 @@ bool run_qsa(Flash_fwd_params &p, hggcStream_t stream) {
     const bool uniform_q = p.total_q == int64_t(p.b) * p.seqlen_q;
     const bool direct_grid = uniform_q && p.b <= 65535
         && int64_t(p.h_k) * p.num_splits <= 65535;
+    const bool small_decode_2048 = qsa_small_decode_2048(p);
     if (p.h == 3 * p.h_k && p.k_row_stride == 256 && p.v_row_stride == 256) {
-        if (direct_grid && split && p.seqlen_q == 1 && p.b <= 7
-            && p.seqlen_k >= 2048 && p.seqlen_k <= 2051) {
+        if (direct_grid && split && p.b <= 7 && small_decode_2048) {
             // Nearby query CTAs improve shared-KV reuse in short MTP groups.
             if (p.b >= 3 && p.b <= 6) { launch<Gqa3WarpNQueryFirst, true>(p, stream); }
             else if (p.b == 2) { launch<GqaSharedWarpNShort, true, false>(p, stream); }
@@ -317,8 +318,7 @@ bool run_qsa(Flash_fwd_params &p, hggcStream_t stream) {
     if (p.h == 6 * p.h_k && p.k_row_stride == 256 && p.v_row_stride == 256) {
         // A single right-aligned query sees every selected KV position; the
         // length and topk-width masks still handle the tail.
-        if (direct_grid && split && p.seqlen_q == 1 && p.b <= 2
-            && p.seqlen_k >= 2048 && p.seqlen_k <= 2051) {
+        if (direct_grid && split && p.b <= 2 && small_decode_2048) {
             launch<GqaSharedWarpNShort, true, false>(p, stream);
         } else if (direct_grid && !split && p.total_q > 2048) { launch<GqaSharedLong256, false>(p, stream); }
         else if (direct_grid) { launch<GqaSharedDirect256>(p, stream); }
@@ -327,8 +327,7 @@ bool run_qsa(Flash_fwd_params &p, hggcStream_t stream) {
     }
     if (p.h == 12 * p.h_k && p.k_row_stride == p.v_row_stride) {
         if (p.k_row_stride == 256) {
-            if (direct_grid && split && p.seqlen_q == 1 && p.b <= 4
-                && p.seqlen_k >= 2048 && p.seqlen_k <= 2051) {
+            if (direct_grid && split && p.b <= 4 && small_decode_2048) {
                 if (p.b >= 2 && p.b <= 3) { launch<GqaSharedWarpNShort, true, false>(p, stream); }
                 else { launch<GqaSharedWarpN, true>(p, stream); }
             } else if (direct_grid && !split && p.total_q <= 2048) {
@@ -340,8 +339,8 @@ bool run_qsa(Flash_fwd_params &p, hggcStream_t stream) {
             return true;
         }
         if (p.k_row_stride == 512) {
-            if (direct_grid && split && p.seqlen_q == 1 && p.b <= 2 && p.h_k == 2
-                && p.seqlen_k >= 2048 && p.seqlen_k <= 2051) {
+            if (direct_grid && split && p.b <= 2 && p.h_k == 2
+                && small_decode_2048) {
                 launch<Gqa12WarpN512, true>(p, stream);
             } else if (direct_grid) { launch<GqaSharedDirect512>(p, stream); }
             else { launch<GqaSharedVarlen512>(p, stream); }
