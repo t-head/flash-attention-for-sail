@@ -32,6 +32,10 @@ struct GqaSharedWarpN : GqaSharedDirect256 {
 };
 // Single-query decode can share a noncausal instance across groups 3, 6, and 12.
 struct GqaSharedWarpNShort : GqaSharedWarpN { static constexpr int Stages = 1; };
+struct Sm80WarpN : GqaSharedWarpNShort {
+    static constexpr int KVStride = 0;
+    static constexpr bool TsmQ = false;
+};
 struct Gqa3Direct : Gqa8Direct { static constexpr int Group = 3, KVStride = 256; };
 struct Gqa3WarpN : Gqa3Direct {
     static constexpr int Warps = 4;
@@ -298,7 +302,17 @@ bool run_qsa_decode_combine(Flash_fwd_params const& p, hggcStream_t stream) {
 
 bool run_qsa(Flash_fwd_params &p, hggcStream_t stream) {
     using namespace qsa;
-    if (p.arch != 89 || !qsa_config_supported(p)) { return false; }
+    if (!qsa_config_supported(p)) { return false; }
+    if (p.arch == 80) {
+        if (p.num_splits <= 1 || p.b > 3 || !qsa_small_decode_2048(p)
+            || (p.h != 3 * p.h_k && p.h != 6 * p.h_k && p.h != 12 * p.h_k)
+            || (p.k_row_stride != 256 && p.k_row_stride != 512)
+            || p.k_row_stride != p.v_row_stride) { return false; }
+        run_flash_fwd<80, 256, 256, 1, cutlass::bfloat16_t, cutlass::bfloat16_t,
+            true, false, false, true, true, false, 16, false, false,
+            true, true, false, false, false, false, true, Sm80WarpN>(p, stream);
+        return true;
+    }
     const bool split = p.num_splits > 1;
     const bool uniform_q = p.total_q == int64_t(p.b) * p.seqlen_q;
     const bool direct_grid = uniform_q && p.b <= 65535

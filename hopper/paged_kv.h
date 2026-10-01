@@ -482,7 +482,7 @@ struct PagedKVManager {
 #endif // FA3_HLLM_BUILD
             if constexpr (Is_QSA) {
                 if constexpr (QsaConfig::DirectIndex) {
-                    tPrKPtr[i] = page >= 0 ? raw_pointer_cast(mK_paged.data()) + int64_t(page_offset) * QsaConfig::KVStride : nullptr;
+                    tPrKPtr[i] = page >= 0 ? raw_pointer_cast(mK_paged.data()) + int64_t(page_offset) * (QsaConfig::KVStride ? QsaConfig::KVStride : get<0>(stride(mK_paged.layout()))) : nullptr;
                 } else { tPrKPtr[i] = page >= 0 ? &mK_paged(page_offset, _0{}, page) : nullptr; }
             } else {
                 tPrKPtr[i] = &mK_paged(page_offset, _0{}, page);
@@ -513,7 +513,7 @@ struct PagedKVManager {
 #endif // FA3_HLLM_BUILD
             if constexpr (Is_QSA) {
                 if constexpr (QsaConfig::DirectIndex) {
-                    tPrVPtr[i] = page >= 0 ? raw_pointer_cast(mV_paged.data()) + int64_t(page_offset) * QsaConfig::KVStride : nullptr;
+                    tPrVPtr[i] = page >= 0 ? raw_pointer_cast(mV_paged.data()) + int64_t(page_offset) * (QsaConfig::KVStride ? QsaConfig::KVStride : get<0>(stride(mV_paged.layout()))) : nullptr;
                 } else { tPrVPtr[i] = page >= 0 ? &mV_paged(page_offset, _0{}, page) : nullptr; }
             } else {
                 tPrVPtr[i] = &mV_paged(page_offset, _0{}, page);
@@ -597,7 +597,7 @@ struct PagedKVManager {
                 } else {
                     token = should_load ? __ldg(&mPageTable[row_idx]) : -1;
                 }
-                k_ptr = token >= 0 ? raw_pointer_cast(mK_paged.data()) + int64_t(token) * QsaConfig::KVStride : nullptr;
+                k_ptr = token >= 0 ? raw_pointer_cast(mK_paged.data()) + int64_t(token) * (QsaConfig::KVStride ? QsaConfig::KVStride : get<0>(stride(mK_paged.layout()))) : nullptr;
             } else { k_ptr = reinterpret_cast<Element const*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrKPtr(m / kGmemThreadsPerRow)), (m % kGmemThreadsPerRow), kGmemThreadsPerRow)); }
             if constexpr (Is_QSA && !QsaConfig::RowBytes) {
                 if (k_ptr == nullptr) { continue; }
@@ -703,7 +703,7 @@ struct PagedKVManager {
                     } else {
                         token = should_load ? __ldg(&mPageTable[row_idx]) : -1;
                     }
-                    v_ptr = token >= 0 ? raw_pointer_cast(mV_paged.data()) + int64_t(token) * QsaConfig::KVStride : nullptr;
+                    v_ptr = token >= 0 ? raw_pointer_cast(mV_paged.data()) + int64_t(token) * (QsaConfig::KVStride ? QsaConfig::KVStride : get<0>(stride(mV_paged.layout()))) : nullptr;
                 } else { v_ptr = reinterpret_cast<Element const*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrVPtr(m / kGmemThreadsPerRow)), m % kGmemThreadsPerRow, kGmemThreadsPerRow)); }
                 bool const qsa_valid = Is_QSA ? (v_ptr != nullptr) : true;
                 Tensor mV_paged_cur = make_tensor(make_gmem_ptr(v_ptr), Shape<Int<kHeadDimV>>{});

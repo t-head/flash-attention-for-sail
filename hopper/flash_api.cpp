@@ -471,7 +471,7 @@ void run_mha_fwd_qsa(Flash_fwd_params &params, hggcStream_t stream) {
 #ifndef FLASHATTENTION_DISABLE_HDIM256
     TORCH_CHECK(params.d == 256 && params.dv == 256, "QSA only supports head dim 256");
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
-    if constexpr (Arch == 89 && PagedKVNonTMA && PackGQA && !Has_softcap) {
+    if constexpr ((Arch == 80 || Arch == 89) && PagedKVNonTMA && PackGQA && !Has_softcap) {
         if (run_qsa(params, stream)) { return; }
     }
 #endif
@@ -605,6 +605,24 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
 #ifdef USE_PPU
 inline int get_qsa_num_splits(Flash_fwd_params const& params, int num_n_blocks, int occ) {
     if (qsa_small_decode_2048(params)) {
+        if (params.arch == 80 && params.h_k * params.total_q <= 32
+            && (params.h == 3 * params.h_k || params.h == 6 * params.h_k
+                || params.h == 12 * params.h_k)
+            && (params.k_row_stride == 256 || params.k_row_stride == 512)
+            && params.k_row_stride == params.v_row_stride) {
+            // The shared four-warp tile is used only for up to three queries.
+            if (params.b <= 3) {
+                if (params.h_k == 1) { return params.b == 1 ? 64 : 32; }
+                return params.b == 1 ? 32 : 20;
+            }
+            int const work = params.h_k * params.total_q;
+            if (work <= 5) { return 64; }
+            if (work == 6 && params.h == 12 * params.h_k) { return 32; }
+            // Short SM80 gathers target 320 split CTAs, rounded to whole N tiles.
+            int const splits = std::max(1, 320 / work);
+            int const blocks_per_split = (num_n_blocks + splits - 1) / splits;
+            return (num_n_blocks + blocks_per_split - 1) / blocks_per_split;
+        }
         // Four-warp group12 decode uses a head-parallel split merge.
         if (params.h == 12 * params.h_k
             && ((params.b <= 4 && params.h_k == 1 && params.k_row_stride == 256)
