@@ -157,9 +157,9 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
 #else
 #ifdef USE_PPU
     static constexpr bool UsePersistentScheduler = Is_QSA || Varlen || (!Varlen && Is_causal);
-    using Scheduler = std::conditional_t<Is_QSA && QsaConfig::SingleTile,
+    using Scheduler = std::conditional_t<Is_QSA && (QsaConfig::SingleTile || Arch == 80),
         flash::QsaSingleTileScheduler<Varlen, Split,
-            Split && QsaConfig::QueryFirst>,
+            Split && QsaConfig::QueryFirst, Arch == 80>,
         std::conditional_t<UsePersistentScheduler, SchedulerPersistent, SchedulerSingleTile>>;
     using AttnKernel = std::conditional_t<
         Arch >= 89,

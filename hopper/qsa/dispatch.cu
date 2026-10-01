@@ -298,7 +298,7 @@ bool run_qsa_decode_combine(Flash_fwd_params const& p, hggcStream_t stream) {
 
 bool run_qsa(Flash_fwd_params &p, hggcStream_t stream) {
     using namespace qsa;
-    if (!qsa_config_supported(p)) { return false; }
+    if (p.arch != 89 || !qsa_config_supported(p)) { return false; }
     const bool split = p.num_splits > 1;
     const bool uniform_q = p.total_q == int64_t(p.b) * p.seqlen_q;
     const bool direct_grid = uniform_q && p.b <= 65535

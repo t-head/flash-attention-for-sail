@@ -99,7 +99,8 @@ struct CollectiveMainloopFwdSm80 {
 #endif
 
 #ifdef USE_PPU
-    static constexpr bool FA4SkipRescaleO = !Is_FP8 && (   // determined by performance test.
+    // Keep SM80 QSA on the standard online-softmax rescale path.
+    static constexpr bool FA4SkipRescaleO = !Is_FP8 && !(Is_QSA && ArchTag::kMinComputeCapability == 80) && (
         (kBlockM >  16 && (ArchTag::kMinComputeCapability >= 89 || (kHeadDim != 64 && kHeadDim != 192))) ||   // prefill
         (kBlockM == 16 && (ArchTag::kMinComputeCapability >= 89 && kHeadDim == 256))  // decode
     );
