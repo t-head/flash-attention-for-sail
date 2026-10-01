@@ -239,7 +239,7 @@ public:
                 softmax_scale_log2 *= q_descale * k_descale;
             }
             flash::Softmax<CollectiveMainloop::QsaReplicateQK
-                               ? 2 : 2 * (2 * kBlockM / NumThreads),
+                               ? kBlockM / 8 : 2 * (2 * kBlockM / NumThreads),
                            /*Max_offset=*/!Is_FP8 ? 0 : 8> softmax(softmax_scale_log2);
 
             SeqlenInfo_t seqlen_info{

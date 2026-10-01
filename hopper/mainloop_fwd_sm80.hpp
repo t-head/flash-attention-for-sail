@@ -19,6 +19,9 @@
 #include "paged_kv.h"
 #include "rotary.h"
 #include "utils.h"
+#ifdef USE_PPU
+#include "qsa/mma_sm80_m8.h"
+#endif
 
 namespace flash {
 
@@ -85,15 +88,16 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
 
 #ifdef USE_PPU
-    // All four warps already execute QK. Give each warp the same valid score
+    // Each warp executes QK. Give every warp the same valid score
     // tile, while PV continues to distribute its output columns across warps.
     static constexpr bool QsaReplicateQK = Is_QSA && PackGQA && PagedKV
         && QsaConfig::DirectIndex && QsaConfig::SingleTile
         && (ArchTag::kMinComputeCapability == 80 || ArchTag::kMinComputeCapability == 89)
         && std::is_same_v<Element, cutlass::bfloat16_t>
-        && kNWarps == 4 && kBlockM == 16 && kBlockN == 16
+        && (kNWarps == 4 || (ArchTag::kMinComputeCapability == 80 && kNWarps == 2))
+        && (kBlockM == 16 || (ArchTag::kMinComputeCapability == 80 && kBlockM == 8)) && kBlockN == 16
         && kHeadDim == 256 && kHeadDimV == 256
-        && !Q_in_regs && !PagedKVAiu && !AppendKV && !Is_local;
+        && (!Q_in_regs || ArchTag::kMinComputeCapability == 80) && !PagedKVAiu && !AppendKV && !Is_local;
 #else
     static constexpr bool QsaReplicateQK = false;
 #endif
@@ -109,7 +113,7 @@ struct CollectiveMainloopFwdSm80 {
     using SeqlenInfo_t = flash::SeqlenInfoQKNewK<Varlen, AppendKV>;
     using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split, Is_QSA>;
 
-    using MMA_Atom_Arch =
+    using MMA_Atom_Default =
 #ifdef USE_PPU
         std::conditional_t<
             ArchTag::kMinComputeCapability >= 89,
@@ -138,13 +142,19 @@ struct CollectiveMainloopFwdSm80 {
         MMA_Atom<PPU0010_16x16x16_F32F16F16F32_TN>
 #endif
     >;
+#ifdef USE_PPU
+    using MMA_Atom_Arch = std::conditional_t<Is_QSA && ArchTag::kMinComputeCapability == 80 && kBlockM == 8,
+        MMA_Atom<QsaSM80_8x16x16_F32BF16BF16F32_TN>, MMA_Atom_Default>;
+#else
+    using MMA_Atom_Arch = MMA_Atom_Default;
+#endif
     using TiledMma = TiledMMA<
         MMA_Atom_Arch,
         std::conditional_t<QsaReplicateQK,
                            Layout<Shape<_1, Int<kNWarps>, _1>>,
                            Layout<Shape<Int<kNWarps>,_1,_1>>>,
         std::conditional_t<QsaReplicateQK,
-                           Tile<_16, Int<16 * kNWarps>, _16>,
+                           Tile<Int<kBlockM>, Int<16 * kNWarps>, _16>,
         std::conditional_t<std::is_same_v<Element, cutlass::float_e4m3_t>,
                            Tile<Int<16 * kNWarps>, _16, _32>,
                            Tile<Int<16 * kNWarps>, _16, _16>>>>;
@@ -249,7 +259,7 @@ struct CollectiveMainloopFwdSm80 {
     // TSM reads shared memory only; global QSA K/V loads remain cp.async.
     static constexpr bool QsaTsmQ = QsaConfig::TsmQ && Is_QSA && PackGQA;
     static constexpr bool QsaTsmKV = QsaConfig::TsmKV && Is_QSA && !PagedKVAiu;
-    using SmemCopyAtomQ = std::conditional_t<!PackGQA || QsaTsmQ, Copy_Atom<SmemCopyOpQ, Element>, SmemCopyAtom>;
+    using SmemCopyAtomQ = std::conditional_t<!PackGQA || QsaTsmQ, Copy_Atom<SmemCopyOpQ, Element>, std::conditional_t<QsaReplicateQK && kBlockM == 8, Copy_Atom<PPU_U32x2_LDSM_N, Element>, SmemCopyAtom>>;
     using SmemCopyAtomK = std::conditional_t<!PagedKV || PagedKVAiu || QsaTsmKV, Copy_Atom<SmemCopyOpK, Element>, SmemCopyAtom>;
     using SmemCopyAtomKVt = std::conditional_t<!PagedKV || PagedKVAiu || QsaTsmKV, Copy_Atom<SmemCopyOpKVt, Element>, SmemCopyAtomTransposed>;
 #else
@@ -1092,7 +1102,8 @@ struct CollectiveMainloopFwdSm80 {
                 if constexpr (ArchTag::kMinComputeCapability >= 89) {
                     return make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMma>(tSrS.layout()));
                 } else {
-                    return flash::convert_acc<Element>(tSrS);
+                    if constexpr (Is_QSA && ArchTag::kMinComputeCapability == 80 && kBlockM == 8) { return cute::qsa_convert_m8<Element>(tSrS); }
+                    else { return flash::convert_acc<Element>(tSrS); }
                 }
             }();
             Tensor tOrP = [&]() -> auto {

@@ -34,8 +34,10 @@ struct GqaSharedWarpN : GqaSharedDirect256 {
 struct GqaSharedWarpNShort : GqaSharedWarpN { static constexpr int Stages = 1; };
 struct Sm80WarpN : GqaSharedWarpNShort {
     static constexpr int KVStride = 0;
-    static constexpr bool TsmQ = false;
+    static constexpr bool QRegs = true, TsmQ = false;
 };
+struct Sm80WarpN2 : Sm80WarpN { static constexpr int Warps = 2; };
+struct Sm80WarpNM8 : Sm80WarpN2 { static constexpr int M = 8; };
 struct Gqa3Direct : Gqa8Direct { static constexpr int Group = 3, KVStride = 256; };
 struct Gqa3WarpN : Gqa3Direct {
     static constexpr int Warps = 4;
@@ -103,9 +105,9 @@ hggcError_t cached_occupancy(int device, int* result, const void* function, int 
     return status;
 }
 
-template<class Config, bool Split, bool Causal=true>
+template<class Config, bool Split, bool Causal=true, int Arch=89>
 void launch(Flash_fwd_params& p, hggcStream_t stream) {
-    run_flash_fwd<89, 256, 256, 1, cutlass::bfloat16_t, cutlass::bfloat16_t,
+    run_flash_fwd<Arch, 256, 256, 1, cutlass::bfloat16_t, cutlass::bfloat16_t,
         Causal, false, false, true, true, false, 16, false, false,
         true, Split, false, false, false, false, true, Config>(p, stream);
 }
@@ -283,7 +285,7 @@ bool run_qsa_decode_combine(Flash_fwd_params const& p, hggcStream_t stream) {
         qsa::decode_combine_kernel<128, 16><<<grid, 512, 0, stream>>>(p);
     } else if (p.num_splits == 128) {
         qsa::decode_combine_kernel<0, 16><<<grid, 512, 0, stream>>>(p);
-    } else if (((group12_small && p.b == 1 && p.h_k == 1)
+    } else if (((group12_small && ((p.arch == 80 && p.b <= 2) || (p.b == 1 && p.h_k == 1)))
                 || (p.h == 3 && p.h_k == 1 && p.b == 2
                     && p.k_row_stride == 256 && p.v_row_stride == 256
                     && small_decode_2048))
@@ -304,13 +306,17 @@ bool run_qsa(Flash_fwd_params &p, hggcStream_t stream) {
     using namespace qsa;
     if (!qsa_config_supported(p)) { return false; }
     if (p.arch == 80) {
-        if (p.num_splits <= 1 || p.b > 3 || !qsa_small_decode_2048(p)
+        if (p.num_splits <= 1 || int64_t(p.b) * p.h_k > 16 || !qsa_small_decode_2048(p)
             || (p.h != 3 * p.h_k && p.h != 6 * p.h_k && p.h != 12 * p.h_k)
             || (p.k_row_stride != 256 && p.k_row_stride != 512)
             || p.k_row_stride != p.v_row_stride) { return false; }
-        run_flash_fwd<80, 256, 256, 1, cutlass::bfloat16_t, cutlass::bfloat16_t,
-            true, false, false, true, true, false, 16, false, false,
-            true, true, false, false, false, false, true, Sm80WarpN>(p, stream);
+        if (p.h != 12 * p.h_k) {
+            launch<Sm80WarpNM8, true, true, 80>(p, stream);
+        } else if (p.b == 1 && p.h_k == 1) {
+            launch<Sm80WarpN, true, true, 80>(p, stream);
+        } else {
+            launch<Sm80WarpN2, true, true, 80>(p, stream);
+        }
         return true;
     }
     const bool split = p.num_splits > 1;

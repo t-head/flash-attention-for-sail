@@ -610,16 +610,22 @@ inline int get_qsa_num_splits(Flash_fwd_params const& params, int num_n_blocks, 
                 || params.h == 12 * params.h_k)
             && (params.k_row_stride == 256 || params.k_row_stride == 512)
             && params.k_row_stride == params.v_row_stride) {
-            // The shared four-warp tile is used only for up to three queries.
-            if (params.b <= 3) {
-                if (params.h_k == 1) { return params.b == 1 ? 64 : 32; }
-                return params.b == 1 ? 32 : 20;
-            }
             int const work = params.h_k * params.total_q;
-            if (work <= 5) { return 64; }
-            if (work == 6 && params.h == 12 * params.h_k) { return 32; }
-            // Short SM80 gathers target 320 split CTAs, rounded to whole N tiles.
-            int const splits = std::max(1, 320 / work);
+            bool const group12 = params.h == 12 * params.h_k;
+            if (work <= 16) {
+                if (params.h_k == 1) {
+                    if (!group12) {
+                        if (params.b == 1) { return 128; }
+                        if (params.b <= 3) { return 64; }
+                    } else {
+                        if (params.b <= 2) { return 64; }
+                        if (params.b <= 6) { return 32; }
+                    }
+                } else if (params.b <= 2) { return params.b == 1 ? 64 : 32; }
+            }
+            // Match the split budget to the small-query tile; round to whole N tiles.
+            int const budget = work <= 16 ? (group12 ? 160 : 240) : 320;
+            int const splits = std::max(1, std::min(work <= 16 && !group12 ? 40 : 128, budget / work));
             int const blocks_per_split = (num_n_blocks + splits - 1) / splits;
             return (num_n_blocks + blocks_per_split - 1) / blocks_per_split;
         }

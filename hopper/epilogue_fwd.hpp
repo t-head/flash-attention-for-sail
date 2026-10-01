@@ -315,7 +315,7 @@ struct CollectiveEpilogueFwd {
 #else
         static_assert(decltype(size<0, 0>(taccOcO))::value == 2);
 #endif
-        static_assert(decltype(size<0, 1>(taccOcO))::value == 2);
+        static_assert(decltype(size<0, 1>(taccOcO))::value == (Is_QSA && ArchTag::kMinComputeCapability == 80 && kBlockM == 8 ? 1 : 2));
         Tensor taccOcO_rowcol = make_tensor(taccOcO.data(), flash::convert_layout_acc_rowcol(taccOcO.layout()));
         Tensor taccOcO_row = taccOcO_rowcol(_, _0{});
         CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));                     // MMA_M

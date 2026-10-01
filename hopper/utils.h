@@ -188,8 +188,8 @@ CUTLASS_DEVICE auto convert_layout_acc_rowcol(Layout0 acc_layout) {
 
     } else {  // SM80
 #ifdef USE_PPU   // applies to ppu1.0
-        // acc is ppu c layout, size0 is 8, MMA_N size is A100 MMA_N/2
-        static_assert(decltype(size<0>(acc_layout))::value == 8);
+        // PPU C layout has eight values for M16 and four for M8.
+        static_assert(decltype(size<0>(acc_layout))::value == 8 || decltype(size<0>(acc_layout))::value == 4);
         static_assert(decltype(rank(acc_layout))::value == 3);
         auto l = logical_divide(acc_layout, Shape<_4>{}); //((2, 4), MMA_M, MMA_N)
 #else
