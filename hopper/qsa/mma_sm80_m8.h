@@ -1,5 +1,6 @@
 // Copyright (c) 2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
 #pragma once
+#include <mma.h>
 #include "cute/atom/mma_traits_ppu0010.hpp"
 namespace cute {
 struct QsaSM80_8x16x16_F32BF16BF16F32_TN {
@@ -13,11 +14,9 @@ struct QsaSM80_8x16x16_F32BF16BF16F32_TN {
         uint32_t const& b0, uint32_t const& b1, uint32_t const& b2, uint32_t const& b3,
         float const& c0, float const& c1, float const& c2, float const& c3) {
 #if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
-        asm volatile("ppu.tc01.mma.sync.aligned.m8n16k16.row.col.f32.bf16.bf16.f32 "
-            "{%0,%1,%2,%3}, {%4,%5}, {%6,%7,%8,%9}, {%10,%11,%12,%13};\n"
-            : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
-            : "r"(a0), "r"(a1), "r"(b0), "r"(b1), "r"(b2), "r"(b3),
-              "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+        auto const d = __ppu_mma_m8n16k16_mma_f32_bf16(
+            v2uint{a0, a1}, v4uint{b0, b1, b2, b3}, v4float{c0, c1, c2, c3}, 0);
+        d0 = d[0]; d1 = d[1]; d2 = d[2]; d3 = d[3];
 #else
         CUTE_INVALID_CONTROL_PATH("QSA M8 requires PPU0010");
 #endif

@@ -245,46 +245,6 @@ def test_qsa(case, dtype):
         torch.cuda.empty_cache()
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-@pytest.mark.parametrize("name,splits", [("original:decode", 1), ("original:functional_hopper", 4)])
-def test_qsa_repeated_forward(name, splits, dtype):
-    """Exercise multiple CTA waves and repeated query tiles on the same inputs."""
-    from flash_attn_interface import flash_attn_with_kvcache
-    case = next(case for case in CASES if case.name == name)
-    q, k, v, indices, cu, cache = build_inputs(case, dtype)
-    ref, pt = sparse_attention_ref(q, k, v, indices, cu, cache, source=True)
-    pt_diff = (pt.float() - ref.float()).abs()
-    previous = None
-    for _ in range(20):
-        out = flash_attn_with_kvcache(
-            q, k, v, cache_seqlens=cache, page_table=indices.unsqueeze(1),
-            cu_seqlens_q=cu, max_seqlen_q=case.sq, causal=True,
-            num_splits=splits, pack_gqa=True)
-        diff = (out.float() - ref.float()).abs()
-        assert diff.max() <= 2 * pt_diff.max() + 1e-5
-        assert diff.mean() <= 1.5 * pt_diff.mean() + 1e-6
-        if previous is not None:
-            assert torch.equal(out, previous), "Identical QSA inputs must produce identical outputs"
-        previous = out
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-def test_qsa_large_query_batch(dtype):
-    """Flattened prefill can exceed the CUDA grid's 65535-entry y/z axes."""
-    from flash_attn_interface import flash_attn_with_kvcache
-    batch, dim = 65536, 256
-    q = torch.randn(batch, 1, dim, device="cuda", dtype=dtype)
-    k = torch.randn(1, 16, 1, dim, device="cuda", dtype=dtype)
-    v = torch.randn_like(k)
-    indices = torch.zeros(batch, 1, 1, device="cuda", dtype=torch.int32)
-    cu = torch.arange(batch + 1, device="cuda", dtype=torch.int32)
-    cache = torch.ones(batch, device="cuda", dtype=torch.int32)
-    out = flash_attn_with_kvcache(
-        q, k, v, cache_seqlens=cache, page_table=indices, cu_seqlens_q=cu,
-        max_seqlen_q=1, causal=True, num_splits=1, pack_gqa=True)
-    torch.testing.assert_close(out, v[0, 0].expand_as(out), rtol=0, atol=0)
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true")

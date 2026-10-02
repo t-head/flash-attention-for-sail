@@ -471,7 +471,7 @@ void run_mha_fwd_qsa(Flash_fwd_params &params, hggcStream_t stream) {
 #ifndef FLASHATTENTION_DISABLE_HDIM256
     TORCH_CHECK(params.d == 256 && params.dv == 256, "QSA only supports head dim 256");
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
-    if constexpr ((Arch == 80 || Arch == 89) && PagedKVNonTMA && PackGQA && !Has_softcap) {
+    if constexpr (PagedKVNonTMA && PackGQA && !Has_softcap) {
         if (run_qsa(params, stream)) { return; }
     }
 #endif

@@ -92,7 +92,6 @@ struct CollectiveMainloopFwdSm80 {
     // tile, while PV continues to distribute its output columns across warps.
     static constexpr bool QsaReplicateQK = Is_QSA && PackGQA && PagedKV
         && QsaConfig::DirectIndex && QsaConfig::SingleTile
-        && (ArchTag::kMinComputeCapability == 80 || ArchTag::kMinComputeCapability == 89)
         && std::is_same_v<Element, cutlass::bfloat16_t>
         && (kNWarps == 4 || (ArchTag::kMinComputeCapability == 80 && kNWarps == 2))
         && (kBlockM == 16 || (ArchTag::kMinComputeCapability == 80 && kBlockM == 8)) && kBlockN == 16
