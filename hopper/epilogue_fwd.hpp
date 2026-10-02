@@ -267,7 +267,10 @@ struct CollectiveEpilogueFwd {
         // Otherwise we can permute after conversion.
         if constexpr (NeedFP8Permute && Split) { flash::permute_output_fp8_Vcolmajor(tOrO); }
         Tensor tOrO_out = make_tensor_like<Element>(tOrO);
-        flash::convert_type_out(tOrO, tOrO_out);
+        // SplitKV stores FP32 partials directly; the BF16 smem output is unused.
+        static constexpr bool QsaSplitStore = Is_QSA
+            && ArchTag::kMinComputeCapability == 80 && QsaConfig::SingleTile;
+        if (!QsaSplitStore || !is_split) { flash::convert_type_out(tOrO, tOrO_out); }
         if constexpr (NeedFP8Permute && !Split) { flash::permute_output_fp8_Vcolmajor(tOrO_out); }
 
         // Make sure all WGs have finished reading V
@@ -278,18 +281,20 @@ struct CollectiveEpilogueFwd {
 
         // Step 1: Write O from rmem -> smem
         if constexpr (Use_smem) {
-            auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma);
-            auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(thread_idx);
-            Tensor taccOrO = smem_thr_copy_O.retile_S(tOrO_out);        // ((Atom,AtomNum), MMA_M, MMA_N)
-            Tensor taccOsO = smem_thr_copy_O.partition_D(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
-            // Tensor taccOsO = smem_thr_copy_O.partition_D(sO_pi);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
-            cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
-            if constexpr (Use_TMA_O) {
-                cutlass::arch::fence_view_async_shared(); // ensure smem writes are visible to TMA
-                cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp,
-                                                    cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
-            } else {
-                flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+            if (!QsaSplitStore || !is_split) {
+                auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma);
+                auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(thread_idx);
+                Tensor taccOrO = smem_thr_copy_O.retile_S(tOrO_out);        // ((Atom,AtomNum), MMA_M, MMA_N)
+                Tensor taccOsO = smem_thr_copy_O.partition_D(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
+                // Tensor taccOsO = smem_thr_copy_O.partition_D(sO_pi);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
+                cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
+                if constexpr (Use_TMA_O) {
+                    cutlass::arch::fence_view_async_shared(); // ensure smem writes are visible to TMA
+                    cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp,
+                                                        cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+                } else {
+                    flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+                }
             }
         } else {
             if constexpr (ArchTag::kMinComputeCapability >= 90) {

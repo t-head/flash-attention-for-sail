@@ -272,7 +272,8 @@ struct PackGQAManager {
                 #pragma unroll
                 for (int k = 0; k < size<2>(tOrO_copy); ++k) {
                     int col = get<1>(taccOcO_col(k * kGmemElemsPerStoreDirect));
-                    if (col < size<1>(mO)) {
+                    // The M8 decode dispatch requires an exact D256 output.
+                    if ((Is_QSA && QsaConfig::M == 8 && kHeadDim == 256) || col < size<1>(mO)) {
                         cute::copy(gmem_copy_direct, tOrO_copy(_, m, k), mO_cur_copy(_, col / kGmemElemsPerStoreDirect));
                     }
                 }
