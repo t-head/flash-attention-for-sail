@@ -71,6 +71,12 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
     static_assert(Layout0::rank == 2, "Only support 2D Tensor");
     static_assert(Layout1::rank == 1, "Only support 1D Tensor");
     CUTE_STATIC_ASSERT_V(size<0>(max) == size<0>(tensor));
+    // Instead of computing exp(x - max), we compute exp2(x * log_2(e) -
+    // max * log_2(e)). This allows the compiler to use the ffma
+    // instruction instead of fadd and fmul separately.
+    // Split into two loops: all FMAs first (independent, fully pipelinable),
+    // then all exp2f (SFU can issue back-to-back). This breaks the serial
+    // FMA->exp2f->FMA->exp2f dependency chain and improves ILP.
     #pragma unroll
     for (int mi = 0; mi < size<0>(tensor); ++mi) {
         // If max is -inf, then all elements must have been -inf (possibly due to masking).
@@ -80,10 +86,11 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
             : (!Scale_max ? max(mi) : max(mi) * scale) - max_offset;
         #pragma unroll
         for (int ni = 0; ni < size<1>(tensor); ++ni)  {
-            // Instead of computing exp(x - max), we compute exp2(x * log_2(e) -
-            // max * log_2(e)). This allows the compiler to use the ffma
-            // instruction instead of fadd and fmul separately.
-            tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
+            tensor(mi, ni) = tensor(mi, ni) * scale - max_scaled;
+        }
+        #pragma unroll
+        for (int ni = 0; ni < size<1>(tensor); ++ni)  {
+            tensor(mi, ni) = exp2f(tensor(mi, ni));
         }
     }
 }
@@ -267,6 +274,36 @@ struct Softmax {
         flash::reduce_sum</*zero_init=*/Is_first, /*warp_reduce=*/false>(scores, row_sum);
     };
 
+
+#ifdef USE_PPU
+    // N-split O warps own column slabs, so their row scales come from
+    // the QK warps through shared memory. The caller publishes these scales
+    // with a CTA barrier. Issue all scale loads before the SFU work to avoid
+    // reusing live exp2 input registers for their destinations (SFU WAR).
+    // This boundary constrains compiler scheduling; it is not a CTA barrier.
+    template<bool Check_inf, typename TensorS, typename TensorO>
+    __forceinline__ __device__ void online_softmax_rescale_o_nsplit(
+            TensorS &acc_s, TensorO &acc_o, const float* scale_smem) {
+        Tensor output = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
+        constexpr int OutputRows = decltype(size<0>(output))::value;
+        const int p = (threadIdx.x % 32) / 4;
+        float scales[OutputRows];
+        #pragma unroll
+        for (int row = 0; row < OutputRows; ++row) {
+            scales[row] = scale_smem[16 * (row / 2) + p + 8 * (row % 2)];
+        }
+        __ppu_sched_bound();
+        online_softmax</*Is_first=*/false, Check_inf>(acc_s);
+        #pragma unroll
+        for (int row = 0; row < OutputRows; ++row) {
+            #pragma unroll
+            for (int ni = 0; ni < size<1>(output); ++ni) {
+                output(row, ni) *= scales[row];
+            }
+        }
+    }
+#endif
+
     __forceinline__ __device__ TensorT finalize(float const final_scale=1.f) {
         SumOp<float> sum_op;
         quad_allreduce_(row_sum, row_sum, sum_op);
@@ -306,6 +343,31 @@ struct Softmax {
         }
         return scores_scale;
     };
+
+#ifdef USE_PPU
+    // N-split scale broadcast: write this warp's per-row scales into the
+    // smem broadcast area so every warp can rescale its N-split slice of O
+    // against all kBlockM rows (flash::rescale_o_nsplit in utils.h). Each
+    // lane holds the scales of rows p and p+8 within its warp's 16 M-split
+    // rows (nrow mode (v1, MMA_M=1): row = warp_idx*16 + p + 8*mi); only
+    // q==0 lanes store (redundant stores of the same value are harmless).
+    // Pass the scores_scale returned by finalize() / the running rescale
+    // factors — NOT row_sum, which finalize() turns into LSE.
+    template<typename TensorScales>
+    __forceinline__ __device__ void write_scales_to_smem(float* scale_ptr, int warp_idx,
+                                                         TensorScales const& scores_scale) const {
+        static_assert(decltype(size(scores_scale))::value == kNRows);
+        const int lane = threadIdx.x % 32;
+        const int p = lane / 4;
+        const int q = lane % 4;
+        if (q == 0) {
+            #pragma unroll
+            for (int mi = 0; mi < kNRows; ++mi) {
+                scale_ptr[warp_idx * kNRows * 8 + mi * 8 + p] = scores_scale(mi);
+            }
+        }
+    }
+#endif
 
     template<typename Tensor1>
     __forceinline__ __device__ void rescale_o(Tensor1 &acc_o, TensorT const &scores_scale) {

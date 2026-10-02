@@ -49,8 +49,10 @@ public:
     using TiledMma = typename CollectiveMainloop::TiledMma;
     // Epilogue MMA view: same as TiledMma except on the zero-shfl FP8
     // V-direct path, where it carries the pi_n-permuted CLayout so O columns
-    // land correctly (see CollectiveMainloop::TiledMmaOPerm).
-    using TiledMmaEpilogue = typename CollectiveMainloop::TiledMmaOPerm;
+    // land correctly (see CollectiveMainloop::TiledMmaOPerm). On the P3 FP8
+    // N-split path it additionally lays the warps out along N (see
+    // CollectiveMainloop::TiledMmaOPerm_Nsplit); otherwise identical.
+    using TiledMmaEpilogue = typename CollectiveMainloop::TiledMmaOPerm_Nsplit;
     using ArchTag = typename CollectiveMainloop::ArchTag;
     using MainloopArguments = typename CollectiveMainloop::Arguments;
     using MainloopParams = typename CollectiveMainloop::Params;
@@ -226,7 +228,21 @@ public:
             }
 #endif
             // Attention output (GEMM-II) accumulator.
-            Tensor tOrO = partition_fragment_C(tiled_mma, select<0, 1>(TileShape_MNK_PV{}));
+            Tensor tOrO = [&]() {
+                if constexpr (CollectiveMainloop::Fp8PvNsplit) {
+                    // N-split: each warp accumulates all kBlockM rows x
+                    // its own contiguous kHeadDimV/kNWarps-column slab
+                    // (gemm_rs_sm80_pv_fp8_nsplit). Keep the standard
+                    // ((2,2,2), MMA_M, MMA_N) compact atom layout so that
+                    // rescale_o_nsplit, permute_output_fp8 and the epilogue
+                    // output layout all use the same register convention.
+                    static constexpr int kHeadDimV_ = CUTE_STATIC_V(get<1>(TileShape_MNK_PV{}));
+                    static constexpr int kNWarps_ = CUTE_STATIC_V(size(TiledMma{})) / 32;
+                    return make_tensor<float>(Shape<Shape<_2, _2, _2>, Int<kBlockM / 16>, Int<kHeadDimV_ / kNWarps_ / 16>>{});
+                } else {
+                    return partition_fragment_C(tiled_mma, select<0, 1>(TileShape_MNK_PV{}));
+                }
+            }();
             float softmax_scale_log2 = params.mainloop.softmax_scale_log2;
             // If there's tanh softcap, the scaling will be done before tanh.
             auto block_coord = work_tile_info.get_block_coord(params.scheduler);
@@ -268,8 +284,11 @@ public:
             scheduler.prefetch_next_work(params.scheduler, work_tile_info);
             if (tile_valid) {
                 // if (threadIdx.x == 128) { printf("Before epilogue, bid.x = %d, bid.y = %d, bid.z = %d, m_block = %d, bidb = %d, split_idx = %d\n", blockIdx.x, blockIdx.y, blockIdx.z, m_block, bidb, split_idx); }
+                // LSE coordinates always use the M-split mainloop TiledMma:
+                // softmax.row_sum is produced on the QK M-split layout even
+                // when TiledMmaEpilogue is N-split.
                 epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, TiledMmaEpilogue{},
-                               threadIdx.x, block_coord);
+                               threadIdx.x, block_coord, TiledMma{});
             } else {
                 // Write 0 to gO and -inf to gLSE.
                 epilogue.store_zero(params.epilogue, threadIdx.x, block_coord);

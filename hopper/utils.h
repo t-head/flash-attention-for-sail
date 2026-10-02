@@ -721,6 +721,223 @@ CUTLASS_DEVICE void gemm_rs_sm80_pv_fp8_vdirect(Tensor0 &acc, Tensor1 &tCrA, Ten
     }
     }
 }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//
+// FA3 FP8 PV N-split helpers: warp-split the PV GEMM along the N
+// (kHeadDimV) axis instead of the M axis. Each warp owns
+// COLS_PER_WARP = kHeadDimV / kNWarps output columns, so it only transposes
+// its own V slice (no kNWarps-fold redundant TSM/byte_perm work). The cost is
+// that the A operand (P, all kBlockM rows) must be all-gathered: QK/softmax
+// stay M-split, so every warp first scatters its own 16 rows of P (fp8, after
+// permute_Cregs_fp8 + convert_type_out) plus its 16 per-row softmax scales
+// into a staging buffer carved out of the just-consumed K smem stage (the
+// stage is dead between the QK read and the load_K_next refill).
+//
+// P smem layout (scheme B: per-thread per-mma-atom linear storage), 4096 B
+// total (= kBlockM*kBlockN fp8). The staged bytes are the same pi_k
+// pre-arranged A-fragments as the old row-major scheme: permute_Cregs_fp8
+// already mapped slot k = 4q+kq (+16 for the high half) to real
+// k = 2q+(kq&1)+8*(kq>>1) (+16) — the same pi_k the V-direct B assembly
+// (byte_perm selectors 0x6420/0x7531) produces — so A read back from this
+// buffer and B assembled from V agree slot-for-slot and the MMA reduction is
+// exact. The key observation is that with the QK M-split, writer warp w owns
+// exactly the rows of M-tile m=w, and its lane l's A-fragment u32s are
+// exactly what ANY reader warp's lane l needs for atom m=w. The buffer is
+// therefore organized as MMA_M*MMA_K atom blocks of 32 lanes x 16 B, and
+// both sides move one 16 B vector per (mk) / (m, mk):
+//   P_smem[(m*MMA_K + mk)*512 + lane*16 + j*4] = A-fragment u32 j (j=0..3)
+//   write: st.shared.v4 at (warp_idx*MMA_K + mk)*512 + lane*16
+//   read:  ld.shared.v4 at (m*MMA_K + mk)*512 + lane*16
+// Every access is naturally 16 B aligned (512 B per atom block, 16 B per
+// lane), replacing the old scheme's 4 scalar ld.shared.b32 per (m, mk).
+//
+// Scale broadcast: scale[row] (kBlockM floats, placed right after P in the
+// staging buffer) is written by the M-split owner warp of each row and read
+// back by every warp for the N-split rescale (rescale_o_nsplit).
+
+// Scatter this warp's own 16 rows of P into the per-thread per-atom linear
+// staging buffer (see the header comment). tOrP is the fp8 A-fragment view
+// (((4,2,2), MMA_M=1, MMA_K), compact) produced by permute_Cregs_fp8 +
+// convert_layout_acc_Aregs + convert_type_out; its u32 register j + 4*mk is
+// exactly the hardware A-fragment u32 j of k-tile mk (bytes kq=0..3). This
+// warp's rows are exactly M-tile m=warp_idx, so the 4 u32 of each k-tile are
+// stored as one 16 B vector at (warp_idx*MMA_K + mk)*512 + lane*16.
+template<int kBlockM, int kBlockN, typename TensorP>
+CUTLASS_DEVICE void write_P_to_smem(char* bcast_base, TensorP const& tOrP, int warp_idx) {
+    static_assert(kBlockM % 16 == 0 && kBlockN % 32 == 0);
+    constexpr int MMA_K = kBlockN / 32;
+    Tensor tOrP_u32 = recast<uint32_t>(tOrP);
+    // 16 rows x kBlockN cols per warp / 32 lanes = kBlockN/8 u32 per lane.
+    static_assert(decltype(size(tOrP_u32))::value == kBlockN / 8, "tOrP per-lane u32 count mismatch");
+    static_assert(decltype(size<1>(tOrP_u32))::value == 1, "write_P_to_smem expects M-split QK (16 rows/warp)");
+    const int lane = threadIdx.x % 32;
+    #pragma unroll
+    for (int mk = 0; mk < MMA_K; ++mk) {
+        const uint4 val = {tOrP_u32(0 + 4 * mk), tOrP_u32(1 + 4 * mk),
+                           tOrP_u32(2 + 4 * mk), tOrP_u32(3 + 4 * mk)};
+        *reinterpret_cast<uint4*>(bcast_base + (warp_idx * MMA_K + mk) * 512 + lane * 16) = val;
+    }
+}
+
+// Write this warp's 16 per-row softmax scales into the broadcast area (see
+// header). Each lane holds the scales of rows p and p+8 within its warp's 16
+// M-split rows; only q==0 lanes store (redundant stores of the same value
+// would be harmless but wasteful). Reader: rescale_o_nsplit.
+template<int kBlockM>
+CUTLASS_DEVICE void write_scale_to_smem(char* scale_base, float scale0, float scale1,
+                                        int warp_idx, int lane) {
+    static_assert(kBlockM % 16 == 0);
+    const int p = lane / 4;
+    const int q = lane % 4;
+    if (q == 0) {
+        float* ptr = reinterpret_cast<float*>(scale_base);
+        ptr[warp_idx * 16 + p]     = scale0;
+        ptr[warp_idx * 16 + p + 8] = scale1;
+    }
+}
+
+// N-split rescale: with the PV GEMM split along N, every warp holds ALL
+// kBlockM rows of O (its own COLS_PER_WARP columns), but the per-row softmax
+// scales were produced M-split, so they are read back from the smem broadcast
+// area (write_scale_to_smem / Softmax::write_scales_to_smem). acc_o is
+// ((2,2,2), MMA_M, MMA_N) fp32 with C(lane d[v0+2*v1+4*v2]) =
+// (m = p + 8*v1, n = 2q + v0 + 8*v2); after convert_layout_acc_rowcol the row
+// mode is (v1, MMA_M), so flat row index mi = v1 + 2*m_atom covers
+// row = 16*m_atom + p + 8*v1.
+template<typename Tensor0>
+CUTLASS_DEVICE void rescale_o_nsplit(Tensor0 &acc_o, const float* scale_smem) {
+    const int lane = threadIdx.x % 32;
+    const int p = lane / 4;
+    Tensor acc_rowcol = make_tensor(acc_o.data(), convert_layout_acc_rowcol(acc_o.layout()));
+    static_assert(decltype(size<0, 0>(acc_rowcol))::value == 2, "nrow mode must be (v1, MMA_M)");
+    constexpr int kNRows = decltype(size<0>(acc_rowcol))::value;
+    // Step 1: batch-issue all scale smem reads into registers (independent
+    // loads, single TSM wait) instead of load-then-multiply per row, which
+    // serialized on s.wait tsmcnt(0) every iteration.
+    float scales[kNRows];
+    #pragma unroll
+    for (int mi = 0; mi < kNRows; ++mi) {
+        const int m_atom = mi / 2;
+        const int v1 = mi % 2;
+        scales[mi] = scale_smem[16 * m_atom + p + 8 * v1];
+    }
+    // Step 2: pure register multiplies, no TSM dependency.
+    #pragma unroll
+    for (int mi = 0; mi < kNRows; ++mi) {
+        #pragma unroll
+        for (int ni = 0; ni < size<1>(acc_rowcol); ++ni) {
+            acc_rowcol(mi, ni) *= scales[mi];
+        }
+    }
+}
+
+// PV GEMM for the FP8 N-split path: identical V-transpose / byte_perm
+// assembly to gemm_rs_sm80_pv_fp8_vdirect (see its header comment for the
+// pi_k/pi_n framework and the TSM/LDSM_T details), but
+//   * A (P) is gathered from the per-thread per-atom linear smem staging
+//     buffer (write_P_to_smem) instead of registers — one ld.shared.v4
+//     (16 B) per (m, mk), covering all kBlockM rows, and
+//   * B (V) covers only this warp's own COLS_PER_WARP = kHeadDimV/kNWarps
+//     columns (j0 = warp_idx*COLS_PER_WARP + 32*np), eliminating the
+//     kNWarps-fold redundant V transpose of the M-split path.
+// acc is ((2,2,2), MMA_M=kBlockM/16, MMA_N=COLS_PER_WARP/16) fp32. The mk
+// loop stays outermost so every (m, n) accumulator sees ascending k, and the
+// A loads are batched per mk (MMA_M*4 u32 live) instead of whole-tile to cap
+// register pressure (fp8_pv_nsplit_design.md §6).
+template<int kBlockM, int kBlockN, int kHeadDimV, int kBlockKGmem, int kNWarps,
+         bool UseTsmLd, typename SmemLayoutVRaw,
+         typename Tensor0, typename TiledMma>
+CUTLASS_DEVICE void gemm_rs_sm80_pv_fp8_nsplit(Tensor0 &acc, const void *smem_p, void *smem_v,
+                                               int stage, int warp_idx, TiledMma tiled_mma) {
+    static_assert(kBlockM % 16 == 0 && kBlockN % 32 == 0 && kHeadDimV % 32 == 0 && kHeadDimV % kBlockKGmem == 0);
+    static_assert(kHeadDimV % kNWarps == 0);
+    constexpr int COLS_PER_WARP = kHeadDimV / kNWarps;
+    static_assert(COLS_PER_WARP % 32 == 0, "B is processed in n-tile pairs");
+    constexpr int MMA_M = kBlockM / 16;
+    constexpr int MMA_N = COLS_PER_WARP / 16;
+    constexpr int MMA_K = kBlockN / 32;
+    constexpr int MMA_NP = COLS_PER_WARP / 32;
+    static_assert(decltype(size<0>(acc))::value == 8, "acc atom C fragment size mismatch");
+    static_assert(decltype(size<1>(acc))::value == MMA_M, "acc MMA_M mismatch");
+    static_assert(decltype(size<2>(acc))::value == MMA_N, "acc MMA_N mismatch");
+    using Element = cutlass::float_e4m3_t;
+    // b16 element view of the raw sV cube: CUBE_W in b16 units = kBlockKGmem/2.
+    using TsmOp = cute::PPU0015_TSM_LD_SWZL<cute::bfloat16_t, kBlockN, kBlockKGmem / 2,
+                                            true /*Swap*/, true /*Trans*/, kHeadDimV / kBlockKGmem>;
+    const int lane = threadIdx.x % 32;
+    const uint8_t* p_base = reinterpret_cast<const uint8_t*>(smem_p);
+    Tensor sVraw = make_tensor(make_smem_ptr(reinterpret_cast<uint8_t const*>(smem_v)), SmemLayoutVRaw{});
+    Tensor tCrA = make_tensor<Element>(Shape<Shape<_4, _2, _2>, Int<MMA_M>, Int<MMA_K>>{});
+    Tensor tCrB = make_tensor<Element>(Shape<Shape<_4, _2, _2>, Int<MMA_N>, Int<MMA_K>>{});
+    Tensor tCrA32 = recast<uint32_t>(tCrA);
+    Tensor tCrB32 = recast<uint32_t>(tCrB);
+    #pragma hggc mmatiestrictly
+    {
+    #pragma unroll
+    for (int mk = 0; mk < MMA_K; ++mk) {
+        // Issue-order reorder: (1) fire ALL V loads first (high-latency TSM
+        // copy), (2) fire the P loads while V is in flight (P smem reads
+        // cover the V latency), (3) consume V with byte_perm + MMA, so the
+        // s.wait tsmcnt before byte_perm sees V already (mostly) arrived.
+        uint32_t rA_all[MMA_NP][4], rB_all[MMA_NP][4];
+        #pragma unroll
+        for (int np = 0; np < MMA_NP; ++np) {
+            const int j0 = warp_idx * COLS_PER_WARP + 32 * np;
+            if constexpr (UseTsmLd) {
+                const int cube = j0 / kBlockKGmem;
+                const int wcoord = (j0 % kBlockKGmem) / 2;  // b16 units
+                TsmOp::copy(rA_all[np], smem_v, /*coord_h=*/32 * mk,      /*coord_w=*/wcoord, cube, stage);
+                TsmOp::copy(rB_all[np], smem_v, /*coord_h=*/32 * mk + 16, /*coord_w=*/wcoord, cube, stage);
+            } else {
+                const int kv0 = 32 * mk;
+                uint32_t ldA[4], ldB[4];
+                const uint8_t* addrA = &sVraw(kv0 + lane, j0,      stage);
+                const uint8_t* addrB = &sVraw(kv0 + lane, j0 + 16, stage);
+                cute::PPU_U16x8_LDSM_T::copy(*reinterpret_cast<cute::uint128_t const*>(addrA),
+                                             ldA[0], ldA[1], ldA[2], ldA[3]);
+                cute::PPU_U16x8_LDSM_T::copy(*reinterpret_cast<cute::uint128_t const*>(addrB),
+                                             ldB[0], ldB[1], ldB[2], ldB[3]);
+                // Same half-remap to the TSM pair as the vdirect path.
+                rA_all[np][0] = ldA[0]; rA_all[np][1] = ldA[1];
+                rA_all[np][2] = ldB[0]; rA_all[np][3] = ldB[1];
+                rB_all[np][0] = ldA[2]; rB_all[np][1] = ldA[3];
+                rB_all[np][2] = ldB[2]; rB_all[np][3] = ldB[3];
+            }
+        }
+        // Gather this k-tile's A fragments from the staged P while the V
+        // loads above are in flight: lane l reads the 16 B atom block of
+        // M-tile m / k-tile mk at (m*MMA_K + mk)*512 + lane*16 (naturally
+        // 16 B aligned -> one ld.shared.v4 per (m, mk) instead of 4 scalar
+        // ld.shared.b32).
+        #pragma unroll
+        for (int m = 0; m < MMA_M; ++m) {
+            const uint4 val = *reinterpret_cast<const uint4*>(p_base + (m * MMA_K + mk) * 512 + lane * 16);
+            tCrA32(0, m, mk) = val.x;
+            tCrA32(1, m, mk) = val.y;
+            tCrA32(2, m, mk) = val.z;
+            tCrA32(3, m, mk) = val.w;
+        }
+        // permute the staged pair and emit the MMAs.
+        #pragma unroll
+        for (int np = 0; np < MMA_NP; ++np) {
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int mn = 2 * np + h;
+                tCrB32(0, mn, mk) = __byte_perm(rA_all[np][2 * h + 0], rA_all[np][2 * h + 1], 0x6420u);
+                tCrB32(1, mn, mk) = __byte_perm(rB_all[np][2 * h + 0], rB_all[np][2 * h + 1], 0x6420u);
+                tCrB32(2, mn, mk) = __byte_perm(rA_all[np][2 * h + 0], rA_all[np][2 * h + 1], 0x7531u);
+                tCrB32(3, mn, mk) = __byte_perm(rB_all[np][2 * h + 0], rB_all[np][2 * h + 1], 0x7531u);
+                // Emit the 16x16x32 atom MMA(s) for this n-tile immediately,
+                #pragma unroll
+                for (int m = 0; m < MMA_M; ++m) {
+                    cute::gemm(tiled_mma, tCrA(_, m, mk), tCrB(_, mn, mk), acc(_, m, mn));
+                }
+            }
+        }
+    }
+    }
+}
 #endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
