@@ -605,7 +605,7 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
 #ifdef USE_PPU
 inline int get_qsa_num_splits(Flash_fwd_params const& params, int num_n_blocks, int occ) {
     if (qsa_small_decode_2048(params)) {
-        if (params.arch == 80 && params.h_k * params.total_q <= 32
+        if (params.arch == 80 && params.h_k * params.total_q <= 64
             && (params.h == 3 * params.h_k || params.h == 6 * params.h_k
                 || params.h == 12 * params.h_k)
             && (params.k_row_stride == 256 || params.k_row_stride == 512)
