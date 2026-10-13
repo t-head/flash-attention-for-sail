@@ -1,0 +1,26 @@
+{
+  "fa2": [
+    "tests/test_flash_attn.py::test_flash_attn_bwd_overflow",
+    "tests/test_flash_attn.py::test_flash_attn_bwd_transpose",
+    "tests/test_flash_attn.py::test_flash_attn_bwd_varlen_overflow",
+    "tests/test_flash_attn.py::test_flash_attn_causal",
+    "tests/test_flash_attn.py::test_flash_attn_deterministic",
+    "tests/test_flash_attn.py::test_flash_attn_kvcache",
+    "# tests/test_flash_attn.py::test_flash_attn_output # expect 4 failures",
+    "tests/test_flash_attn.py::test_flash_attn_qkvpacked",
+    "tests/test_flash_attn.py::test_flash_attn_race_condition",
+    "# tests/test_flash_attn.py::test_flash_attn_splitkv # expect 8 failures",
+    "tests/test_flash_attn.py::test_flash_attn_varlen_causal",
+    "tests/test_flash_attn.py::test_flash_attn_varlen_deterministic",
+    "tests/test_flash_attn.py::test_flash_attn_varlen_output",
+    "tests/test_flash_attn.py::test_flash_attn_varlen_qkvpacked"
+  ],
+  "fa3": [
+    "# hopper/test_flash_attn.py::test_flash_attn_output # expect 2 failures",
+    "# hopper/test_flash_attn.py::test_flash_attn_varlen_output # expect 10 failures",
+    "hopper/test_flash_attn.py::test_flash_attn_kvcache",
+    "hopper/test_flash_attn.py::test_flash_attn_cluster",
+    "# hopper/test_flash_attn.py::test_flash_attn_race_condition # expect 60 failures",
+    "hopper/test_flash_attn.py::test_flash_attn_combine"
+  ]
+}
