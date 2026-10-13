@@ -1,39 +1,39 @@
-name: flash-attention checkin     # ① Workflow 名称（显示在 Actions 页面）
+name: flash-attention checkin     # Workflow name (shown on the Actions page)
 
-# ② 触发条件
+# Triggers
 on:
-  workflow_dispatch:                                       # 支持手动触发（网页/API）
+  workflow_dispatch:                                       # manual trigger (UI / API)
   pull_request:
-    branches: ['main', 'v2.7.2', 'v2.7.4', 'v2.8.2']         # 目标分支决定运行哪个 FA 版本
+    branches: ['main', 'v2.7.2', 'v2.7.4', 'v2.8.2']         # target branch selects the FA version to test
     types: [opened, synchronize, reopened]
   # push:
-  #   branches: ['feature/add-ci-workflow']                                       # 调试时打开
+  #   branches: ['feature/add-ci-workflow']                                       # uncomment for debugging
 
-permissions:                    # ③ Token 权限
+permissions:                    # token permissions
   contents: read
   pull-requests: write
   statuses: write
 
 concurrency:
   group: ci-ppu-smoke-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true                 # 新运行自动取消旧的
+  cancel-in-progress: true                 # newer runs cancel older ones
 
 jobs:
   
-  # Stage 1: 密钥扫描预检（组织级 reusable workflow）
+  # Stage 1: secret-scan precheck (org-level reusable workflow)
   precheck:
     name: Pre-check
     uses: t-head/.github/.github/workflows/user-precheck.yml@main
   # TODO: add smoketest if necessary
 
-  # Stage 2: AI 代码审查
+  # Stage 2: AI code review
   ai-code-review:
     name: AI Code Review (Copilot Gate)
     needs: precheck
     uses: t-head/.github/.github/workflows/ai-code-review.yml@main
     secrets: inherit
 
-  # Stage 3: 人工审批门禁
+  # Stage 3: human approval gate
   human-review:
     name: Human Review Gate
     # TODO: change to ai-code-review
@@ -41,26 +41,13 @@ jobs:
     uses: t-head/.github/.github/workflows/human-review.yml@main
     secrets: inherit
 
-  fa272-ut-tests-ppu:
-    name: flash-attention fa272 UT Tests PPU
+  # Stage 4: FA UT tests. A single reusable job; the PR base branch selects the version.
+  fa-ut-tests-ppu:
+    name: flash-attention UT Tests PPU (${{ github.base_ref }})
     # TODO: change to human-review
     needs: precheck
-    if: github.event_name == 'pull_request' && startsWith(github.base_ref, 'v2.7.2')
-    uses: ./.github/workflows/pr-fa272-test-ppu.yaml
-    secrets: inherit
-
-  fa274-ut-tests-ppu:
-    name: flash-attention fa274 UT Tests PPU
-    # TODO: change to human-review
-    needs: precheck
-    if: github.event_name == 'pull_request' && startsWith(github.base_ref, 'v2.7.4')
-    uses: ./.github/workflows/pr-fa274-test-ppu.yaml
-    secrets: inherit
-
-  fa282-ut-tests-ppu:
-    name: flash-attention fa282 UT Tests PPU
-    # TODO: change to human-review
-    needs: precheck
-    if: github.event_name == 'pull_request' && startsWith(github.base_ref, 'v2.8.2')
-    uses: ./.github/workflows/pr-fa282-test-ppu.yaml
+    if: github.event_name == 'pull_request' && contains(fromJSON('["v2.7.2", "v2.7.4", "v2.8.2"]'), github.base_ref)
+    uses: ./.github/workflows/pr-fa-test-ppu.yaml
+    with:
+      version: ${{ github.base_ref }}
     secrets: inherit

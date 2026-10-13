@@ -3,6 +3,7 @@ import xml.etree.ElementTree as ET
 import subprocess
 import sys
 import argparse
+import json
 import signal
 from junit_xml import TestCase, TestSuite, to_xml_report_string
 from datetime import datetime
@@ -27,21 +28,36 @@ ERROR_LOG_MAX_LINE_CHARS = 500
 temp_xml_files = []
 # (case args, exit code, temp xml, last output lines) for every pytest invocation that did not exit 0
 failed_cases = []
-def load_caselist(caselist_path):
-    """Load pytest targets from a .list file.
+def load_caselist(caselist_path, suite=""):
+    """Load pytest targets from casecmd.json or a plain .list file.
 
-    Each non-empty, non-comment line is one pytest invocation. A line holds a
-    pytest node id (e.g. tests/test_flash_attn.py::test_flash_attn_causal) plus
-    any optional per-case pytest args, separated by whitespace. Text after '#'
-    is treated as an inline comment and stripped.
+    For a .json file, the top-level object maps a suite key (e.g. "fa2" /
+    "fa3") to the list of pytest invocations for that variant, and `suite`
+    selects the group; an empty suite or a missing key is a hard error
+    (same contract as actlize's casecmd.json handling). For any other
+    suffix, each non-empty, non-comment line is one pytest invocation. An
+    entry holds a pytest node id (e.g. tests/test_flash_attn.py::test_flash_attn_causal) plus
+    any optional per-case pytest args, separated by whitespace. Text after
+    '#' is treated as an inline comment and stripped; entries starting with
+    '#' are skipped entirely (known-failing cases kept for reference).
     """
+    if caselist_path.endswith(".json"):
+        if not suite:
+            raise SystemExit(f"--suite is required when --caselist is a JSON file: {caselist_path}")
+        with open(caselist_path, "r", encoding="utf-8") as f:
+            cases = json.load(f)
+        if suite not in cases:
+            raise SystemExit(f"Suite '{suite}' not found in {caselist_path}; available keys: {', '.join(cases)}")
+        lines = cases[suite]
+    else:
+        with open(caselist_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
     cmds = []
-    with open(caselist_path, "r", encoding="utf-8") as f:
-        for raw in f:
-            line = raw.split("#", 1)[0].strip()
-            if not line:
-                continue
-            cmds.append(line.split())
+    for raw in lines:
+        line = str(raw).split("#", 1)[0].strip()
+        if not line:
+            continue
+        cmds.append(line.split())
     return cmds
 def get_case_timeout(args):
     """Return a case-specific timeout, falling back to the default limit."""
@@ -203,11 +219,13 @@ def merge_xml(temp_xml_files, output_xml, failed_cases=()):
 def main():
     parser = argparse.ArgumentParser(description="Run FA unit tests from a caselist and emit a merged JUnit XML report.")
     parser.add_argument("-c", "--caselist", required=True,
-                        help="Path of the pytest caselist (e.g. fa2_pytest.list / fa3_pytest.list)")
+                        help="Path of the case list (casecmd.json or a *.list text file)")
+    parser.add_argument("-k", "--suite", default="",
+                        help="Suite key to run when --caselist is casecmd.json (e.g. fa2 / fa3)")
     parser.add_argument("-o", "--output", default=output_xml,
                         help="Path of the merged JUnit XML report (default: %(default)s)")
     args = parser.parse_args()
-    test_files_cmds = load_caselist(args.caselist)
+    test_files_cmds = load_caselist(args.caselist, args.suite)
     print(f"📋 Loaded {len(test_files_cmds)} test cases from {args.caselist}")
     # 1. Run tests and generate temporary XML files
     for i, cmd in enumerate(test_files_cmds):
