@@ -16,7 +16,7 @@
 // #define USE_PPU
 
 #ifdef USE_PPU
-#include "ppu/ppu_include.hpp"
+#include "ppu_include.hpp"
 #endif
 
 #if !USE_AIU
@@ -44,18 +44,18 @@ struct Flash_kernel_traits {
     using MMA_Atom_Arch = std::conditional_t<
         std::is_same_v<elem_type, cutlass::half_t>,
 #if defined USE_PPU && ACOMPUTE_VERSION==10000
-        MMA_Atom<PPU_16x16x16_F32F16F16F32_TN>,
-        MMA_Atom<PPU_16x16x16_F32BF16BF16F32_TN>
+        MMA_Atom<PPU0010_16x16x16_F32F16F16F32_TN>,
+        MMA_Atom<PPU0010_16x16x16_F32BF16BF16F32_TN>
 #elif defined USE_PPU && ACOMPUTE_VERSION > 10000
         MMA_Atom<PPU0015_16x16x16_F32F16F16F32_TN>,
         MMA_Atom<PPU0015_16x16x16_F32BF16BF16F32_TN>
 #else
-        MMA_Atom<PPU_16x8x16_F32F16F16F32_TN>,
-        MMA_Atom<PPU_16x8x16_F32BF16BF16F32_TN>
+        MMA_Atom<PPU0010_16x16x16_F32F16F16F32_TN>,
+        MMA_Atom<PPU0010_16x16x16_F32BF16BF16F32_TN>
 #endif
     >;
 #else
-    using MMA_Atom_Arch = MMA_Atom<PPU_16x8x8_F32F16F16F32_TN>;
+    using MMA_Atom_Arch = MMA_Atom<PPU0010_16x16x16_F32F16F16F32_TN>;
 #endif
 
 #if defined(__HGGC_ARCH__) &&  __HGGC_ARCH__ >= 100

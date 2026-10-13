@@ -10,7 +10,7 @@ static CUTLASS_DEVICE int32_t get_lane_id() {
 static CUTLASS_DEVICE int32_t get_warp_id() {
   return threadIdx.y;
 }
-template <typename T, typename S, int N> struct NumericArrayConverterPPU {
+template <typename T, typename S, int N, bool ScalarStores = true> struct NumericArrayConverterPPU {
   using ElementCompute = T;
   bool is_source_needed() { return false; }
 };
@@ -19,7 +19,7 @@ template <typename T, typename S, int N> struct NumericArrayConverterPPU {
 #define CONVERTER_BASE_UNIT_8 8
 #define SHFL_V1
 
-template <typename T> struct NumericArrayConverterPPU<T, float, CONVERTER_BASE_UNIT_32> {
+template <typename T, bool ScalarStores> struct NumericArrayConverterPPU<T, float, CONVERTER_BASE_UNIT_32, ScalarStores> {
   using result_type = cutlass::Array<T, CONVERTER_BASE_UNIT_32>;
   using source_type = cutlass::Array<float, CONVERTER_BASE_UNIT_32>;
   using ElementCompute = T;
@@ -155,7 +155,7 @@ asm volatile(
   result_type operator()(source_type const &s) { return convert(s); }
 };
 
-template <typename T> struct NumericArrayConverterPPU<T, float, CONVERTER_BASE_UNIT_8> {
+template <typename T, bool ScalarStores> struct NumericArrayConverterPPU<T, float, CONVERTER_BASE_UNIT_8, ScalarStores> {
   using result_type = cutlass::Array<T, CONVERTER_BASE_UNIT_8>;
   using source_type = cutlass::Array<float, CONVERTER_BASE_UNIT_8>;
   using ElementCompute = T;
@@ -291,7 +291,7 @@ asm volatile(
   result_type operator()(source_type const &s) { return convert(s); }
 };
 
-template <typename T, int N> struct NumericArrayConverterPPU<T, float, N> {
+template <typename T, int N, bool ScalarStores> struct NumericArrayConverterPPU<T, float, N, ScalarStores> {
   using result_type = cutlass::Array<T, N>;
   using source_type = cutlass::Array<float, N>;
   using ElementCompute = T;
@@ -308,12 +308,17 @@ template <typename T, int N> struct NumericArrayConverterPPU<T, float, N> {
       NumericArrayConverterPPU<scalar_result_type, scalar_source_type, VEC_WIDTH> convert_vector_;
       using vec_result = cutlass::Array<scalar_result_type, VEC_WIDTH>;
       using vec_source = cutlass::Array<scalar_source_type, VEC_WIDTH>;
-      vec_result *result_ptr = reinterpret_cast<vec_result *>(&result);
       vec_source const *source_ptr = reinterpret_cast<vec_source const *>(&source);
 
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < N / VEC_WIDTH; ++i) {
-        result_ptr[i] = convert_vector_.convert(source_ptr[i]);
+        vec_result vr = convert_vector_.convert(source_ptr[i]);
+        if constexpr (ScalarStores) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int j = 0; j < VEC_WIDTH; ++j) { result[i * VEC_WIDTH + j] = vr[j]; }
+        } else {
+          reinterpret_cast<vec_result *>(&result)[i] = vr;
+        }
       }
     } else {
       constexpr int VEC_WIDTH = CONVERTER_BASE_UNIT_8;
