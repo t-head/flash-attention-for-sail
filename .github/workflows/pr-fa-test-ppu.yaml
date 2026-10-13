@@ -1,40 +1,70 @@
-name: flash-attention fa274 checkin     # ① Workflow 名称（显示在 Actions 页面）
+# Unified reusable workflow for the flash-attention-for-sail PPU CI.
+# Per-version differences are inputs only: `version` keys the job names, NAS
+# paths, the branch cloned in actlize source modes and the build variants
+# (only v2.8.2 builds fa3 in addition to fa2). fa3-specific handling stays
+# internal to this workflow.
+name: flash-attention UT Tests PPU
 
-# ② 触发条件
 on:
-  workflow_call:                                           # 由 ci-flash-attention.yaml 按 PR 目标分支调用
+  workflow_call:
     inputs:
+      version:
+        description: 'Target branch name (v2.7.2 / v2.7.4 / v2.8.2): job names, NAS paths and the branch cloned in actlize source modes.'
+        required: true
+        type: string
       matrix:
+        description: 'JSON list of runners, e.g. ["OAM-810E","ZW-M890P"].'
         required: false
         type: string
         default: '["OAM-810E","ZW-M890P"]'
-  workflow_dispatch:                                       # 支持手动触发（网页/API）
+      source_mode:
+        description: 'Source layout mode. Supported values: flash-attention, actlize0.8.0, actlize1.0.0.'
+        required: false
+        type: string
+        default: flash-attention
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Target branch name (v2.7.2 / v2.7.4 / v2.8.2).'
+        required: true
+        type: string
+        default: v2.8.2
+      matrix:
+        description: 'JSON list of runners, e.g. ["OAM-810E","ZW-M890P"].'
+        required: false
+        type: string
+        default: '["OAM-810E","ZW-M890P"]'
+      source_mode:
+        description: 'Source layout mode. Supported values: flash-attention, actlize0.8.0, actlize1.0.0.'
+        required: false
+        type: string
+        default: flash-attention
 
-permissions:                    # ③ Token 权限
+permissions:
   contents: read
   pull-requests: write
   statuses: write
 
 concurrency:
-  group: ci-ppu-fa274-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true                 # 新运行自动取消旧的
+  group: ci-ppu-fa-ut-${{ inputs.version }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
-  PPU_BASE_IMAGE: ${{ secrets.PPU_BASE_IMAGE }}
   SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
 
 jobs:
   build-test:
-    name: Build & Test (${{ matrix.variant }} / ${{ matrix.runner }})
+    name: flash-attention ${{ inputs.version }} ${{ matrix.variant }} (${{ matrix.runner }})
     runs-on: k8s-runner-group-cpu-thead
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 360
+    timeout-minutes: 420
     strategy:
       fail-fast: false
       matrix:
         runner: ${{ fromJson(inputs.matrix || '["OAM-810E","ZW-M890P"]') }}
-        variant: [fa2]
+        # Only v2.8.2 builds fa3 in addition to fa2; other versions build fa2 only.
+        variant: ${{ fromJson(inputs.version == 'v2.8.2' && '["fa2", "fa3"]' || '["fa2"]') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -49,36 +79,57 @@ jobs:
         with:
           image: ${{ env.SAIL_IMAGE }}
           container_options: |
-            cpus: "40"
+            cpus: "30"
             memory: "240g"
           nnodes: 0
           nproc_per_node: 1
           node_selector: "board-type=${{ matrix.runner }}"
           namespace: ppu-sched
-          timeout_minutes: 360
+          timeout_minutes: 420
           command: |
             set -ex
-            cd /workspace/source
-            # Fix: image bakes in PIP_INDEX_URL pointing to unreachable internal server
+            # The image points pip and github.com at unreachable internal mirrors. Fix these
+            # before source_mode handling because actlize mode clones the FA repository.
             unset PIP_INDEX_URL
-            # Fix: image bakes in git insteadOf redirecting github.com to unreachable internal gerrit
             git config --global --unset-all url.https://ai-gerrit.eng.t-head.cn/Public/Github/.insteadOf 2>/dev/null || true
+            VERSION='${{ inputs.version }}'
+            # Use the caller-provided branch name as-is when cloning FA in actlize source modes.
+            FA_BRANCH="$VERSION"
+            SOURCE_MODE='${{ inputs.source_mode }}'
+            case "$SOURCE_MODE" in
+              ""|flash-attention)
+                cd /workspace/source
+                ;;
+              actlize|actlize0.8.0|actlize1.0.0)
+                cd /workspace
+                FA_SOURCE=$(mktemp -d /workspace/fa-source.XXXXXX)
+                rmdir "$FA_SOURCE"
+                git config --global --add safe.directory '*'
+                git clone --recurse-submodules -b "$FA_BRANCH" \
+                  https://github.com/t-head/flash-attention-for-sail.git "$FA_SOURCE"
+                ACTLIZE_SOURCE=$(mktemp -d /workspace/actlize-source.XXXXXX)
+                rmdir "$ACTLIZE_SOURCE"
+                mv /workspace/source "$ACTLIZE_SOURCE"
+                rm -rf "$FA_SOURCE/csrc/actlize"
+                mkdir -p "$FA_SOURCE/csrc"
+                mv "$ACTLIZE_SOURCE" "$FA_SOURCE/csrc/actlize"
+                mv "$FA_SOURCE" /workspace/source
+                cd /workspace/source
+                ;;
+              *)
+                echo "Unsupported source_mode: $SOURCE_MODE"
+                exit 1
+                ;;
+            esac
             # PPU SDK and torch are pre-installed in the docker image
             source /usr/local/PPU_SDK/envsetup.sh
-            echo $PPU_SDK
             # Drop any pre-installed flash-attn so the freshly built wheel takes effect.
             pip uninstall -y flash-attn flash-attn-3 || true
             export MAX_JOBS=20
             export PYTORCH_SAIL_ARCH="ppu_10;ppu_15"
             export FLASH_ATTENTION_FORCE_BUILD="TRUE"
-            echo "START TO INIT SUBMODULES"
-            git config --global --add safe.directory /workspace/source
-            git submodule update --init --recursive
-            # Pre-install setup_requires (packaging/psutil/ninja) via pip so setuptools does not
-            # fall back to its legacy fetch_build_eggs against the unreachable internal index.
-            # Pin setuptools and packaging to known-good versions: the image ships an old
-            # packaging whose canonicalize_version() lacks the strip_trailing_zero kwarg that
-            # newer setuptools calls when building wheel metadata (TypeError otherwise).
+            # Submodules are initialized by checkout or the source_mode clone above.
+            # Pin build dependencies to avoid legacy fetching and old-packaging incompatibilities.
             pip install "setuptools==75.8.0" "packaging==24.2" psutil ninja
             VARIANT="${{ matrix.variant }}"
             VARIANT_UPPER="${VARIANT^^}"
@@ -116,36 +167,38 @@ jobs:
                 tail -n 100 "$LOG_FILE"
                 exit 1
             fi
-            echo "✅ ${VARIANT_UPPER} 构建成功！"
+            echo "${VARIANT_UPPER} wheel built successfully"
             echo "----- last 200 lines of $LOG_FILE -----"
             tail -n 200 "$LOG_FILE"
             # bdist_wheel leaves <pkg>.egg-info in BUILD_DIR; if it is on sys.path pip treats the
-            # package as already installed and silently skips the wheel (so the CUDA extension is missing).
+            # package as already installed and silently skips the wheel (so flash_attn_3._C is missing).
             rm -rf "$BUILD_DIR"/*.egg-info
             pip install "$BUILD_DIR"/dist/*.whl
             if [[ "$VARIANT" == "fa3" ]]; then
-              # Check the compiled extension from the installed wheel before running any case.
-              # In v2.7.4 the hopper extension is the top-level module flash_attn_3_cuda.
-              (cd /tmp && python -c "import flash_attn_3_cuda; print(flash_attn_3_cuda.__file__)")
+              pip show -f flash-attn-3 || true
               export PYTHONPATH="/workspace/source/hopper"
+            else
+              pip show -f flash-attn || true
             fi
             echo "START TO INSTALL TEST DEPS"
             pip install numpy==1.26.4 junit-xml einops
             pip install --upgrade pytest
-            CASELIST=".github/workflows/scripts/${VARIANT}_pytest.list"
+            CASELIST=".github/workflows/scripts/casecmd.json"
             RESULT_FILE="test-results-${VARIANT}.xml"
             echo "START TO TEST ${VARIANT_UPPER} CASES FROM $CASELIST"
             cd /workspace/source
+            # Keep going on test failures so the report is still copied to NAS for the summary.
             set +e
             python .github/workflows/scripts/pr-run-fa-ut.py \
-              --caselist "$CASELIST" --output "$RESULT_FILE"
+              --caselist "$CASELIST" --suite "$VARIANT" --output "$RESULT_FILE"
             TEST_EXIT_CODE=$?
             # Record the runtime environment alongside the JUnit report.
             python3 .github/workflows/scripts/generate-env-info.py \
               --docker-image "${{ env.SAIL_IMAGE }}" \
               --output env_info.json
-            # Copy the JUnit report and runtime information to NAS for the runner and variant.
-            NAS_RESULT_DIR="/mnt/wl_nas/devops/flash-attention-ci/fa274/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${{ matrix.variant }}"
+            # Keep results per runner and variant so the parallel matrix jobs do not collide.
+            # Same layout for every FA version; run_id already makes it unique.
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/flash-attention-ci/${VERSION}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${{ matrix.variant }}"
             mkdir -p "$NAS_RESULT_DIR"
             cp "$RESULT_FILE" "$NAS_RESULT_DIR/" 2>/dev/null || true
             cp env_info.json "$NAS_RESULT_DIR/" 2>/dev/null || true
@@ -157,10 +210,10 @@ jobs:
         shell: bash
         run: |
           VARIANT="${{ matrix.variant }}"
-          NAS_RESULT_DIR="/wl_nas/devops/flash-attention-ci/fa274/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${{ matrix.variant }}"
+          NAS_RESULT_DIR="/wl_nas/devops/flash-attention-ci/${{ inputs.version }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${VARIANT}"
           XML_FILE="$NAS_RESULT_DIR/test-results-${VARIANT}.xml"
           ENV_FILE="$NAS_RESULT_DIR/env_info.json"
-          echo "## FA274 ${VARIANT^^} results (${{ matrix.runner }})" >> "$GITHUB_STEP_SUMMARY"
+          echo "## ${{ inputs.version }} ${VARIANT^^} results (${{ matrix.runner }})" >> "$GITHUB_STEP_SUMMARY"
           if [[ ! -f "$XML_FILE" ]]; then
             echo "JUnit report not found: $XML_FILE" >> "$GITHUB_STEP_SUMMARY"
             exit 1
