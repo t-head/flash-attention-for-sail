@@ -315,6 +315,7 @@ public:
         }
         __syncthreads();
         int tile_idx = __ppu_read_firstlane(*tile_count_smem) + int(gridDim.x);
+        __syncthreads();
         return {tile_idx, current_work.tile_idx, current_work.block_idx, current_work.split_idx, current_work.bidh, current_work.bidb};
     }
 
