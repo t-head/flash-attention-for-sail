@@ -1,0 +1,53 @@
+name: flash-attention checkin     # Workflow name (shown on the Actions page)
+
+# Triggers
+on:
+  workflow_dispatch:                                       # manual trigger (UI / API)
+  pull_request:
+    branches: ['v2.7.2_v0.2.0_release', 'v2.7.4_v0.2.0_release', 'v2.8.2_v0.2.0_release']         # target branch selects the FA version to test
+    types: [opened, synchronize, reopened]
+  # push:
+  #   branches: ['feature/add-ci-workflow']                                       # uncomment for debugging
+
+permissions:                    # token permissions
+  contents: read
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: ci-ppu-smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true                 # newer runs cancel older ones
+
+jobs:
+  
+  # Stage 1: secret-scan precheck (org-level reusable workflow)
+  precheck:
+    name: Pre-check
+    uses: t-head/.github/.github/workflows/user-precheck.yml@main
+  # TODO: add smoketest if necessary
+
+  # Stage 2: AI code review
+  ai-code-review:
+    name: AI Code Review (Copilot Gate)
+    needs: precheck
+    uses: t-head/.github/.github/workflows/ai-code-review.yml@main
+    secrets: inherit
+
+  # Stage 3: human approval gate
+  human-review:
+    name: Human Review Gate
+    # TODO: change to ai-code-review
+    needs: precheck
+    uses: t-head/.github/.github/workflows/human-review.yml@main
+    secrets: inherit
+
+  # Stage 4: FA UT tests. A single reusable job; the PR base branch selects the version.
+  fa-ut-tests-ppu:
+    name: flash-attention UT Tests PPU (${{ github.base_ref }})
+    # TODO: change to human-review
+    needs: precheck
+    if: github.event_name == 'pull_request' && contains(fromJSON('["v2.7.2_v0.2.0_release", "v2.7.4_v0.2.0_release", "v2.8.2_v0.2.0_release"]'), github.base_ref)
+    uses: ./.github/workflows/pr-fa-test-ppu.yaml
+    with:
+      version: ${{ github.base_ref }}
+    secrets: inherit
