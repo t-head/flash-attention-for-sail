@@ -132,7 +132,7 @@ def generate_markdown_summary(stats, show_subcases=False, env_info=None):
     repo_prefix = f"{repo} " if repo else ""
     lines.append(f"## {repo_prefix}Test Results{suffix}\n")
     # ---- Summary overview ----
-    lines.append('<h3>概览</h3>')
+    lines.append('<h3>Overview</h3>')
     lines.append('<table>')
     lines.append('<tr>'
                  '<th>Total Cases</th>'
