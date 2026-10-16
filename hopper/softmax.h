@@ -62,7 +62,7 @@ __device__ __forceinline__ void reduce_sum(Tensor<Engine0, Layout0> const& tenso
 }
 
 // Apply the exp to all the elements.
-template <bool Scale_max=true, bool Check_inf=true, int Max_offset=0,
+template <bool Scale_max=true, bool Check_inf=true, int Max_offset=0, bool SeparateExp2=false,
         typename Engine0, typename Layout0, typename Engine1, typename Layout1>
 __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tensor, Tensor<Engine1, Layout1> const &max, const float scale) {
     // For FP8, we can subtract max by 8.0 so that the value after exp2 is in the range of [0, 256].
@@ -74,9 +74,6 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
     // Instead of computing exp(x - max), we compute exp2(x * log_2(e) -
     // max * log_2(e)). This allows the compiler to use the ffma
     // instruction instead of fadd and fmul separately.
-    // Split into two loops: all FMAs first (independent, fully pipelinable),
-    // then all exp2f (SFU can issue back-to-back). This breaks the serial
-    // FMA->exp2f->FMA->exp2f dependency chain and improves ILP.
     #pragma unroll
     for (int mi = 0; mi < size<0>(tensor); ++mi) {
         // If max is -inf, then all elements must have been -inf (possibly due to masking).
@@ -84,13 +81,25 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
         const float max_scaled = Check_inf
             ? (max(mi) == -INFINITY ? 0.f : (!Scale_max ? max(mi) : max(mi) * scale) - max_offset)
             : (!Scale_max ? max(mi) : max(mi) * scale) - max_offset;
-        #pragma unroll
-        for (int ni = 0; ni < size<1>(tensor); ++ni)  {
-            tensor(mi, ni) = tensor(mi, ni) * scale - max_scaled;
-        }
-        #pragma unroll
-        for (int ni = 0; ni < size<1>(tensor); ++ni)  {
-            tensor(mi, ni) = exp2f(tensor(mi, ni));
+        if constexpr (SeparateExp2) {
+            // PPU ASM analysis shows that separate FMA/exp2 loops allow better
+            // instruction scheduling in the FP8 PV N-split path, with measured
+            // gains for noncausal kernels. Keep this opt-in for N-split: the
+            // common softmax also serves BF16/FP16 and other FP8 paths, where
+            // the scheduling change can regress performance.
+            #pragma unroll
+            for (int ni = 0; ni < size<1>(tensor); ++ni) {
+                tensor(mi, ni) = tensor(mi, ni) * scale - max_scaled;
+            }
+            #pragma unroll
+            for (int ni = 0; ni < size<1>(tensor); ++ni) {
+                tensor(mi, ni) = exp2f(tensor(mi, ni));
+            }
+        } else {
+            #pragma unroll
+            for (int ni = 0; ni < size<1>(tensor); ++ni) {
+                tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
+            }
         }
     }
 }
@@ -263,12 +272,12 @@ struct Softmax {
         return scores_scale;
     };
 
-    template<bool Is_first, bool Check_inf=false, typename Tensor0>
+    template<bool Is_first, bool Check_inf=false, bool SeparateExp2=false, typename Tensor0>
     __forceinline__ __device__ void online_softmax(Tensor0 &acc_s) {
         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
         static_assert(CUTE_STATIC_V(size<0>(scores)) == kNRows);
-        flash::template scale_apply_exp2</*Scale_max=*/true, Check_inf, Max_offset>(scores, row_max, softmax_scale_log2);
+        flash::template scale_apply_exp2</*Scale_max=*/true, Check_inf, Max_offset, SeparateExp2>(scores, row_max, softmax_scale_log2);
         // We don't do the reduce across threads here since we don't need to use the row_sum.
         // We do that reduce at the end when we need to normalize the softmax.
         flash::reduce_sum</*zero_init=*/Is_first, /*warp_reduce=*/false>(scores, row_sum);
@@ -293,7 +302,7 @@ struct Softmax {
             scales[row] = scale_smem[16 * (row / 2) + p + 8 * (row % 2)];
         }
         __ppu_sched_bound();
-        online_softmax</*Is_first=*/false, Check_inf>(acc_s);
+        online_softmax</*Is_first=*/false, Check_inf, /*SeparateExp2=*/true>(acc_s);
         #pragma unroll
         for (int row = 0; row < OutputRows; ++row) {
             #pragma unroll

@@ -1145,7 +1145,8 @@ struct CollectiveMainloopFwdSm80 {
             } else
 #endif
             {
-                softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
+                softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf,
+                                                /*SeparateExp2=*/Fp8PvNsplit>(tSrS);
             }
 #ifdef USE_PPU
             if constexpr (FA4SkipRescaleO && !Fp8PvNsplit) {
