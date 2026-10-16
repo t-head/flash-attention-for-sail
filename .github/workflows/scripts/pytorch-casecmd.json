@@ -1,0 +1,6 @@
+{
+  "pytorch": [
+    "test/test_native_mha.py",
+    "test/distributed/fsdp/test_fsdp_flatten_params.py"
+  ]
+}
