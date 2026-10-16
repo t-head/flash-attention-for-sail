@@ -1,0 +1,141 @@
+# Reusable workflow for flash-attention-for-sail PyTorch integration tests on PPU.
+# Mirrors pr-fa-test-ppu.yaml but builds PyTorch from source with flash-attention
+# integrated and runs PyTorch's own distributed/attention tests via pytest.
+name: flash-attention PyTorch Tests PPU
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Target branch name (v2.7.2 / v2.7.4 / v2.8.2): job names and NAS paths.'
+        required: true
+        type: string
+      matrix:
+        description: 'JSON list of runners, e.g. ["OAM-810E"].'
+        required: false
+        type: string
+        default: '["OAM-810E"]'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Target branch name (v2.7.2 / v2.7.4 / v2.8.2).'
+        required: true
+        type: string
+        default: v2.7.2
+      matrix:
+        description: 'JSON list of runners, e.g. ["OAM-810E"].'
+        required: false
+        type: string
+        default: '["OAM-810E"]'
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: ci-ppu-fa-pytorch-${{ inputs.version }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  SAIL_IMAGE: download.t-head.cn/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-hggcrt3-py312-20261005
+
+jobs:
+  build-test:
+    name: flash-attention ${{ inputs.version }} pytorch (${{ matrix.runner }})
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 960
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJson(inputs.matrix || '["OAM-810E"]') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Build and Test PyTorch on ${{ matrix.runner }}
+        id: ppu-test
+        uses: t-head/ppu-scheduler-action@main
+        with:
+          image: ${{ env.SAIL_IMAGE }}
+          container_options: |
+            cpus: "30"
+            memory: "240g"
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: "board-type=${{ matrix.runner }}"
+          namespace: ppu-sched
+          timeout_minutes: 960
+          command: |
+            set -ex
+
+            # The image may point pip and github.com at unreachable internal mirrors.
+            unset PIP_INDEX_URL
+            git config --global --unset-all url.https://ai-gerrit.eng.t-head.cn/Public/Github/.insteadOf 2>/dev/null || true
+            git config --global --add safe.directory '*'
+
+            VERSION='${{ inputs.version }}'
+            FA_SRC=/workspace/source
+            DEPS_DIR=/workspace/deps
+            PYTORCH_SRC=${DEPS_DIR}/pytorch
+
+            mkdir -p ${DEPS_DIR}
+
+            # Clone PyTorch for SAIL from GitHub.
+            git clone -b v2.10.0 --depth 1 --recurse-submodules \
+              https://github.com/t-head/pytorch-for-sail.git ${PYTORCH_SRC}
+
+            cd ${FA_SRC}
+            git submodule update --init
+
+            cd ${PYTORCH_SRC}
+            rm -rf third_party/flash-attention third_party/cutlass
+            cp -rf "${FA_SRC}" third_party/flash-attention
+            # FA kernels compile against third_party/cutlass/include; pin it to FA's actlize.
+            cp -rf "${FA_SRC}/csrc/actlize" third_party/cutlass
+            rm -f third_party/cutlass/.git
+            echo "actlize for PyTorch build: $(git -C "${FA_SRC}" rev-parse HEAD:csrc/actlize)"
+
+            # Build PyTorch from source with flash-attention integrated.
+            export FA_SRC PYTORCH_SRC
+            export python_version=py312
+            export product=ppu
+            source ${FA_SRC}/.github/workflows/scripts/fa272_fa2_pytorch_build.sh
+
+            # Keep going on test failures so the report is still copied to NAS for the summary.
+            TEST_EXIT_CODE=0
+            bash ${FA_SRC}/.github/workflows/scripts/fa272_fa2_run_ci_pytorch.sh || TEST_EXIT_CODE=$?
+
+            # Publish test results even if environment collection fails.
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/flash-attention-ci/${VERSION}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/pytorch"
+            mkdir -p "${NAS_RESULT_DIR}"
+            cp ${FA_SRC}/test-results-pytorch.xml "${NAS_RESULT_DIR}/" 2>/dev/null || true
+            if ! python3 "${FA_SRC}/.github/workflows/scripts/generate-env-info.py" \
+              --docker-image "${{ env.SAIL_IMAGE }}" \
+              --output "${FA_SRC}/env_info_pytorch.json"; then
+              printf '%s\n' '{"collection_error": "Environment information collection failed"}' \
+                > "${FA_SRC}/env_info_pytorch.json"
+            fi
+            cp ${FA_SRC}/env_info_pytorch.json "${NAS_RESULT_DIR}/" 2>/dev/null || true
+            exit "${TEST_EXIT_CODE}"
+          cleanup_policy: on_success
+
+      - name: Test summary (pytorch / ${{ matrix.runner }})
+        if: always()
+        shell: bash
+        run: |
+          NAS_RESULT_DIR="/wl_nas/devops/flash-attention-ci/${{ inputs.version }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/pytorch"
+          XML_FILE="$NAS_RESULT_DIR/test-results-pytorch.xml"
+          ENV_FILE="$NAS_RESULT_DIR/env_info_pytorch.json"
+          echo "## ${{ inputs.version }} pytorch results (${{ matrix.runner }})" >> "$GITHUB_STEP_SUMMARY"
+          if [[ ! -f "$XML_FILE" ]]; then
+            echo "JUnit report not found: $XML_FILE" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          python3 .github/workflows/scripts/display-test-summary.py \
+            "$XML_FILE" --env-info "$ENV_FILE"
