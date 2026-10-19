@@ -50,7 +50,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJson(inputs.matrix || '["OAM-810E"]') }}
+        runner: ${{ fromJson(inputs.matrix || '["OAM-810E","ZW-M890P"]') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -104,7 +104,13 @@ jobs:
             # Build PyTorch from source with flash-attention integrated.
             export FA_SRC PYTORCH_SRC
             export python_version=py312
-            export product=ppu
+            # 810E uses ppu (ppu_10); 890 uses ppu1.5 (ppu_15).
+            case '${{ matrix.runner }}' in
+              OAM-810E)  product=ppu ;;
+              ZW-M890P)  product=ppu1.5 ;;
+              *)         echo "Unknown runner: ${{ matrix.runner }}"; exit 1 ;;
+            esac
+            export product
             source ${FA_SRC}/.github/workflows/scripts/fa272_fa2_pytorch_build.sh
 
             # Keep going on test failures so the report is still copied to NAS for the summary.

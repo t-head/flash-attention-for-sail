@@ -60,5 +60,4 @@ jobs:
     uses: ./.github/workflows/pr-fa-pytorch-test-ppu.yaml
     with:
       version: ${{ github.base_ref }}
-      matrix: '["OAM-810E"]'
     secrets: inherit
