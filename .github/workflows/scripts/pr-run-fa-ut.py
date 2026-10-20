@@ -5,10 +5,8 @@ import sys
 import argparse
 import json
 import signal
-from junit_xml import TestCase, TestSuite, to_xml_report_string
-from datetime import datetime
-import time
 from collections import deque
+
 # Configuration: default output file and per-case timeout limits
 output_xml = "test-results.xml"
 DEFAULT_TIMEOUT_SECONDS = 1200
@@ -17,29 +15,35 @@ CASE_TIMEOUT_OVERRIDES = {
     "tests/test_flash_attn.py::test_flash_attn_varlen_output": 5000,
     "hopper/test_flash_attn.py::test_flash_attn_kvcache": 3000,
 }
+
 # Known failures tolerated per pytest target: exactly this many failed subcases still counts as a pass.
 KNOWN_FAILURE_COUNTS = {
     "tests/test_flash_attn.py::test_flash_attn_varlen_output": 24,
 }
+
 # Number of trailing pytest output lines attached to a failed case in the report
 ERROR_LOG_TAIL_LINES = 10
 # Max characters kept per log line (tensor dumps / assert diffs can be huge single lines)
 ERROR_LOG_MAX_LINE_CHARS = 500
+
 temp_xml_files = []
 # (case args, exit code, temp xml, last output lines) for every pytest invocation that did not exit 0
 failed_cases = []
+
+
 def load_caselist(caselist_path, suite=""):
     """Load pytest targets from casecmd.json or a plain .list file.
 
     For a .json file, the top-level object maps a suite key (e.g. "fa2" /
-    "fa3") to the list of pytest invocations for that variant, and `suite`
-    selects the group; an empty suite or a missing key is a hard error
-    (same contract as actlize's casecmd.json handling). For any other
-    suffix, each non-empty, non-comment line is one pytest invocation. An
-    entry holds a pytest node id (e.g. tests/test_flash_attn.py::test_flash_attn_causal) plus
-    any optional per-case pytest args, separated by whitespace. Text after
-    '#' is treated as an inline comment and stripped; entries starting with
-    '#' are skipped entirely (known-failing cases kept for reference).
+    "fa3" in casecmd.json, "pytorch" in pytorch-casecmd.json) to the list of
+    pytest invocations for that variant, and `suite` selects the group; an
+    empty suite or a missing key is a hard error (same contract as actlize's
+    casecmd.json handling). For any other suffix, each non-empty, non-comment
+    line is one pytest invocation. An entry holds a pytest node id (e.g.
+    tests/test_flash_attn.py::test_flash_attn_causal) plus any optional
+    per-case pytest args, separated by whitespace. Text after '#' is treated
+    as an inline comment and stripped; entries starting with '#' are skipped
+    entirely (known-failing cases kept for reference).
     """
     if caselist_path.endswith(".json"):
         if not suite:
@@ -59,19 +63,24 @@ def load_caselist(caselist_path, suite=""):
             continue
         cmds.append(line.split())
     return cmds
-def get_case_timeout(args):
+
+
+def get_case_timeout(args, default_timeout):
     """Return a case-specific timeout, falling back to the default limit."""
     case_id = " ".join(args)
     for case_path, timeout_seconds in CASE_TIMEOUT_OVERRIDES.items():
         if case_path in case_id:
             return timeout_seconds
-    return DEFAULT_TIMEOUT_SECONDS
+    return default_timeout
+
 
 def truncate_line(line, limit=ERROR_LOG_MAX_LINE_CHARS):
     """Cut an over-long log line, noting how many characters were dropped."""
     if len(line) <= limit:
         return line
     return f"{line[:limit]} ...[truncated {len(line) - limit} chars]"
+
+
 def tolerate_known_failures(args, temp_xml):
     """Accept a run whose only failures are the expected known ones.
 
@@ -110,16 +119,17 @@ def tolerate_known_failures(args, temp_xml):
         ts.set("skipped", str(int(ts.get("skipped", "0")) + moved))
     tree.write(temp_xml, encoding="utf-8", xml_declaration=True)
     return True
-def run_test_python(args, idx):
+
+
+def run_test_python(args, temp_xml, default_timeout):
     """Run a single pytest target and generate a JUnit XML report."""
-    temp_xml = f"results_{idx}.xml"
     cmd = [
         "pytest",
         "-v",
         *args,
         f"--junitxml={temp_xml}"
     ]
-    timeout_seconds = get_case_timeout(args)
+    timeout_seconds = get_case_timeout(args, default_timeout)
     print(f"🚀 Running: {' '.join(cmd)}")
     print(f"⏰ Timeout: {timeout_seconds}s")
     # Always keep the report: pytest also writes it on test failures and collection errors.
@@ -164,7 +174,8 @@ def run_test_python(args, idx):
     else:
         print(f"❌ Test case {' '.join(args)} failed with exit code {returncode}")
         failed_cases.append((args, returncode, temp_xml, list(tail)))
-    return temp_xml
+
+
 def merge_xml(temp_xml_files, output_xml, failed_cases=()):
     """Merge all temporary XML files into the final result."""
     final_root = ET.Element("testsuite", name="pytest", tests="0", failures="0", errors="0", skipped="0", time="0.0")
@@ -180,16 +191,14 @@ def merge_xml(temp_xml_files, output_xml, failed_cases=()):
             # pytest writes <testsuites><testsuite>...; older versions write <testsuite> as the root
             testsuites = [root] if root.tag == "testsuite" else root.findall("testsuite")
             for testsuite in testsuites:
-                # Extract and merge all testcase elements
                 testcases = testsuite.findall("testcase")
                 for testcase in testcases:
                     final_root.append(testcase)
                 merged_cases.setdefault(temp_xml, []).extend(testcases)
-                # Update aggregate statistics
                 final_root.set("tests", str(int(final_root.get("tests")) + int(testsuite.get("tests", "0"))))
                 final_root.set("failures", str(int(final_root.get("failures")) + int(testsuite.get("failures", "0"))))
                 final_root.set("errors", str(int(final_root.get("errors")) + int(testsuite.get("errors", "0"))))
-                final_root.set("skipped", str(int(final_root.get("skipped", "0")) + int(testsuite.get("skipped", "0"))))
+                final_root.set("skipped", str(int(final_root.get("skipped")) + int(testsuite.get("skipped", "0"))))
                 final_root.set("time", str(float(final_root.get("time")) + float(testsuite.get("time", "0.0"))))
                 print(f"✅ Merged {testsuite.get('tests', '0')} test cases from {temp_xml}")
         except ET.ParseError as e:
@@ -211,17 +220,26 @@ def merge_xml(temp_xml_files, output_xml, failed_cases=()):
         if tail:
             system_err = ET.SubElement(testcase, "system-err")
             header = f"===== last {len(tail)} lines of `pytest -v {case_id}` (exit code {returncode}) ====="
-            system_err.text = "\n".join([header, *tail])
-    # Write the final XML file
+            log_text = "\n".join([header, *tail])
+            # Drop characters XML 1.0 forbids (ANSI escapes, NUL, ...) so the report stays parseable.
+            system_err.text = "".join(
+                char for char in log_text
+                if char in "\t\n\r" or "\u0020" <= char <= "\uD7FF"
+                or "\uE000" <= char <= "\uFFFD" or "\U00010000" <= char <= "\U0010FFFF"
+            )
     final_tree = ET.ElementTree(final_root)
     final_tree.write(output_xml, encoding="utf-8", xml_declaration=True)
     print(f"✅ Test results merged into {output_xml}")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Run FA unit tests from a caselist and emit a merged JUnit XML report.")
+    parser = argparse.ArgumentParser(description="Run pytest cases from a caselist and emit a merged JUnit XML report.")
     parser.add_argument("-c", "--caselist", required=True,
-                        help="Path of the case list (casecmd.json or a *.list text file)")
+                        help="Path of the case list (casecmd.json, pytorch-casecmd.json or a *.list text file)")
     parser.add_argument("-k", "--suite", default="",
-                        help="Suite key to run when --caselist is casecmd.json (e.g. fa2 / fa3)")
+                        help="Suite key to run when --caselist is a JSON file (e.g. fa2 / fa3 / pytorch)")
+    parser.add_argument("-t", "--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS,
+                        help="Per-case timeout in seconds for cases without an override (default: %(default)s)")
     parser.add_argument("-o", "--output", default=output_xml,
                         help="Path of the merged JUnit XML report (default: %(default)s)")
     args = parser.parse_args()
@@ -229,10 +247,12 @@ def main():
     print(f"📋 Loaded {len(test_files_cmds)} test cases from {args.caselist}")
     # 1. Run tests and generate temporary XML files
     for i, cmd in enumerate(test_files_cmds):
+        temp_xml = f"results_{args.suite}_{i}.xml" if args.suite else f"results_{i}.xml"
         try:
-            run_test_python(cmd, i)
+            run_test_python(cmd, temp_xml, args.timeout)
         except Exception as e:
             print(f"🔥 Critical error while running test command {cmd}: {e}")
+            failed_cases.append((cmd, -1, temp_xml, [truncate_line(str(e))]))
     # 2. Merge XML files
     merge_xml(temp_xml_files, args.output, failed_cases)
     # 3. Clean up temporary files
@@ -249,5 +269,7 @@ def main():
         print(f"❌ {len(failed_cases)}/{len(test_files_cmds)} pytest invocations failed")
         return 1
     return 0
+
+
 if __name__ == "__main__":
     sys.exit(main())
