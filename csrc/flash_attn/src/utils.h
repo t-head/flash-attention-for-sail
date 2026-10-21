@@ -273,11 +273,11 @@ __forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const &tenso
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 #if defined USE_PPU
-template <typename To_type, typename Engine, typename Layout>
+template <typename To_type, bool ScalarStores = true, typename Engine, typename Layout>
 inline __device__ auto convert_acc(Tensor<Engine, Layout> const &tensor) {
     using From_type = typename Engine::value_type;
     constexpr int numel = decltype(size(tensor))::value;
-    NumericArrayConverterPPU<To_type, From_type, numel> convert_op;
+    NumericArrayConverterPPU<To_type, From_type, numel, ScalarStores> convert_op;
     // convert_op:: accum(tensor.data());
     // auto frag = convert_op(accum);
     auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
