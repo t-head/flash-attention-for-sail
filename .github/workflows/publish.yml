@@ -8,7 +8,7 @@
 name: Build wheels and deploy
 
 on:
-  create:
+  push:
     tags:
       - v*
 
@@ -20,7 +20,7 @@ jobs:
     steps:
       - name: Get the tag version
         id: extract_branch
-        run: echo ::set-output name=branch::${GITHUB_REF#refs/tags/}
+        run: echo "branch=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Create Release
@@ -156,7 +156,7 @@ jobs:
 
       - name: Get the tag version
         id: extract_branch
-        run: echo ::set-output name=branch::${GITHUB_REF#refs/tags/}
+        run: echo "branch=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
 
       - name: Get Release with tag
         id: get_current_release

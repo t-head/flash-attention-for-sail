@@ -23,12 +23,15 @@ def parse_test_results(xml_path):
     tree = ET.parse(xml_path)
     root = tree.getroot()
 
-    total = int(root.get("tests", 0))
-    failures = int(root.get("failures", 0))
-    errors = int(root.get("errors", 0))
-    skipped = int(root.get("skipped", 0))
+    # The standard FA runner emits a single testsuite, while pytest wraps
+    # one or more suites in testsuites. Read suite counters in both formats.
+    suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
+    total = sum(int(suite.get("tests", 0)) for suite in suites)
+    failures = sum(int(suite.get("failures", 0)) for suite in suites)
+    errors = sum(int(suite.get("errors", 0)) for suite in suites)
+    skipped = sum(int(suite.get("skipped", 0)) for suite in suites)
     passed = total - failures - errors - skipped
-    time = float(root.get("time", 0))
+    time = sum(float(suite.get("time", 0)) for suite in suites)
 
     testcases = []
     for tc in root.findall(".//testcase"):

@@ -63,13 +63,14 @@ jobs:
       fail-fast: false
       matrix:
         runner: ${{ fromJson(inputs.matrix || '["OAM-810E","ZW-M890P"]') }}
-        # Only v2.8.2 builds fa3 in addition to fa2; other versions build fa2 only.
-        variant: ${{ fromJson(inputs.version == 'v2.8.2' && '["fa2", "fa3"]' || '["fa2"]') }}
+        # v2.8.2 additionally tests FA3 and the standalone Holmes raw ABI.
+        variant: ${{ fromJson(inputs.version == 'v2.8.2' && '["fa2", "fa3", "holmes", "holmes-fa3"]' || '["fa2"]') }}
     steps:
       - uses: actions/checkout@v4
         with:
           # Full history so the base..head diff below resolves both ends.
           fetch-depth: 0
+          ref: ${{ startsWith(matrix.variant, 'holmes') && (github.event.pull_request.head.sha || github.sha) || github.sha }}
           # Fetch submodules (csrc/actlize provides cutlass headers) at checkout time, recursively.
           submodules: recursive
           persist-credentials: false
@@ -123,6 +124,37 @@ jobs:
             esac
             # PPU SDK and torch are pre-installed in the docker image
             source /usr/local/PPU_SDK/envsetup.sh
+            VARIANT="${{ matrix.variant }}"
+            if [[ "$VARIANT" == holmes* ]]; then
+              pip install "setuptools==75.8.0" "packaging==24.2" psutil ninja pytest
+              # /workspace/source is this workflow's checkout (PR head SHA),
+              # or the explicitly assembled ACTLIZE dependency source mode.
+              if [[ "$SOURCE_MODE" == "" || "$SOURCE_MODE" == "flash-attention" ]]; then
+                export EXPECTED_FA_SHA='${{ github.event.pull_request.head.sha || github.sha }}'
+              else
+                export EXPECTED_ACTLIZE_SHA='${{ github.event.pull_request.head.sha || github.sha }}'
+              fi
+              RESULT_DIR="/workspace/${VARIANT}-${{ github.run_id }}-${{ github.run_attempt }}"
+              NAS_RESULT_DIR="/mnt/wl_nas/devops/flash-attention-ci/${VERSION}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${VARIANT}"
+              mkdir -p "$NAS_RESULT_DIR"
+              # Preserve diagnostics even when build/test fails, and propagate failure.
+              set +e
+              HOLMES_RUNNER="tests/holmes/run.sh"
+              if [[ "$VARIANT" == "holmes-fa3" ]]; then HOLMES_RUNNER="tests/holmes_fa3/run.sh"; fi
+              bash "$HOLMES_RUNNER" "$RESULT_DIR"
+              TEST_EXIT_CODE=$?
+              COPY_EXIT_CODE=0
+              for RESULT_FILE in "$RESULT_DIR"/*; do
+                if [[ -f "$RESULT_FILE" ]]; then
+                  cp "$RESULT_FILE" "$NAS_RESULT_DIR/" || COPY_EXIT_CODE=1
+                fi
+              done
+              if [[ -d "$RESULT_DIR/dist" ]]; then
+                cp -a "$RESULT_DIR/dist" "$NAS_RESULT_DIR/" || COPY_EXIT_CODE=1
+              fi
+              if [[ "$TEST_EXIT_CODE" -ne 0 ]]; then exit "$TEST_EXIT_CODE"; fi
+              exit "$COPY_EXIT_CODE"
+            fi
             # Drop any pre-installed flash-attn so the freshly built wheel takes effect.
             pip uninstall -y flash-attn flash-attn-3 || true
             export MAX_JOBS=20
@@ -211,12 +243,37 @@ jobs:
         run: |
           VARIANT="${{ matrix.variant }}"
           NAS_RESULT_DIR="/wl_nas/devops/flash-attention-ci/${{ inputs.version }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${VARIANT}"
+          echo "## ${{ inputs.version }} ${VARIANT^^} results (${{ matrix.runner }})" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$VARIANT" == holmes* ]]; then
+            XML_FILE="$NAS_RESULT_DIR/junit.xml"
+            if [[ ! -f "$XML_FILE" ]]; then
+              echo "JUnit report not found: $XML_FILE" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            python3 .github/workflows/scripts/display-test-summary.py "$XML_FILE"
+            while read -r SHA256 ARTIFACT_PATH; do
+              [[ "$ARTIFACT_PATH" == *.whl ]] || continue
+              {
+                printf '\n**Wheel:** `%s`\n\n' "${ARTIFACT_PATH##*/}"
+                printf '**SHA256:**\n\n```text\n%s\n```\n\n' "$SHA256"
+              } >> "$GITHUB_STEP_SUMMARY"
+            done < "$NAS_RESULT_DIR/artifact.sha256"
+            python3 "$NAS_RESULT_DIR/check_junit.py" "$NAS_RESULT_DIR/junit.xml"
+            exit 0
+          fi
           XML_FILE="$NAS_RESULT_DIR/test-results-${VARIANT}.xml"
           ENV_FILE="$NAS_RESULT_DIR/env_info.json"
-          echo "## ${{ inputs.version }} ${VARIANT^^} results (${{ matrix.runner }})" >> "$GITHUB_STEP_SUMMARY"
           if [[ ! -f "$XML_FILE" ]]; then
             echo "JUnit report not found: $XML_FILE" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
           python3 .github/workflows/scripts/display-test-summary.py \
             "$XML_FILE" --env-info "$ENV_FILE"
+
+      - name: Upload Holmes ABI evidence
+        if: always() && startsWith(matrix.variant, 'holmes')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.variant }}-abi-${{ inputs.version }}-${{ matrix.runner }}
+          path: /wl_nas/devops/flash-attention-ci/${{ inputs.version }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${{ matrix.variant }}/
+          if-no-files-found: error

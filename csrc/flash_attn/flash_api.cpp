@@ -252,7 +252,22 @@ void set_params_dgrad(Flash_bwd_params &params,
     params.deterministic = deterministic;
 }
 
+#if defined(FLASH_ATTN_CPP_INFERENCE_FOR_HOLMES) && defined(HOLMES_RAW_ABI_TESTING)
+// Host dispatch evidence for standalone ABI tests; absent from release builds.
+static thread_local int holmes_test_splits = -1, holmes_test_swapped = -1, holmes_test_dense_swapped = -1;
+extern "C" void holmes_raw_test_dispatch(int* splits, int* swapped, int* dense_swapped) {
+    *splits = holmes_test_splits;
+    *swapped = holmes_test_swapped;
+    *dense_swapped = holmes_test_dense_swapped;
+    holmes_test_splits = holmes_test_swapped = holmes_test_dense_swapped = -1;
+}
+#endif
+
 void run_mha_fwd(Flash_fwd_params &params, hggcStream_t stream, bool force_split_kernel=false) {
+#if defined(FLASH_ATTN_CPP_INFERENCE_FOR_HOLMES) && defined(HOLMES_RAW_ABI_TESTING)
+    holmes_test_splits = params.num_splits;
+    holmes_test_swapped = params.seqlenq_ngroups_swapped;
+#endif
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
@@ -458,6 +473,9 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     // H/t Daniel Haziza
     const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size % 8 == 0 && !alibi_slopes_.has_value();
     const int ngroups = num_heads / num_heads_k;
+#if defined(FLASH_ATTN_CPP_INFERENCE_FOR_HOLMES) && defined(HOLMES_RAW_ABI_TESTING)
+    holmes_test_dense_swapped = seqlenq_ngroups_swapped;
+#endif
     if (seqlenq_ngroups_swapped) {
         q = q.reshape({batch_size, num_heads_k, ngroups, head_size}).transpose(1, 2);
         seqlen_q = ngroups;

@@ -195,6 +195,8 @@ if HOLMES_BUILD:
         extension.name = "flashattn2_holmes"
         extension.sources = [s for s in extension.sources if "bwd" not in s]
         extension.define_macros.append(("FLASH_ATTN_CPP_INFERENCE_FOR_HOLMES", "1"))
+        if os.getenv("FA_HOLMES_ABI_TEST", "0") == "1":
+            extension.define_macros.append(("HOLMES_RAW_ABI_TESTING", "1"))
         if USE_PPU:
             extension.define_macros.append(("USE_PPU", "1"))
         extension.libraries = [lib for lib in extension.libraries if lib != "torch_python"]
