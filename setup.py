@@ -67,6 +67,17 @@ if not SKIP_CUDA_BUILD:
         "-DUSE_PPU", "-DUSE_AIU=1",
     ]
 
+    major, minor = map(int, subprocess.check_output(
+        ["hgcc", "-E", "-x", "cu", "/dev/stdin"],
+        input="PPU_VERSION __HGGCCC_VER_MAJOR__ __HGGCCC_VER_MINOR__\n",
+        text=True, timeout=10,
+    ).rsplit("PPU_VERSION", 1)[1].split())
+    if (major, minor) >= (2, 2):
+        hgcc_flags += [
+            "-mllvm", "-no-ppu-gvn=true",
+            "-Xhggcfe", "-mframe-pointer=all",
+        ]
+
     cc_flag = []
     cc_flag.append("-arch=ppu_10")
     cc_flag.append("-arch=ppu_15")
