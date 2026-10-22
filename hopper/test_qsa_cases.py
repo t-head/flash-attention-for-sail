@@ -345,5 +345,65 @@ def test_qsa_fwd_direct_causal_matches_kvcache():
         f"max diff {(out_fwd.float() - out_kv.float()).abs().max().item()}"
 
 
+@pytest.mark.parametrize("queries", [511, 512, 513])
+@pytest.mark.parametrize("selected", [200, 511, 512, 2051])
+@pytest.mark.parametrize("cache_tokens", [8192, 32768])
+def test_qsa_tp1_prefill_split_boundary(queries, selected, cache_tokens):
+    """Check TP1 auto and explicit splits."""
+    torch.manual_seed(0)
+    device = "cuda"
+    q = torch.randn(queries, 24, 256, device=device, dtype=torch.bfloat16)
+    k = torch.randn(cache_tokens // 16, 16, 2, 256, device=device, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    # Independent queries share one cache and include a top-k tail.
+    indices = torch.randint(cache_tokens, (queries, 2051), device=device, dtype=torch.int32)
+    cu = torch.arange(queries + 1, device=device, dtype=torch.int32)
+    cache = torch.full((queries,), selected, device=device, dtype=torch.int32)
+    ref, pt = sparse_attention_ref(q, k, v, indices, cu, cache)
+    pt_diff = (pt.float() - ref.float()).abs()
+    for splits in (0, 1, 4):
+        result = _fwd_direct(q, k, v, indices.unsqueeze(1), cu, cache, 1,
+                             num_splits=splits)
+        diff = (result[0].float() - ref.float()).abs()
+        assert torch.isfinite(result[0]).all()
+        assert diff.max().item() <= 2 * pt_diff.max().item() + 1e-5
+        assert diff.mean().item() <= 2 * pt_diff.mean().item() + 1e-6
+        if splits == 4:
+            assert result[2] is not None and result[2].shape[0] == splits
+
+
+@pytest.mark.parametrize(
+    "queries,prefix_selected,tail_selected",
+    [
+        pytest.param(513, 2051, 200, id="long-prefix-short-tail"),
+        pytest.param(1025, 200, 2051, id="short-midpoint-long-tail"),
+        pytest.param(513, 200, 511, id="all-short-mixed"),
+        pytest.param(1025, 511, 200, id="midpoint-below-boundary"),
+        pytest.param(513, 512, 511, id="midpoint-at-boundary"),
+        pytest.param(1025, 511, 512, id="tail-at-boundary"),
+    ],
+)
+def test_qsa_tp1_prefill_mixed_selected(queries, prefix_selected, tail_selected):
+    """Check all outputs with mixed selected lengths."""
+    torch.manual_seed(0)
+    device = "cuda"
+    cache_tokens = 8192
+    q = torch.randn(queries, 24, 256, device=device, dtype=torch.bfloat16)
+    k = torch.randn(cache_tokens // 16, 16, 2, 256, device=device, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    indices = torch.randint(cache_tokens, (queries, 2051), device=device, dtype=torch.int32)
+    cu = torch.arange(queries + 1, device=device, dtype=torch.int32)
+    cache = torch.full((queries,), prefix_selected, device=device, dtype=torch.int32)
+    # Vary the last quarter; odd Q also exercises the head mapping.
+    cache[3 * queries // 4:] = tail_selected
+    ref, pt = sparse_attention_ref(q, k, v, indices, cu, cache)
+    result = _fwd_direct(q, k, v, indices.unsqueeze(1), cu, cache, 1, num_splits=0)
+    diff = (result[0].float() - ref.float()).abs()
+    pt_diff = (pt.float() - ref.float()).abs()
+    assert torch.isfinite(result[0]).all()
+    assert diff.max().item() <= 2 * pt_diff.max().item() + 1e-5
+    assert diff.mean().item() <= 2 * pt_diff.mean().item() + 1e-6
+
+
 if __name__ == "__main__":
     sys.exit(main())
