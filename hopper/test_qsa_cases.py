@@ -372,6 +372,8 @@ def test_qsa_tp1_prefill_split_boundary(queries, selected, cache_tokens):
             assert result[2] is not None and result[2].shape[0] == splits
 
 
+@pytest.mark.parametrize("heads,kv_heads", [(3, 1), (6, 1), (24, 2)])
+@pytest.mark.parametrize("num_splits", [0, 1])
 @pytest.mark.parametrize(
     "queries,prefix_selected,tail_selected",
     [
@@ -383,13 +385,14 @@ def test_qsa_tp1_prefill_split_boundary(queries, selected, cache_tokens):
         pytest.param(1025, 511, 512, id="tail-at-boundary"),
     ],
 )
-def test_qsa_tp1_prefill_mixed_selected(queries, prefix_selected, tail_selected):
+def test_qsa_prefill_mixed_selected(queries, prefix_selected, tail_selected,
+                                   heads, kv_heads, num_splits):
     """Check all outputs with mixed selected lengths."""
     torch.manual_seed(0)
     device = "cuda"
     cache_tokens = 8192
-    q = torch.randn(queries, 24, 256, device=device, dtype=torch.bfloat16)
-    k = torch.randn(cache_tokens // 16, 16, 2, 256, device=device, dtype=torch.bfloat16)
+    q = torch.randn(queries, heads, 256, device=device, dtype=torch.bfloat16)
+    k = torch.randn(cache_tokens // 16, 16, kv_heads, 256, device=device, dtype=torch.bfloat16)
     v = torch.randn_like(k)
     indices = torch.randint(cache_tokens, (queries, 2051), device=device, dtype=torch.int32)
     cu = torch.arange(queries + 1, device=device, dtype=torch.int32)
@@ -397,7 +400,7 @@ def test_qsa_tp1_prefill_mixed_selected(queries, prefix_selected, tail_selected)
     # Vary the last quarter; odd Q also exercises the head mapping.
     cache[3 * queries // 4:] = tail_selected
     ref, pt = sparse_attention_ref(q, k, v, indices, cu, cache)
-    result = _fwd_direct(q, k, v, indices.unsqueeze(1), cu, cache, 1, num_splits=0)
+    result = _fwd_direct(q, k, v, indices.unsqueeze(1), cu, cache, 1, num_splits=num_splits)
     diff = (result[0].float() - ref.float()).abs()
     pt_diff = (pt.float() - ref.float()).abs()
     assert torch.isfinite(result[0]).all()

@@ -40,6 +40,7 @@ struct Sm80WarpN : GqaSharedWarpNShort {
 };
 struct Sm80WarpN2 : Sm80WarpN { static constexpr int Warps = 2; };
 struct Sm80WarpN1 : Sm80WarpN2 { static constexpr int Warps = 1; };
+struct Sm80WarpN1M8 : Sm80WarpN1 { static constexpr int M = 8; };
 struct Sm80WarpNM8 : Sm80WarpN2 { static constexpr int M = 8; };
 struct Gqa3Direct : Gqa8Direct { static constexpr int Group = 3, KVStride = 256; };
 struct Gqa3WarpN : Gqa3Direct {
@@ -309,8 +310,9 @@ bool run_qsa(Flash_fwd_params &p, hggcStream_t stream) {
     using namespace qsa;
     if (!qsa_config_supported(p)) { return false; }
     if (p.arch == 80) {
-        if (p.num_splits <= 1 && qsa_small_decode_2048(p) && p.h == 12 * p.h_k) {
-            launch<Sm80WarpN1, false, false, 80>(p, stream);
+        if (p.num_splits <= 1 && qsa_small_decode_2048(p) && p.h <= 16 * p.h_k) {
+            if (p.h <= 8 * p.h_k) { launch<Sm80WarpN1M8, false, false, 80>(p, stream); }
+            else { launch<Sm80WarpN1, false, false, 80>(p, stream); }
             return true;
         }
         if (p.num_splits <= 1 || int64_t(p.b) * p.h_k > 16 || !qsa_small_decode_2048(p)
