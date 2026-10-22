@@ -49,7 +49,8 @@ template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element,
 #endif
 void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
 #ifdef USE_PPU
-    static_assert(!QsaConfig::M || (Is_QSA && kHeadDim == 256 && kHeadDimV == 256 && PackGQA),
+    static_assert(!QsaConfig::M || (Is_QSA && kHeadDim == 256
+                  && kHeadDimV * QsaConfig::VParts == 256 && PackGQA),
                   "QSA configurations require packed hdim256 QSA");
 #endif
     static_assert(!(Is_causal && Is_local), "Causal and Local cannot be enabled at the same time");
@@ -159,7 +160,7 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
     static constexpr bool UsePersistentScheduler = Is_QSA || Varlen || (!Varlen && Is_causal);
     using Scheduler = std::conditional_t<Is_QSA && (QsaConfig::SingleTile || Arch == 80),
         flash::QsaSingleTileScheduler<Varlen, Split,
-            QsaConfig::QueryFirst, Arch == 80>,
+            QsaConfig::QueryFirst, Arch == 80, QsaConfig::VParts>,
         std::conditional_t<UsePersistentScheduler, SchedulerPersistent, SchedulerSingleTile>>;
     using AttnKernel = std::conditional_t<
         Arch >= 89,

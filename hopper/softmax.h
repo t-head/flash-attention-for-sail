@@ -247,7 +247,7 @@ struct Softmax {
         return scores_scale;
     };
 
-    template<bool Is_first, bool Check_inf=false, typename Tensor0>
+    template<bool Is_first, bool Check_inf=false, bool QsaFp8=false, typename Tensor0>
     __forceinline__ __device__ TensorT max_get_scale(Tensor0 &acc_s) {
         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
@@ -265,14 +265,21 @@ struct Softmax {
                 float scores_max_cur = !Check_inf
                     ? row_max(mi)
                     : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
-                scores_scale(mi) = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+#ifdef FLASHATTENTION_QSA_FP8
+                if constexpr (QsaFp8) {
+                    scores_scale(mi) = scores_max_prev(mi) == scores_max_cur ? 1.f : exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+                } else
+#endif
+                {
+                    scores_scale(mi) = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+                }
                 row_sum(mi) *= scores_scale(mi);
             }
         }
         return scores_scale;
     };
 
-    template<bool Is_first, bool Check_inf=false, bool SeparateExp2=false, typename Tensor0>
+    template<bool Is_first, bool Check_inf=false, bool SeparateExp2=false, bool QsaFp8=false, typename Tensor0>
     __forceinline__ __device__ void online_softmax(Tensor0 &acc_s) {
         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
@@ -280,7 +287,21 @@ struct Softmax {
         flash::template scale_apply_exp2</*Scale_max=*/true, Check_inf, Max_offset, SeparateExp2>(scores, row_max, softmax_scale_log2);
         // We don't do the reduce across threads here since we don't need to use the row_sum.
         // We do that reduce at the end when we need to normalize the softmax.
-        flash::reduce_sum</*zero_init=*/Is_first, /*warp_reduce=*/false>(scores, row_sum);
+#ifdef FLASHATTENTION_QSA_FP8
+        if constexpr (QsaFp8 && Max_offset == 8) {
+            // The numerator multiplies E4M3-rounded probabilities. Normalize
+            // the same values, preserving unit mass (and constant V).
+            auto rounded = make_fragment_like(scores);
+            #pragma unroll
+            for (int i = 0; i < size(scores); ++i) {
+                rounded(i) = float(cutlass::float_e4m3_t(scores(i)));
+            }
+            flash::reduce_sum</*zero_init=*/Is_first, /*warp_reduce=*/false>(rounded, row_sum);
+        } else
+#endif
+        {
+            flash::reduce_sum</*zero_init=*/Is_first, /*warp_reduce=*/false>(scores, row_sum);
+        }
     };
 
 
@@ -378,7 +399,7 @@ struct Softmax {
     }
 #endif
 
-    template<typename Tensor1>
+    template<bool QsaFp8=false, typename Tensor1>
     __forceinline__ __device__ void rescale_o(Tensor1 &acc_o, TensorT const &scores_scale) {
         // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
         Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
@@ -386,7 +407,14 @@ struct Softmax {
         #pragma unroll
         for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
             #pragma unroll
-            for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scores_scale(mi); }
+            for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
+#ifdef FLASHATTENTION_QSA_FP8
+                if constexpr (QsaFp8) {
+                    if (scores_scale(mi) != 1.f) { acc_o_rowcol(mi, ni) *= scores_scale(mi); }
+                } else
+#endif
+                { acc_o_rowcol(mi, ni) *= scores_scale(mi); }
+            }
         }
     };
 
