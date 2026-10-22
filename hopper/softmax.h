@@ -265,7 +265,11 @@ struct Softmax {
                 float scores_max_cur = !Check_inf
                     ? row_max(mi)
                     : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
+#ifdef FLASHATTENTION_QSA_FP8
+                scores_scale(mi) = scores_max_prev(mi) == scores_max_cur ? 1.f : exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+#else
                 scores_scale(mi) = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+#endif  // FLASHATTENTION_QSA_FP8
                 row_sum(mi) *= scores_scale(mi);
             }
         }
@@ -280,7 +284,22 @@ struct Softmax {
         flash::template scale_apply_exp2</*Scale_max=*/true, Check_inf, Max_offset, SeparateExp2>(scores, row_max, softmax_scale_log2);
         // We don't do the reduce across threads here since we don't need to use the row_sum.
         // We do that reduce at the end when we need to normalize the softmax.
+#ifdef FLASHATTENTION_QSA_FP8
+        if constexpr (Max_offset == 8) {
+            // The numerator multiplies E4M3-rounded probabilities. Normalize
+            // the same values, preserving unit mass (and constant V).
+            auto rounded = make_fragment_like(scores);
+            #pragma unroll
+            for (int i = 0; i < size(scores); ++i) {
+                rounded(i) = float(cutlass::float_e4m3_t(scores(i)));
+            }
+            flash::reduce_sum</*zero_init=*/Is_first, /*warp_reduce=*/false>(rounded, row_sum);
+        } else {
+            flash::reduce_sum</*zero_init=*/Is_first, /*warp_reduce=*/false>(scores, row_sum);
+        }
+#else
         flash::reduce_sum</*zero_init=*/Is_first, /*warp_reduce=*/false>(scores, row_sum);
+#endif  // FLASHATTENTION_QSA_FP8
     };
 
 
@@ -386,7 +405,11 @@ struct Softmax {
         #pragma unroll
         for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
             #pragma unroll
+#ifdef FLASHATTENTION_QSA_FP8
+            for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { if (scores_scale(mi) != 1.f) acc_o_rowcol(mi, ni) *= scores_scale(mi); }
+#else
             for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scores_scale(mi); }
+#endif  // FLASHATTENTION_QSA_FP8
         }
     };
 
