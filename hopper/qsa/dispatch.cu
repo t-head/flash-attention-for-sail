@@ -25,6 +25,8 @@ struct GqaSharedDirect256 : Gqa8Direct { static constexpr int KVStride = 256; st
 struct GqaSharedLong256 : GqaSharedDirect256 { static constexpr int RowBytes = 256; static constexpr bool PredicatedQ = false; };
 struct GqaSharedVarlen256 : GqaSharedDirect256 { static constexpr bool SingleTile = false; };
 struct GqaSharedDirect512 : Gqa8Direct { static constexpr bool FixedGroup = false, DirectGroupIndex = true; };
+// Group adjacent queries by KV head.
+struct GqaSharedQueryFirst512 : GqaSharedDirect512 { static constexpr bool QueryFirst = true; };
 struct GqaSharedVarlen512 : GqaSharedDirect512 { static constexpr bool SingleTile = false; };
 struct GqaSharedWarpN : GqaSharedDirect256 {
     static constexpr int Warps = 4, Stages = 2;
@@ -37,6 +39,7 @@ struct Sm80WarpN : GqaSharedWarpNShort {
     static constexpr bool QRegs = true, TsmQ = false;
 };
 struct Sm80WarpN2 : Sm80WarpN { static constexpr int Warps = 2; };
+struct Sm80WarpN1 : Sm80WarpN2 { static constexpr int Warps = 1; };
 struct Sm80WarpNM8 : Sm80WarpN2 { static constexpr int M = 8; };
 struct Gqa3Direct : Gqa8Direct { static constexpr int Group = 3, KVStride = 256; };
 struct Gqa3WarpN : Gqa3Direct {
@@ -306,6 +309,10 @@ bool run_qsa(Flash_fwd_params &p, hggcStream_t stream) {
     using namespace qsa;
     if (!qsa_config_supported(p)) { return false; }
     if (p.arch == 80) {
+        if (p.num_splits <= 1 && qsa_small_decode_2048(p) && p.h == 12 * p.h_k) {
+            launch<Sm80WarpN1, false, false, 80>(p, stream);
+            return true;
+        }
         if (p.num_splits <= 1 || int64_t(p.b) * p.h_k > 16 || !qsa_small_decode_2048(p)
             || (p.h != 3 * p.h_k && p.h != 6 * p.h_k && p.h != 12 * p.h_k)
             || (p.k_row_stride != 256 && p.k_row_stride != 512)
@@ -362,6 +369,11 @@ bool run_qsa(Flash_fwd_params &p, hggcStream_t stream) {
             if (direct_grid && split && p.b <= 2 && p.h_k == 2
                 && small_decode_2048) {
                 launch<Gqa12WarpN512, true>(p, stream);
+            } else if (direct_grid && !split && p.total_q >= 512 && p.h_k == 2
+                       && small_decode_2048
+                       // Interleave heads for small batches over large caches.
+                       && (p.total_q >= 4096 || int64_t(p.num_pages) * p.page_size < 16384)) {
+                launch<GqaSharedQueryFirst512, false>(p, stream);
             } else if (direct_grid) { launch<GqaSharedDirect512>(p, stream); }
             else { launch<GqaSharedVarlen512>(p, stream); }
             return true;

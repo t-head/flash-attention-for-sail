@@ -18,11 +18,11 @@ using namespace cute;
 
 #if defined(USE_PPU) && USE_AIU
 template <int kBlockN, int kHeadDim, int kHeadDimV, int NumThreads, typename Element, bool KV_Same_Iter=false, int LoadsPerRow_LB=1, bool PagedKVAiu=false, int kBlockNPagedPerAiuLoad=16, bool Is_QSA=false
-          , class QsaConfig = flash::QsaConfig
+          , class QsaConfig = flash::QsaConfig, bool ReuseQsaTokenIndex=false
           >
 #else
 template <int kBlockN, int kHeadDim, int kHeadDimV, int NumThreads, typename Element, bool KV_Same_Iter=false, int LoadsPerRow_LB=1, bool Is_QSA=false
-          , class QsaConfig = flash::QsaConfig
+          , class QsaConfig = flash::QsaConfig, bool ReuseQsaTokenIndex=false
           >
 #endif
 struct PagedKVManager {
@@ -96,6 +96,17 @@ struct PagedKVManager {
     using TensorPageOffset = decltype(make_tensor<cute::tuple<int64_t, int>>(Shape<Int<kPageEntryPerThread>>{}));
 #endif
     using TensorKVPtr = decltype(make_tensor<Element*>(Shape<Int<kPageEntryPerThread>>{}));
+    // Stage 1 reuses each K token index for V.
+    static_assert(!ReuseQsaTokenIndex || (Is_QSA && QsaConfig::Stages == 1 && KV_Same_Iter
+        && QsaConfig::DirectIndex && QsaConfig::RowBytes == 128
+        && kBlockN == 16 && NumThreads == 32 && kHeadDim == 256 && kHeadDimV == 256
+        && std::is_same_v<Element, cutlass::bfloat16_t>));
+#if defined(USE_PPU) && USE_AIU
+    static_assert(!ReuseQsaTokenIndex || !PagedKVAiu);
+#endif
+    using TensorQsaTokens = decltype(make_tensor<int>(make_shape(size<1>(TensortKcK{}))));
+    TensorQsaTokens qsa_tokens;
+
 
     GmemTiledCopyKVCpAsync gmem_tiled_copy_kv;
     cutlass::FastDivmod const &page_size_divmod;
@@ -597,6 +608,7 @@ struct PagedKVManager {
                 } else {
                     token = should_load ? __ldg(&mPageTable[row_idx]) : -1;
                 }
+                if constexpr (ReuseQsaTokenIndex) { qsa_tokens(m) = token; }
                 k_ptr = token >= 0 ? raw_pointer_cast(mK_paged.data()) + int64_t(token) * (QsaConfig::KVStride ? QsaConfig::KVStride : get<0>(stride(mK_paged.layout()))) : nullptr;
             } else { k_ptr = reinterpret_cast<Element const*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrKPtr(m / kGmemThreadsPerRow)), (m % kGmemThreadsPerRow), kGmemThreadsPerRow)); }
             if constexpr (Is_QSA && !QsaConfig::RowBytes) {
@@ -696,7 +708,9 @@ struct PagedKVManager {
                 if constexpr (QsaConfig::DirectIndex) {
                     int const row_idx = n_block * kBlockN + get<0>(tVcV(_0{}, m, _0{}));
                     int token;
-                    if constexpr (QsaConfig::RowBytes == 512) {
+                    if constexpr (ReuseQsaTokenIndex) {
+                        token = qsa_tokens(m);
+                    } else if constexpr (QsaConfig::RowBytes == 512) {
                         static_assert(kGmemThreadsPerRow == 32);
                         token = __ppu_read_firstlane(should_load)
                             ? __ld_smem(&mPageTable[__ppu_read_firstlane(row_idx)]) : -1;

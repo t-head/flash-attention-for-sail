@@ -572,7 +572,7 @@ struct CollectiveMainloopFwdSm80 {
                 };
     }
 
-    template <typename SharedStorage, typename FrgTensorO, typename Softmax>
+    template <bool ReuseTokens=false, typename SharedStorage, typename FrgTensorO, typename Softmax>
     CUTLASS_DEVICE bool
     mma(Params const& params,
         FrgTensorO& tOrO,
@@ -582,6 +582,13 @@ struct CollectiveMainloopFwdSm80 {
         cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
         SharedStorage& shared_storage
         ) {
+        if constexpr (!ReuseTokens && Is_QSA && QsaConfig::QueryFirst && !Split) {
+            if (std::min(seqlen_info.seqlen_k, int(get<1>(params.shape_pagetable))) >= 2048
+                && (get<0>(params.shape_Q) >= 8192
+                    || int64_t(get<0>(params.shape_K)) * get<3>(params.shape_K) < 65536)) {
+                return mma<true>(params, tOrO, softmax, thread_idx, seqlen_info, block_coord, shared_storage);
+            }
+        }
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
@@ -793,11 +800,11 @@ struct CollectiveMainloopFwdSm80 {
 
 #if defined(USE_PPU) && USE_AIU
         using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumMmaThreads, Element, true /*KV_Same_Iter*/, 1 /*LoadsPerRow_LB*/, PagedKVAiu, kBlockNPagedPerAiuLoad, Is_QSA
-            , QsaConfig
+            , QsaConfig, ReuseTokens
             >;
 #else
         using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumMmaThreads, Element, true /*KV_Same_Iter*/, 1 /*LoadsPerRow_LB*/, Is_QSA
-            , QsaConfig
+            , QsaConfig, ReuseTokens
             >;
 #endif
 #if defined(USE_PPU) && !defined(FLASHATTENTION_DISABLE_FP8)
