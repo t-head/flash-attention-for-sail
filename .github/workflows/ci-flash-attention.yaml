@@ -51,13 +51,3 @@ jobs:
     with:
       version: ${{ github.base_ref }}
     secrets: inherit
-
-  # Stage 5: PyTorch integration tests for v2.7.2.
-  fa-pytorch-tests-ppu:
-    name: flash-attention PyTorch Tests PPU (${{ github.base_ref }})
-    needs: precheck
-    if: github.event_name == 'pull_request' && github.base_ref == 'v2.7.2'
-    uses: ./.github/workflows/pr-fa-pytorch-test-ppu.yaml
-    with:
-      version: ${{ github.base_ref }}
-    secrets: inherit

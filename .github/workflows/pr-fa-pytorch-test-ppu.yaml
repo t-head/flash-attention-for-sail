@@ -1,20 +1,9 @@
-# Reusable workflow for flash-attention-for-sail PyTorch integration tests on PPU.
+# Manual workflow for flash-attention-for-sail PyTorch integration tests on PPU.
 # Mirrors pr-fa-test-ppu.yaml but builds PyTorch from source with flash-attention
 # integrated and runs PyTorch's own distributed/attention tests via pytest.
 name: flash-attention PyTorch Tests PPU
 
 on:
-  workflow_call:
-    inputs:
-      version:
-        description: 'Target branch name (v2.7.2): job names and NAS paths.'
-        required: true
-        type: string
-      matrix:
-        description: 'JSON list of runners, e.g. ["OAM-810E","ZW-M890P"].'
-        required: false
-        type: string
-        default: '["OAM-810E","ZW-M890P"]'
   workflow_dispatch:
     inputs:
       version:
