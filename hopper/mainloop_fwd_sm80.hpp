@@ -163,6 +163,7 @@ struct CollectiveMainloopFwdSm80 {
 #else
     using MMA_Atom_Arch = MMA_Atom_Default;
 #endif
+    static constexpr int kMmaM = size<0>(typename MMA_Atom_Arch::Shape_MNK{});
     using TiledMma = TiledMMA<
         MMA_Atom_Arch,
         std::conditional_t<QsaReplicateQK,
@@ -171,8 +172,8 @@ struct CollectiveMainloopFwdSm80 {
         std::conditional_t<QsaReplicateQK,
                            Tile<Int<kBlockM>, Int<16 * kNWarps>, _16>,
         std::conditional_t<std::is_same_v<Element, cutlass::float_e4m3_t>,
-                           Tile<Int<16 * kNWarps>, _16, _32>,
-                           Tile<Int<16 * kNWarps>, _16, _16>>>>;
+                           Tile<Int<kMmaM * kNWarps>, _16, _32>,
+                           Tile<Int<kMmaM * kNWarps>, _16, _16>>>>;
 
 #if defined(USE_PPU) && !defined(FLASHATTENTION_DISABLE_FP8)
     // Epilogue twin of TiledMma for the zero-shfl FP8 V-direct PV path
@@ -293,7 +294,7 @@ struct CollectiveMainloopFwdSm80 {
     // TSM reads shared memory only; global QSA K/V loads remain cp.async.
     static constexpr bool QsaTsmQ = QsaConfig::TsmQ && Is_QSA && PackGQA;
     static constexpr bool QsaTsmKV = QsaConfig::TsmKV && Is_QSA && !PagedKVAiu;
-    using SmemCopyAtomQ = std::conditional_t<!PackGQA || QsaTsmQ, Copy_Atom<SmemCopyOpQ, Element>, std::conditional_t<QsaReplicateQK && kBlockM == 8, Copy_Atom<PPU_U32x2_LDSM_N, Element>, SmemCopyAtom>>;
+    using SmemCopyAtomQ = std::conditional_t<!PackGQA || QsaTsmQ, Copy_Atom<SmemCopyOpQ, Element>, std::conditional_t<Is_QSA && kBlockM == 8, Copy_Atom<PPU_U32x2_LDSM_N, Element>, SmemCopyAtom>>;
     using SmemCopyAtomK = std::conditional_t<!PagedKV || PagedKVAiu || QsaTsmKV, Copy_Atom<SmemCopyOpK, Element>, SmemCopyAtom>;
     using SmemCopyAtomKVt = std::conditional_t<!PagedKV || PagedKVAiu || QsaTsmKV, Copy_Atom<SmemCopyOpKVt, Element>, SmemCopyAtomTransposed>;
 #else
@@ -572,7 +573,7 @@ struct CollectiveMainloopFwdSm80 {
                 };
     }
 
-    template <typename SharedStorage, typename FrgTensorO, typename Softmax>
+    template <bool ReuseTokens=false, typename SharedStorage, typename FrgTensorO, typename Softmax>
     CUTLASS_DEVICE bool
     mma(Params const& params,
         FrgTensorO& tOrO,
@@ -582,6 +583,13 @@ struct CollectiveMainloopFwdSm80 {
         cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
         SharedStorage& shared_storage
         ) {
+        if constexpr (!ReuseTokens && Is_QSA && QsaConfig::QueryFirst && !Split) {
+            if (std::min(seqlen_info.seqlen_k, int(get<1>(params.shape_pagetable))) >= 2048
+                && (get<0>(params.shape_Q) >= 8192
+                    || int64_t(get<0>(params.shape_K)) * get<3>(params.shape_K) < 65536)) {
+                return mma<true>(params, tOrO, softmax, thread_idx, seqlen_info, block_coord, shared_storage);
+            }
+        }
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
@@ -793,11 +801,11 @@ struct CollectiveMainloopFwdSm80 {
 
 #if defined(USE_PPU) && USE_AIU
         using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumMmaThreads, Element, true /*KV_Same_Iter*/, 1 /*LoadsPerRow_LB*/, PagedKVAiu, kBlockNPagedPerAiuLoad, Is_QSA
-            , QsaConfig
+            , QsaConfig, ReuseTokens
             >;
 #else
         using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumMmaThreads, Element, true /*KV_Same_Iter*/, 1 /*LoadsPerRow_LB*/, Is_QSA
-            , QsaConfig
+            , QsaConfig, ReuseTokens
             >;
 #endif
 #if defined(USE_PPU) && !defined(FLASHATTENTION_DISABLE_FP8)
