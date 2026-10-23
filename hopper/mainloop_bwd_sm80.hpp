@@ -1622,6 +1622,9 @@ struct CollectiveMainloopBwdSm80 {
                     if constexpr (Has_softcap) { dS(mi, ni) *= dtanh(mi, ni); }
                 }
             }
+            if (__builtin_expect(seqlen_k <= 1, 0)) {
+                clear(dS);
+            }
 
             // Convert scores from fp32 to fp16/bf16
             Tensor rP = make_tensor_like<Element>(tSrS);
