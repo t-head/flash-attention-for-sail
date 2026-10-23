@@ -304,6 +304,11 @@ bool run_qsa_decode_combine(Flash_fwd_params const& p, hggcStream_t stream) {
 
 bool run_qsa(Flash_fwd_params &p, hggcStream_t stream) {
     using namespace qsa;
+#ifndef FLASHATTENTION_DISABLE_FP8
+    if (qsa_fp8_config_supported(p) && p.pack_gqa) {
+        return run_qsa_fp8(p, stream);
+    }
+#endif
     if (!qsa_config_supported(p)) { return false; }
     if (p.arch == 80) {
         if (p.num_splits <= 1 || int64_t(p.b) * p.h_k > 16 || !qsa_small_decode_2048(p)

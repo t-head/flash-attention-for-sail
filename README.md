@@ -327,7 +327,7 @@ def flash_attn_qkvpacked_func(qkv, softmax_scale=None, causal=False,
         softmax_scale: float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
-        q_descale, k_descale, v_descale: (batch_size, nheads), fp32. Descale factors used for the
+        q_descale, k_descale, v_descale: (batch_size, nheads_k), fp32. Descale factors used for the
             FP8 forward pass. Set to None for FP16 / BF16.
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
         attention_chunk: int. If > 0, applies chunked (block-diagonal) attention of this chunk size.
@@ -364,7 +364,7 @@ def flash_attn_func(q, k, v, softmax_scale=None, causal=False, qv=None,
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
         qv [optional]: (batch_size, seqlen, nheads, headdim_v). Extra value tensor added to the output.
-        q_descale, k_descale, v_descale: (batch_size, nheads), fp32. Descale factors for the FP8
+        q_descale, k_descale, v_descale: (batch_size, nheads_k), fp32. Descale factors for the FP8
             forward pass. Set to None for FP16 / BF16.
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
         attention_chunk: int. If > 0, applies chunked (block-diagonal) attention of this chunk size.
@@ -490,7 +490,23 @@ def flash_attn_with_kvcache(
             Pass (total_q, 1, topk) instead to select query-sparse attention (QSA), where each row
             holds the token indices selected for one unpadded query token. Requires head dim 256,
             cu_seqlens_q, no cache_batch_idx, and a build with FLASH_ATTENTION_ENABLE_QSA.
-        q_descale, k_descale, v_descale: (batch_size, nheads), fp32. Descale factors for the FP8
+            Entries are physical KV cache row indices. Pack valid indices first. For causal QSA,
+            query i in a sequence of length L uses sparse columns c < topk and
+            c < cache_seqlens[b] - L + i + 1. Single-query sequences therefore use the first
+            cache_seqlens[b] columns. The caller must supply initialized, in-range, causally
+            visible slots belonging to that request; no absolute-token causal mask is applied.
+            On PPU0015, FP8 QSA supports E4M3 Q/K/V with Dqk=Dv=256, H divisible by Hkv,
+            and 1..32 query heads per KV head, matching the BF16 QSA size range. Arbitrary
+            positive page sizes, multiple queries per sequence and variable query lengths
+            are supported. Q/K/V head dimensions must be contiguous with 16-byte-aligned
+            pointers and outer strides. Pass causal=True and cache_seqlens.
+            Contiguous page-size-64 single-query H6:1 and H24:2 retain tuned kernels.
+            Supply FP32 q_descale/k_descale/v_descale of shape (batch_size, nheads_k).
+            Quantization/calibration belongs to the caller. FP8 QSA does not support AIU,
+            local/softcap/rotary/auxiliary modes; num_splits=0 selects automatic splitting,
+            1 selects unsplit attention, and 2–128 explicitly split KV. Splitting may change
+            E4M3 probability rounding. FP8 QSA remains experimental pending model validation.
+        q_descale, k_descale, v_descale: (batch_size, nheads_k), fp32. Descale factors for the FP8
             forward pass. Set to None for FP16 / BF16.
         softmax_scale: float. The scaling of QK^T before applying softmax. Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).

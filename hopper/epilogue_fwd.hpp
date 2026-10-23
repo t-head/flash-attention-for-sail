@@ -238,9 +238,29 @@ struct CollectiveEpilogueFwd {
 #endif
     }
 
+#ifdef FLASHATTENTION_QSA_FP8
+    CUTLASS_DEVICE static Params output_part_params(Params const& original) {
+        Params p = original;
+        if constexpr (QsaConfig::VParts > 1) {
+            int const part = blockIdx.x % QsaConfig::VParts;
+            constexpr int PartDim = 256 / QsaConfig::VParts;
+            p.ptr_O += part * PartDim;
+            if (p.ptr_O_partial) { p.ptr_O_partial += part * PartDim; }
+            int64_t const lse_size = int64_t(get<0>(p.shape_O)) * get<2>(p.shape_O) * get<3>(p.shape_O);
+            p.ptr_LSE += part * lse_size;
+            if (p.ptr_LSE_partial) { p.ptr_LSE_partial += part * lse_size * get<4>(p.shape_O); }
+        }
+        return p;
+    }
+
+#endif  // FLASHATTENTION_QSA_FP8
     template <typename SharedStorage, typename FrgTensorO, typename FrgTensorLSE, typename TiledMma, typename TiledMmaLSE = TiledMma>
     CUTLASS_DEVICE void
+#ifdef FLASHATTENTION_QSA_FP8
+    store(Params const& original,
+#else
     store(Params const& params,
+#endif
           FrgTensorO& tOrO,
           FrgTensorLSE const& lse,
           SharedStorage& shared_storage,
@@ -249,6 +269,9 @@ struct CollectiveEpilogueFwd {
           cute::tuple<int32_t, int32_t, int32_t, int32_t> const& block_coord,
           TiledMmaLSE tiled_mma_lse = {}
           ) {
+#ifdef FLASHATTENTION_QSA_FP8
+        Params params=output_part_params(original);
+#endif
 
         auto [m_block, bidh, bidb, split_idx] = block_coord;
         int num_splits = get<4>(params.shape_O_packed);
@@ -471,10 +494,17 @@ struct CollectiveEpilogueFwd {
     // Write 0 to output and -inf to LSE
     CUTLASS_DEVICE void
     store_zero(
+#ifdef FLASHATTENTION_QSA_FP8
+         Params const& original,
+#else
          Params const& params,
+#endif  // FLASHATTENTION_QSA_FP8
          int thread_idx,
          cute::tuple<int32_t, int32_t, int32_t, int32_t> const& block_coord
          ) {
+#ifdef FLASHATTENTION_QSA_FP8
+        Params params=output_part_params(original);
+#endif  // FLASHATTENTION_QSA_FP8
         static constexpr int kBlockM = get<0>(TileShape_MNK_PV{});
         auto [m_block, bidh, bidb, split_idx] = block_coord;
         int num_splits = get<4>(params.shape_O_packed);
