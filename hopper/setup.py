@@ -199,7 +199,6 @@ if not SKIP_CUDA_BUILD:
         "-DCUTLASS_ENABLE_GDC_FOR_SM90",
         "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
         "-DNDEBUG",
-        "-mllvm", "-ppu-max-vreg-count=256",
         "-mllvm", "-ppu-sink-matrix-addr=true",
         "-mllvm", "-ppu-max-alloca-byte-size=320",
         "-mllvm", "-ppu-sink-async-addr=true",

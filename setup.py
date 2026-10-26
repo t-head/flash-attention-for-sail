@@ -81,7 +81,6 @@ if not SKIP_KERNEL_BUILD:
         "--expt-relaxed-constexpr",
         "--expt-extended-lambda",
         "--use_fast_math",
-        "-mllvm", "-ppu-max-vreg-count=256",
         "-mllvm", "-ppu-sink-matrix-addr=true",
         "-mllvm", "-ppu-max-alloca-byte-size=320",
         "-mllvm", "-ppu-sink-async-addr=true",
