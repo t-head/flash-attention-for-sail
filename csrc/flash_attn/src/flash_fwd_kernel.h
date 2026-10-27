@@ -395,7 +395,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 rP_drop, block_row_idx, block_col_idx, kNWarps
             );
 
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10500
+            cute::copy_if(cute::TrivialPredTensor{}, rP_drop, tSgS);
+#else
             cute::copy(rP_drop, tSgS);
+#endif
 
             tSgS.data() = tSgS.data() + (-kBlockN);
         }
@@ -410,7 +414,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
 #if defined USE_PPU && ACOMPUTE_VERSION==10000
-        Tensor rP = flash::convert_acc<Element>(acc_s);
+        constexpr bool kScalarStores = !(
+            std::is_same<Element, cutlass::bfloat16_t>::value &&
+            Kernel_traits::kHeadDim == 96 && kBlockM == 128 && kBlockN == 64 &&
+            !Is_dropout && !Is_causal && !Is_local && !Has_alibi &&
+            !Is_even_K && !Is_softcap);
+        Tensor rP = flash::convert_acc<Element, kScalarStores>(acc_s);
         Tensor tOrP = make_tensor(rP.data(), make_layout(get<0>(tSrQ.layout()), get<1>(acc_s.layout()), get<2>(acc_s.layout())));
 #else
         Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
@@ -473,7 +482,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                 rP_drop, block_row_idx, block_col_idx, kNWarps
             );
 
+#if defined(USE_PPU) && ACOMPUTE_VERSION == 10500
+            cute::copy_if(cute::TrivialPredTensor{}, rP_drop, tSgS);
+#else
             cute::copy(rP_drop, tSgS);
+#endif
             tSgS.data() = tSgS.data() + (-kBlockN);
         }
         if (Is_dropout) {
@@ -488,7 +501,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
 
 #if defined USE_PPU && ACOMPUTE_VERSION==10000
-        Tensor rP = flash::convert_acc<Element>(acc_s);
+        constexpr bool kScalarStores = !(
+            std::is_same<Element, cutlass::bfloat16_t>::value &&
+            Kernel_traits::kHeadDim == 96 && kBlockM == 128 && kBlockN == 64 &&
+            !Is_dropout && !Is_causal && !Is_local && !Has_alibi &&
+            !Is_even_K && !Is_softcap);
+        Tensor rP = flash::convert_acc<Element, kScalarStores>(acc_s);
 
         Tensor tOrP = make_tensor(rP.data(), make_layout(get<0>(tSrQ.layout()), get<1>(acc_s.layout()), get<2>(acc_s.layout())));
 #else
