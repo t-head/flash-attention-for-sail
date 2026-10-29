@@ -440,17 +440,17 @@ template<bool A_in_regs=false, bool B_in_regs=false, bool SwapAB=false,
          typename Tensor0, typename Tensor1,
          typename Tensor2, typename Tensor3, typename Tensor4,
          typename TiledMma, typename TiledCopyA, typename TiledCopyB,
-         typename ThrCopyA, typename ThrCopyB, typename Hook>
+         typename ThrCopyA, typename ThrCopyB, typename Hook, typename FragmentHook = std::nullptr_t>
 CUTLASS_DEVICE void gemm_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsA,
                               Tensor4 const& tCsB, TiledMma tiled_mma,
                               TiledCopyA smem_tiled_copy_A, TiledCopyB smem_tiled_copy_B,
-                              ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B, Hook fn) {
+                              ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B, Hook fn, FragmentHook after_fragment = nullptr) {
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
     static_assert(PrefetchB == 1 || PrefetchB == 2);
     static_assert(PrefetchB == 1 || (A_in_regs && !B_in_regs && !SwapAB));
 #endif
     if constexpr (SwapAB) {
-        gemm_sm80<B_in_regs, A_in_regs>(acc, tCrB, tCrA, tCsB, tCsA, tiled_mma, smem_tiled_copy_B, smem_tiled_copy_A, smem_thr_copy_B, smem_thr_copy_A, fn);
+        gemm_sm80<B_in_regs, A_in_regs>(acc, tCrB, tCrA, tCsB, tCsA, tiled_mma, smem_tiled_copy_B, smem_tiled_copy_A, smem_thr_copy_B, smem_thr_copy_A, fn, after_fragment);
     } else {
         CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
         CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
@@ -489,6 +489,8 @@ CUTLASS_DEVICE void gemm_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor
             if constexpr (PrefetchB == 2) { __ppu_sched_bound(); }
 #endif
             cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+            // Release dependent warp groups after this reduction fragment.
+            if constexpr (!std::is_same_v<FragmentHook, std::nullptr_t>) { after_fragment(i); }
         }
         }
 #else
@@ -504,6 +506,8 @@ CUTLASS_DEVICE void gemm_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor
                 if (i == 0) { fn(); }
             }
             cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+            // Release dependent warp groups after this reduction fragment.
+            if constexpr (!std::is_same_v<FragmentHook, std::nullptr_t>) { after_fragment(i); }
         }
 #endif
     }
@@ -567,11 +571,14 @@ CUTLASS_DEVICE void gemm_sm80_kv_paged_aiu(Tensor0 &acc, Tensor1 &tCrA, Tensor2 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// The optional hook follows the final shared-memory B load, before its MMA.
+// Callers may retire the shared slot after synchronizing those reads; the
+// remaining MMA consumes registers. Ordinary callers have no hook or overhead.
 template<typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
-         typename TiledMma, typename TiledCopy, typename ThrCopy>
+         typename TiledMma, typename TiledCopy, typename ThrCopy, typename ReadDoneHook = std::nullptr_t>
 CUTLASS_DEVICE void gemm_rs_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsB,
                                  TiledMma tiled_mma, TiledCopy smem_tiled_copy_B,
-                                 ThrCopy smem_thr_copy_B) {
+                                 ThrCopy smem_thr_copy_B, ReadDoneHook reads_done = nullptr) {
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
     CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
     CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
@@ -583,6 +590,9 @@ CUTLASS_DEVICE void gemm_rs_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Ten
     #pragma unroll
     for (int i = 0; i < size<2>(tCrA); ++i) {
         cute::copy(smem_tiled_copy_B, tCsB(_, _, i), tCrB_copy_view(_, _, i));
+        if constexpr (!std::is_same_v<ReadDoneHook, std::nullptr_t>) {
+            if (i + 1 == size<2>(tCrA)) { reads_done(); }
+        }
         cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
     }
     }
@@ -592,6 +602,9 @@ CUTLASS_DEVICE void gemm_rs_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Ten
     for (int i = 0; i < size<2>(tCrA); ++i) {
         if (i < size<2>(tCrA) - 1) {
             cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
+        }
+        if constexpr (!std::is_same_v<ReadDoneHook, std::nullptr_t>) {
+            if (i + 1 == size<2>(tCrA)) { reads_done(); }
         }
         cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
     }
