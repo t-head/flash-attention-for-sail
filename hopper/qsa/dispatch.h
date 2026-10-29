@@ -5,7 +5,9 @@ namespace flash {
 struct QsaConfig {
     static constexpr int M = 0, N = 0, Warps = 0, Stages = 0, Group = 1;
     static constexpr int RowBytes = 0, KVStride = 0;
+    static constexpr int PrefetchB = 1;
     static constexpr bool QRegs = false, TsmQ = false, TsmKV = false;
+    static constexpr bool NativeK = false;
     static constexpr bool FixedGroup = false, DirectIndex = false, SingleTile = false;
     static constexpr bool DirectGroupIndex = false;
     static constexpr bool PredicatedQ = true;
