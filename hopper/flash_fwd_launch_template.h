@@ -42,7 +42,8 @@ template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element,
 #endif
 #ifdef USE_PPU
           bool PackGQA, bool Split, bool V_colmajor, bool kBlockM128, bool kBlockM16, bool kBlockN16, bool Is_QSA=false
-          , class QsaConfig = flash::QsaConfig
+          , class QsaConfig = flash::QsaConfig,
+          bool PrefillInterleave = false
           >
 #else
           bool PackGQA, bool Split, bool V_colmajor>
@@ -108,7 +109,7 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
 #if defined(USE_PPU) && USE_AIU
     static constexpr int kBlockNPagedPerAiuLoad = kBlockN % kBlockNPagedPerAiuLoad_ == 0 ? kBlockNPagedPerAiuLoad_ : 16;   // kBlockNPagedPerAiuLoad_ = 64 or 16
     using CollectiveMainloop = flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, ArchTag, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, PagedKVAiu, kBlockNPagedPerAiuLoad, AppendKV, PackGQA, Split, ElementS, Is_QSA
-            , QsaConfig
+            , QsaConfig, PrefillInterleave
             >;
 #else
     using CollectiveMainloop = flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, ArchTag, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split, ElementS, Is_QSA
@@ -394,6 +395,21 @@ void run_mha_fwd_(Flash_fwd_params &params, hggcStream_t stream) {
                                         if constexpr (kBlockM16 && (kBlockN16 || kBlockNPagedPerAiuLoad == 16)) {
                                             run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, true /*PagedKVNonTMA*/, Is_QSA && PagedKVAiu, Is_QSA ? kBlockNPagedPerAiuLoad : 1, !Is_QSA && AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, false /*kBlockM128*/, true /*kBlockM16*/, kBlockN16, Is_QSA>(params, stream);
                                         } else {
+#if !defined(FA3_HLLM_BUILD)
+                                            if constexpr (Arch == 89 && cute::is_same_v<T, cutlass::bfloat16_t>
+                                                && kHeadDim == 192 && kHeadDimV == 128 && Is_causal && !Is_local
+                                                && !Has_softcap && Varlen && !AppendKV && !HasQv && PackGQA
+                                                && !V_colmajor && !kBlockM128 && !kBlockM16 && !kBlockN16
+                                                && PagedKVAiu && kBlockNPagedPerAiuLoad == 64) {
+                                                if (params.use_prefill_warp_interleave) {
+                                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out,
+                                                        Is_causal, Is_local, Has_softcap, Varlen, true, PagedKVAiu,
+                                                        kBlockNPagedPerAiuLoad, false, false, PackGQA, Split,
+                                                        V_colmajor, false, false, false, false, flash::QsaConfig, true>(params, stream);
+                                                    return;
+                                                }
+                                            }
+#endif
                                             run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, true /*PagedKVNonTMA*/, PagedKVAiu, kBlockNPagedPerAiuLoad, !Is_QSA && AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, kBlockM128, kBlockM16, false /*kBlockN16*/, Is_QSA>(params, stream);
                                         }
                                     });

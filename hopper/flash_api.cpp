@@ -607,6 +607,43 @@ static bool run_qsa_sm80_split_tail(Flash_fwd_params const& p, at::Tensor const&
 }
 #endif
 
+#if defined(USE_PPU) && USE_AIU && !defined(FA3_HLLM_BUILD)
+inline bool get_prefill_warp_interleave(Flash_fwd_params const& params) {
+    constexpr int kMinKvCapacity = 1024;
+    constexpr int kMinQueryTilesPerSm = 3;
+    if (params.arch != 89 || !params.is_bf16 || params.is_local || params.is_qsa
+        || params.use_kblockm_16 || params.use_kblockm_128 || params.use_kblockn_16
+        || params.num_sm <= 0
+        || params.num_splits < 1 || params.num_splits > 256
+        || params.b <= 0 || params.total_q <= 0 || params.seqlen_q <= 16
+        || params.d != 192 || params.dv != 128 || !params.cu_seqlens_q
+        || params.seqused_q || params.leftpad_k || params.kv_batch_idx
+        || params.knew_ptr || params.vnew_ptr || params.qv_ptr || params.rotary_cos_ptr
+        || params.softcap != 0.f || params.attention_chunk != 0
+        || params.q_head_stride != 192 || params.q_row_stride != params.h * 192
+        || params.o_head_stride != 128 || params.o_row_stride != params.h * 128
+        || params.v_dim_stride != 1) {
+        return false;
+    }
+    if (params.page_table) {
+        if (!params.is_causal || !params.pack_gqa
+            || params.h != 16 || params.h_k != 1 || params.page_size != 64
+            || !params.seqused_k || params.cu_seqlens_k
+            || params.seqlen_k < kMinKvCapacity
+            || params.k_row_stride != 192 || params.k_batch_stride != 64 * 192
+            || params.v_row_stride != 128 || params.v_batch_stride != 64 * 128) {
+            return false;
+        }
+        int const qhead_per_khead = params.h / params.h_k;
+        int64_t const query_tiles = (int64_t(params.total_q) * qhead_per_khead + 63) / 64;
+        // Aggregate packed-Q work per KV head. This empirical cutoff is not a
+        // wave count: the persistent grid also depends on resident blocks/SM.
+        return query_tiles >= int64_t(kMinQueryTilesPerSm) * params.num_sm;
+    }
+    return false;
+}
+#endif
+
 inline bool get_pagedkv_tma(Flash_fwd_params const& params) {
     if (params.arch < 90 || !params.page_table || params.leftpad_k || params.knew_ptr) { return false; }
     // This needs to match the kernel configs
@@ -1810,6 +1847,11 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     } else {
         params.s_aux_ptr = nullptr;
     }
+
+#if defined(USE_PPU) && USE_AIU && !defined(FA3_HLLM_BUILD)
+    // Select the prefill schedule after layout and split parameters are finalized.
+    params.use_prefill_warp_interleave = get_prefill_warp_interleave(params);
+#endif
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
     TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
