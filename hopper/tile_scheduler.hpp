@@ -153,10 +153,13 @@ class DynamicPersistentTileSchedulerSM80 {
 
 public:
 
-    using SharedStorage = int;
+    struct SharedStorage {
+        int tile_count[2];
+    };
 
 protected:
     SharedStorage* const tile_count_smem;
+    mutable unsigned int next_slot = 0;
 
 public:
     // Device side kernel params
@@ -306,15 +309,17 @@ public:
     WorkTileInfo
     get_next_work(Params const& params, WorkTileInfo const& current_work) const {
         int const warp_idx = cutlass::canonical_warp_idx_sync();
+        unsigned int const slot = next_slot;
         if (warp_idx == 0) {
             int lane_id = __ppu_read_laneid();
             int tile_idx = atomicAdd(&params.tile_count_semaphore[lane_id], 1);
             if (lane_id == 0) {
-                *tile_count_smem = tile_idx;
+                tile_count_smem->tile_count[slot] = tile_idx;
             }
         }
         __syncthreads();
-        int tile_idx = __ppu_read_firstlane(*tile_count_smem) + int(gridDim.x);
+        int tile_idx = __ppu_read_firstlane(tile_count_smem->tile_count[slot]) + int(gridDim.x);
+        next_slot ^= 1;
         return {tile_idx, current_work.tile_idx, current_work.block_idx, current_work.split_idx, current_work.bidh, current_work.bidb};
     }
 
