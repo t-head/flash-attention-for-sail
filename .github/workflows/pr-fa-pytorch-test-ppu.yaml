@@ -12,10 +12,10 @@ on:
         type: string
         default: v2.7.2
       matrix:
-        description: 'JSON list of runners, e.g. ["OAM-810E","ZW-M890P"].'
+        description: 'JSON list of runners, e.g. ["ZW-810E","ZW-M890P"].'
         required: false
         type: string
-        default: '["OAM-810E","ZW-M890P"]'
+        default: '["ZW-810E","ZW-M890P"]'
 
 permissions:
   contents: read
@@ -39,7 +39,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJson(inputs.matrix || '["OAM-810E","ZW-M890P"]') }}
+        runner: ${{ fromJson(inputs.matrix || '["ZW-810E","ZW-M890P"]') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -49,7 +49,7 @@ jobs:
 
       - name: Build and Test PyTorch on ${{ matrix.runner }}
         id: ppu-test
-        uses: t-head/ppu-scheduler-action@main
+        uses: t-head/ci-infra/cluster-run@main
         with:
           image: ${{ env.SAIL_IMAGE }}
           container_options: |
@@ -95,7 +95,7 @@ jobs:
             export python_version=py312
             # 810E uses ppu (ppu_10); 890 uses ppu1.5 (ppu_15).
             case '${{ matrix.runner }}' in
-              OAM-810E)  product=ppu ;;
+              ZW-810E)  product=ppu ;;
               ZW-M890P)  product=ppu1.5 ;;
               *)         echo "Unknown runner: ${{ matrix.runner }}"; exit 1 ;;
             esac
