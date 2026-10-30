@@ -345,5 +345,297 @@ def test_qsa_fwd_direct_causal_matches_kvcache():
         f"max diff {(out_fwd.float() - out_kv.float()).abs().max().item()}"
 
 
+def _fp8_qsa_inputs(heads, kv_heads, width, rows=3):
+    torch.manual_seed(20261017)
+    capacity = 128
+    q = torch.randn(rows, heads, 256, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(capacity, 2, kv_heads, 256, device="cuda", dtype=torch.bfloat16)
+    k, v = kv[:, 0], kv[:, 1]
+    k, v = k.contiguous(), v.contiguous()
+    slots = torch.randint(capacity, (rows, width), device="cuda", dtype=torch.int32)
+    if rows > 1:
+        slots[0] = -1
+    if rows > 2:
+        slots[1, 1:] = -1
+    counts = (slots >= 0).sum(-1, dtype=torch.int32)
+    pages = slots.clamp_min(0)[:, None, :]
+    cu = torch.arange(rows + 1, device="cuda", dtype=torch.int32)
+    q, k, v = ((x.float() / scale).clamp(-448, 448).to(torch.float8_e4m3fn).contiguous()
+               for x, scale in ((q, .02), (k, .025), (v, .025)))
+    descales = {name: torch.full((rows, kv_heads), scale, device="cuda")
+                for name, scale in (("q_descale", .02), ("k_descale", .025), ("v_descale", .025))}
+    return q, k.reshape(-1, 64, kv_heads, 256), v.reshape(-1, 64, kv_heads, 256), slots, pages, counts, cu, descales
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires PPU")
+@pytest.mark.parametrize("heads,kv_heads", [(6, 1), (24, 2)])
+@pytest.mark.parametrize("width", [1, 17, 65, 2051])
+@pytest.mark.parametrize("splits", [0, 1, 4, 32, 128])
+def test_fp8_single_query_qsa(heads, kv_heads, width, splits):
+    from flash_attn_interface import flash_attn_with_kvcache
+
+    q, k, v, slots, pages, counts, cu, descales = _fp8_qsa_inputs(heads, kv_heads, width)
+    if torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("FP8 QSA requires PPU0015")
+    try:
+        out, lse, *_ = flash_attn_with_kvcache(q, k, v, cache_seqlens=counts, cu_seqlens_q=cu,
+            max_seqlen_q=1, page_table=pages, softmax_scale=.0625, causal=True,
+            num_splits=splits, return_softmax_lse=True, **descales)
+    except RuntimeError as error:
+        if "QSA FP8 is not compiled in" in str(error):
+            pytest.skip(str(error))
+        raise
+    qf, kf, vf = (x.cpu().double() for x in (q, k.flatten(0, 1), v.flatten(0, 1)))
+    qf, kf, vf = qf * .02, kf * .025, vf * .025
+    expected = torch.zeros(q.shape, dtype=torch.float64)
+    for row in (1, 2):
+        ids = slots[row].cpu().long()
+        ids = ids[ids >= 0]
+        for head in range(heads):
+            scores = kf[ids, head // (heads // kv_heads)] @ qf[row, head] * .0625
+            expected[row, head] = scores.softmax(0) @ vf[ids, head // (heads // kv_heads)]
+            assert abs(float(lse[head, row]) - float(scores.logsumexp(0))) < .1
+    assert out.dtype == torch.bfloat16 and out.shape == q.shape
+    assert lse.shape == (heads, len(q)) and torch.isfinite(out).all()
+    assert torch.count_nonzero(out[0]) == 0 and torch.isneginf(lse[:, 0]).all()
+    relative = (out.cpu().double() - expected).norm() / expected.norm().clamp_min(1e-12)
+    assert relative <= .1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires PPU")
+@pytest.mark.parametrize("rows,heads,kv_heads", [
+    (1, 6, 1), (2, 6, 1), (8, 6, 1), (9, 6, 1),
+    (639, 6, 1), (640, 6, 1), (780, 6, 1), (781, 6, 1),
+    (896, 6, 1), (936, 6, 1), (937, 6, 1), (1, 24, 2), (4096, 24, 2),
+])
+def test_fp8_qsa_auto_boundaries(rows, heads, kv_heads):
+    from flash_attn_interface import flash_attn_with_kvcache
+
+    if torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("FP8 QSA requires PPU0015")
+    q, k, v, slots, pages, counts, cu, descales = _fp8_qsa_inputs(
+        heads, kv_heads, 2051, rows=rows
+    )
+    sample = sorted({0, min(1, rows - 1), rows // 2, rows - 1})
+    qf = q[sample].cpu().double().reshape(len(sample), kv_heads, -1, 256) * .02
+    kf, vf = (x.flatten(0, 1).cpu().double() * .025 for x in (k, v))
+    expected = torch.zeros((len(sample), heads, 256), dtype=torch.float64)
+    for index, row in enumerate(sample):
+        ids = slots[row].cpu().long()
+        ids = ids[ids >= 0]
+        if len(ids):
+            scores = torch.einsum("hgd,khd->hgk", qf[index], kf[ids]) * .0625
+            expected[index] = torch.einsum(
+                "hgk,khd->hgd", scores.softmax(-1), vf[ids]
+            ).reshape(heads, 256)
+    for splits in (0, 1):
+        try:
+            out = flash_attn_with_kvcache(
+                q, k, v, cache_seqlens=counts, cu_seqlens_q=cu, max_seqlen_q=1,
+                page_table=pages, softmax_scale=.0625, causal=True,
+                num_splits=splits, **descales
+            )
+        except RuntimeError as error:
+            if "QSA FP8 is not compiled in" in str(error):
+                pytest.skip(str(error))
+            raise
+        assert torch.isfinite(out).all()
+        assert torch.count_nonzero(out[counts == 0]) == 0
+        relative = (out[sample].cpu().double() - expected).norm() / expected.norm().clamp_min(1e-12)
+        assert relative <= .1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires PPU")
+@pytest.mark.parametrize("heads,kv_heads", [(6, 1), (24, 2)])
+@pytest.mark.parametrize("splits", [0, 1, 4, 128])
+def test_fp8_qsa_preserves_constant_value(heads, kv_heads, splits):
+    from flash_attn_interface import flash_attn_with_kvcache
+
+    if torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("FP8 QSA requires PPU0015")
+    q, k, v, _, pages, counts, cu, descales = _fp8_qsa_inputs(
+        heads, kv_heads, 2051
+    )
+    v = torch.full(v.shape, 2.0, device=v.device).to(v.dtype)
+    descales["v_descale"].fill_(.5)
+    try:
+        out = flash_attn_with_kvcache(
+            q, k, v, cache_seqlens=counts, cu_seqlens_q=cu, max_seqlen_q=1,
+            page_table=pages, softmax_scale=.0625, causal=True,
+            num_splits=splits, **descales
+        )
+    except RuntimeError as error:
+        if "QSA FP8 is not compiled in" in str(error):
+            pytest.skip(str(error))
+        raise
+    assert torch.count_nonzero(out[0]) == 0
+    assert torch.equal(out[1:], torch.ones_like(out[1:]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires PPU")
+def test_fp8_qsa_rejects_unsupported_features():
+    from flash_attn_interface import flash_attn_with_kvcache
+
+    if torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("FP8 QSA requires PPU0015")
+    q, k, v, _, pages, counts, cu, descales = _fp8_qsa_inputs(6, 1, 65)
+    kwargs = dict(cache_seqlens=counts, cu_seqlens_q=cu, max_seqlen_q=1, page_table=pages,
+                  causal=True, softmax_scale=.0625, **descales)
+    with pytest.raises(RuntimeError, match="FP8 QSA|QSA FP8"):
+        flash_attn_with_kvcache(q, k[:0], v[:0], **kwargs)
+    for changes in (dict(causal=False), dict(qsa_allow_aiu=True), dict(pack_gqa=False),
+                    dict(num_splits=129), dict(q_descale=None), dict(q_descale=descales['q_descale'].half()),
+                    dict(softmax_scale=0.0), dict(softmax_scale=-1.0), dict(softmax_scale=float('nan'))):
+        with pytest.raises(RuntimeError, match="FP8 QSA|QSA FP8"):
+            flash_attn_with_kvcache(q, k, v, **{**kwargs, **changes})
+
+
+def _run_fp8_general_qsa(group, kv_heads, lengths, page, width, splits, layout="contiguous"):
+    """Check native FP8 against dequantized CPU FP64, including every head and LSE."""
+    from flash_attn_interface import flash_attn_with_kvcache
+
+    if torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("FP8 QSA requires PPU0015")
+    torch.manual_seed(20261021)
+    batch, total = len(lengths), sum(lengths)
+    heads, pages_count = group * kv_heads, math.ceil(128 / page)
+    q = torch.randn(total, heads, 256, device="cuda").to(torch.float8_e4m3fn)
+    if layout == "interleaved":
+        kv = torch.randn(pages_count, page, 2, kv_heads, 256, device="cuda").to(q.dtype)
+        k, v = kv[:, :, 0], kv[:, :, 1]
+    else:
+        extra = int(layout == "gapped-pages")
+        k, v = (torch.randn(pages_count, page + extra, kv_heads, 256, device="cuda")
+                .to(q.dtype)[:, :page] for _ in range(2))
+    if layout == "strided":
+        q = torch.stack((q, q), dim=1)[:, 0]
+        k = torch.stack((k, k), dim=2)[:, :, 0]
+        v = torch.stack((v, v), dim=2)[:, :, 1]
+    cu = torch.tensor([0] + list(accumulate(lengths)), device="cuda", dtype=torch.int32)
+    indices = torch.randint(pages_count * page, (total, 1, width), device="cuda", dtype=torch.int32)
+    if layout == "gapped-pages" and pages_count > 1:
+        indices[..., 0] = page
+        indices[..., -1] = pages_count * page - 1
+    cache = torch.tensor([0, 1] + [width] * max(0, batch - 2), device="cuda", dtype=torch.int32)[:batch]
+    if batch == 1:
+        cache.fill_(width)
+    base = torch.arange(batch * kv_heads, device="cuda").reshape(batch, kv_heads).float()
+    descales = {name: value + base * .001 for name, value in
+                (("q_descale", .7), ("k_descale", .8), ("v_descale", .9))}
+    try:
+        out, lse, *_ = flash_attn_with_kvcache(
+            q, k, v, cache_seqlens=cache, cu_seqlens_q=cu, max_seqlen_q=max(lengths),
+            page_table=indices, causal=True, num_splits=splits, return_softmax_lse=True,
+            **descales)
+    except RuntimeError as error:
+        if "QSA FP8 is not compiled in" in str(error):
+            pytest.skip(str(error))
+        raise
+    qf, kf, vf = (x.cpu().double() for x in (q, k.flatten(0, 1), v.flatten(0, 1)))
+    indices, cache = indices.cpu().long(), cache.cpu().tolist()
+    scales = {name: x.cpu().double() for name, x in descales.items()}
+    expected = torch.zeros(q.shape, dtype=torch.float64)
+    expected_lse = torch.full((heads, total), -torch.inf, dtype=torch.float64)
+    row = 0
+    for b, length in enumerate(lengths):
+        for pos in range(length):
+            count = max(0, min(width, cache[b] - length + pos + 1))
+            if count:
+                ids = indices[row, 0, :count]
+                qq = qf[row].reshape(kv_heads, group, 256) * scales["q_descale"][b, :, None, None]
+                kk = kf[ids] * scales["k_descale"][b, None, :, None]
+                vv = vf[ids] * scales["v_descale"][b, None, :, None]
+                scores = torch.einsum("hgd,khd->hgk", qq, kk) * .0625
+                expected[row] = torch.einsum("hgk,khd->hgd", scores.softmax(-1), vv).reshape(heads, 256)
+                expected_lse[:, row] = scores.logsumexp(-1).reshape(heads)
+            row += 1
+    assert out.dtype == torch.bfloat16 and out.shape == q.shape and torch.isfinite(out).all()
+    relative = (out.cpu().double() - expected).norm() / expected.norm().clamp_min(1e-12)
+    assert relative <= .1
+    empty = torch.isneginf(expected_lse)
+    assert torch.equal(torch.isneginf(lse.cpu()), empty)
+    assert torch.count_nonzero(out.cpu().transpose(0, 1)[empty]) == 0
+    torch.testing.assert_close(lse.cpu().double()[~empty], expected_lse[~empty], atol=.1, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires PPU")
+@pytest.mark.parametrize("group", range(1, 33))
+@pytest.mark.parametrize("kv_heads", [1, 3])
+@pytest.mark.parametrize("splits", [0, 1, 4])
+def test_fp8_qsa_group_range(group, kv_heads, splits):
+    _run_fp8_general_qsa(group, kv_heads, [1, 1, 1], 16, 65, splits)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires PPU")
+@pytest.mark.parametrize("group,kv_heads,lengths,page,width,layout", [
+    (1, 1, [4, 4, 4], 1, 17, "contiguous"),
+    (3, 1, [16, 9, 1], 16, 33, "contiguous"),
+    (6, 1, [8, 3, 0, 1], 64, 65, "contiguous"),
+    (8, 2, [16, 7, 1], 128, 31, "interleaved"),
+    (12, 2, [4, 2, 1], 64, 65, "interleaved"),
+    (16, 4, [2, 4, 1], 63, 32, "strided"),
+    (6, 1, [4, 3, 1], 16, 33, "gapped-pages"),
+    (17, 3, [1, 4, 2], 16, 33, "gapped-pages"),
+    (17, 3, [1, 4, 2], 544, 33, "gapped-pages"),
+    (24, 2, [4, 3, 1], 576, 65, "interleaved"),
+    (31, 5, [1, 8, 2], 16, 65, "strided"),
+    (32, 2, [17, 3, 1], 64, 2051, "contiguous"),
+    (1, 1, [1], 64, 65537, "contiguous"),
+])
+@pytest.mark.parametrize("splits", [0, 1, 4, 128])
+def test_fp8_qsa_general_sizes(group, kv_heads, lengths, page, width, layout, splits):
+    _run_fp8_general_qsa(group, kv_heads, lengths, page, width, splits, layout)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires PPU")
+@pytest.mark.parametrize("batch,sq,heads", [(65536, 1, 1), (1, 16384, 32)])
+@pytest.mark.parametrize("splits", [0, 1])
+def test_fp8_qsa_large_axes(batch, sq, heads, splits):
+    from flash_attn_interface import flash_attn_with_kvcache
+
+    if torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("FP8 QSA requires PPU0015")
+    rows = batch * sq
+    q = torch.zeros(rows, heads, 256, device="cuda").to(torch.float8_e4m3fn)
+    k = torch.zeros(1, 1, 1, 256, device="cuda").to(q.dtype)
+    v = torch.ones(1, 1, 1, 256, device="cuda").to(q.dtype)
+    scale = torch.ones(batch, 1, device="cuda")
+    out = flash_attn_with_kvcache(
+        q, k, v, cache_seqlens=torch.full((batch,), sq, device="cuda", dtype=torch.int32),
+        cu_seqlens_q=torch.arange(batch + 1, device="cuda", dtype=torch.int32) * sq, max_seqlen_q=sq,
+        page_table=torch.zeros(rows, 1, 1, device="cuda", dtype=torch.int32),
+        causal=True, num_splits=splits, q_descale=scale, k_descale=scale, v_descale=scale)
+    assert torch.equal(out, torch.ones_like(out))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires PPU")
+@pytest.mark.parametrize("heads,kv_heads,message", [(33, 1, "at most 32"), (7, 2, "must divide")])
+def test_fp8_qsa_rejects_invalid_head_counts(heads, kv_heads, message):
+    from flash_attn_interface import flash_attn_with_kvcache
+
+    if torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("FP8 QSA requires PPU0015")
+    q, k, v, _, pages, counts, cu, descales = _fp8_qsa_inputs(heads, kv_heads, 65)
+    with pytest.raises(RuntimeError, match=message):
+        flash_attn_with_kvcache(q, k, v, cache_seqlens=counts, cu_seqlens_q=cu,
+            max_seqlen_q=1, page_table=pages, causal=True, **descales)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires PPU")
+def test_fp8_qsa_rejects_unaligned_storage():
+    from flash_attn_interface import flash_attn_with_kvcache
+
+    q, k, v, _, pages, counts, cu, descales = _fp8_qsa_inputs(6, 1, 65)
+    if torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("FP8 QSA requires PPU0015")
+    bad_q = torch.empty(q.numel() + 1, dtype=q.dtype, device=q.device)[1:].view(q.shape)
+    backing = torch.empty(k.numel() + 1, dtype=k.dtype, device=k.device)
+    bad_k = backing.as_strided(k.shape, (k.stride(0) + 1, *k.stride()[1:]))
+    for qq, kk in ((bad_q, k), (q, bad_k)):
+        with pytest.raises(RuntimeError, match="16-byte"):
+            flash_attn_with_kvcache(qq, kk, v, cache_seqlens=counts, cu_seqlens_q=cu,
+                max_seqlen_q=1, page_table=pages, causal=True, **descales)
+
+
 if __name__ == "__main__":
     sys.exit(main())

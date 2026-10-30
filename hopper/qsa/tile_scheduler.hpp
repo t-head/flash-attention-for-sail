@@ -3,7 +3,7 @@
 #include "../tile_scheduler.hpp"
 
 namespace flash {
-template<bool Varlen, bool Split, bool QueryFirst=false, bool FlattenBatch=false>
+template<bool Varlen, bool Split, bool QueryFirst=false, bool FlattenBatch=false, int VParts=1>
 class QsaSingleTileScheduler : public SingleTileScheduler<Varlen, Split> {
     using Base = SingleTileScheduler<Varlen, Split>;
 
@@ -27,15 +27,17 @@ public:
         if constexpr (FlattenBatch) {
             // SM80 uses this scheduler for all QSA, including more than 65535
             // single-query batches. Keep batch out of the limited y/z axes.
-            return {uint32_t(params.num_blocks) * uint32_t(params.num_batch),
+            return {uint32_t(params.num_blocks * VParts) * uint32_t(params.num_batch),
                     uint32_t(params.num_head), uint32_t(!Split ? 1 : params.num_splits)};
         } else if constexpr (QueryFirst) {
             // Keep the packed (split, KV head) coordinate intact, while
             // neighboring CTAs advance through queries first.
-            return {uint32_t(params.num_blocks), uint32_t(params.num_batch),
+            return {uint32_t(params.num_blocks * VParts), uint32_t(params.num_batch),
                     uint32_t((!Split ? 1 : params.num_splits) * params.num_head)};
         } else {
-            return Base::get_grid_shape(params, num_sm);
+            auto grid = Base::get_grid_shape(params, num_sm);
+            grid.x *= VParts;
+            return grid;
         }
     }
 
@@ -43,12 +45,12 @@ public:
     CUTLASS_DEVICE
     WorkTileInfo
     get_initial_work(Params const& params) const {
-        WorkTileInfo work_info {int(blockIdx.x),
+        WorkTileInfo work_info {int(blockIdx.x / VParts),
             int(QueryFirst ? blockIdx.z : blockIdx.y),
             int(QueryFirst ? blockIdx.y : blockIdx.z), 0};
         if constexpr (FlattenBatch) {
-            work_info.block_idx = int(blockIdx.x) % params.num_blocks;
-            work_info.bidb = int(blockIdx.x) / params.num_blocks;
+            work_info.block_idx = int(blockIdx.x / VParts) % params.num_blocks;
+            work_info.bidb = int(blockIdx.x / VParts) / params.num_blocks;
             work_info.split_idx = !Split ? 0 : int(blockIdx.z);
         } else if constexpr (Split) {
             int const packed = work_info.bidh;

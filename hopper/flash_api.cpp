@@ -7,6 +7,8 @@
 #include <Python.h>
 #endif // FA3_HLLM_BUILD
 
+#include <cmath>
+
 #include <torch/nn/functional/padding.h>
 #include <ATen/cuda/CUDAContextLight.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -464,7 +466,7 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, hggcStream_t stream) {
 }
 
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
-// QSA is only verified for head dim 256 bf16/fp16, so only those kernels are instantiated.
+// QSA uses the shared native API and dispatch, including the dedicated FP8 TU.
 template <int Arch, int Split, bool PagedKVNonTMA, bool PackGQA, bool Has_softcap>
 void run_mha_fwd_qsa(Flash_fwd_params &params, hggcStream_t stream) {
 #ifndef FLASHATTENTION_DISABLE_HDIM256
@@ -474,6 +476,7 @@ void run_mha_fwd_qsa(Flash_fwd_params &params, hggcStream_t stream) {
         if (run_qsa(params, stream)) { return; }
     }
 #endif
+    TORCH_CHECK(!params.is_e4m3, "Unsupported FP8 QSA configuration");
     if (params.is_bf16) {
         return run_mha_fwd_<Arch, cutlass::bfloat16_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA, true>(params, stream);
     } else {
@@ -603,6 +606,31 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
 
 #ifdef USE_PPU
 inline int get_qsa_num_splits(Flash_fwd_params const& params, int num_n_blocks, int occ) {
+    if (qsa_fp8_uses_tuned_layout(params)) {
+        int const blocks = params.total_q * params.h_k * (params.h_k == 2 ? 2 : 1);
+        int const tiles = (params.seqlen_k + 31) / 32;
+        bool const short_selector = params.seqlen_k >= 2048 && params.seqlen_k <= 2051;
+        if (short_selector && params.h_k == 2 && params.total_q == 1) { return 64; }
+        if (short_selector && params.h_k == 1) {
+            // Small batches benefit from finer KV partitions and fixed-count merges.
+            if (params.total_q <= 2) { return 128; }
+            if (params.total_q <= 8) { return 64; }
+            // The one-warp H6 kernel fits 16 CTAs per CU. Split an underfilled
+            // second wave, leaving one CU of slack for irregular query lengths.
+            int const wave = 16 * params.num_sm;
+            if (params.total_q >= wave + 16 && 2 * params.total_q <= 3 * wave) {
+                return 4 * params.total_q <= 5 * wave ? 4 : 2;
+            }
+        }
+        return std::max(1,std::min({32, std::max(1,tiles/2), (13*params.num_sm + blocks/2)/blocks}));
+    }
+    if (qsa_fp8_config_supported(params)) {
+        int64_t const blocks = std::max<int64_t>(1, int64_t(params.total_q) * params.h_k);
+        int const tiles = (params.seqlen_k + 31) / 32;
+        int const slots = params.num_sm * (params.h / params.h_k <= 16 ? 8 : 4);
+        return int(std::max<int64_t>(1, std::min<int64_t>({128, std::max(1, tiles / 2),
+                                                        (slots + blocks / 2) / blocks})));
+    }
     if (qsa_small_decode_2048(params)) {
         if (params.arch == 80 && params.h_k * params.total_q <= 64
             && (params.h == 3 * params.h_k || params.h == 6 * params.h_k
@@ -1071,7 +1099,42 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     bool const is_qsa = qsa_page_table;
     if (is_qsa) {
         TORCH_CHECK(head_size == 256, "QSA only supports head dim 256");
-        TORCH_CHECK(q_type != at::ScalarType::Float8_e4m3fn, "QSA does not support fp8");
+        if (is_fp8) {
+            TORCH_CHECK(num_heads > 0 && k.size(-2) > 0, "FP8 QSA requires positive query and KV head counts");
+            TORCH_CHECK(batch_size > 0 && page_table.size(1) > 0,
+                        "FP8 QSA requires a positive batch and topk width");
+#ifdef FLASHATTENTION_DISABLE_FP8
+            TORCH_CHECK(false, "QSA FP8 is not compiled in");
+#endif
+            TORCH_CHECK(is_sm89 && head_size_v == 256 && page_size > 0 && num_pages > 0,
+                        "FP8 QSA requires PPU0015, D256 and a nonempty paged cache");
+            TORCH_CHECK(k.device() == q.device() && v.device() == q.device(),
+                        "FP8 QSA requires quantized Q/K/V on the same device");
+            // The vectorized async copies require 16-byte-aligned rows and heads.
+            for (const auto& tensor : {q, k, v}) {
+                bool aligned = tensor.stride(-1) == 1
+                    && reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0;
+                for (int dim = 0; dim < tensor.dim() - 1; ++dim) {
+                    aligned &= tensor.stride(dim) % 16 == 0;
+                }
+                TORCH_CHECK(aligned, "FP8 QSA requires 16-byte-aligned contiguous head dimensions");
+            }
+            TORCH_CHECK(is_varlen_q && cu_seqlens_q.device() == q.device() && page_table.device() == q.device()
+                        && seqused_k_.has_value() && seqused_k_.value().device() == q.device(),
+                        "FP8 QSA requires cu_seqlens_q, page_table and cache_seqlens on q.device");
+            TORCH_CHECK(is_causal && seqused_k_.has_value() && !qsa_allow_aiu
+                        && window_size_left == -1 && window_size_right == -1 && softcap == 0.0 && attention_chunk == 0
+                        && !q_v_.has_value() && !rotary_cos_.has_value() && !rotary_sin_.has_value() && !s_aux_.has_value(),
+                        "FP8 QSA requires selected causal slots, cache_seqlens and no local/auxiliary features");
+            TORCH_CHECK(!pack_gqa_.has_value() || pack_gqa_.value(), "FP8 QSA requires pack_gqa");
+            TORCH_CHECK(num_splits >= 0 && num_splits <= 128, "FP8 QSA num_splits must be in [0,128]");
+            TORCH_CHECK(q_descale_.has_value() && k_descale_.has_value() && v_descale_.has_value(),
+                        "FP8 QSA requires q_descale, k_descale and v_descale");
+            for (const auto& descale : {q_descale_.value(), k_descale_.value(), v_descale_.value()}) {
+                TORCH_CHECK(descale.device() == q.device() && descale.scalar_type() == at::kFloat,
+                            "FP8 QSA descales must be FP32 on q.device");
+            }
+        }
         TORCH_CHECK(is_varlen_q, "QSA requires cu_seqlens_q");
         TORCH_CHECK(!kv_batch_idx_.has_value(), "QSA does not support kv_batch_idx");
         TORCH_CHECK(!k_new_.has_value(), "QSA does not support appending new KV");
@@ -1090,9 +1153,17 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     int const total_k = !is_varlen_k ? batch_size * k.size(1) : k.size(0);
     int const num_heads_k = k.size(-2);
     int const batch_size_k = !paged_KV ? (!is_varlen_k ? k.size(0) : cu_seqlens_k.size(0) - 1) : (is_qsa ? batch_size : int(page_table.size(0)));
+    // Reserve the second LSE plane for the tuned H24:2 V-partition path.
+    // Generic H24:2 requests use only the first plane.
+    int const qsa_v_parts = is_qsa && is_fp8 && num_heads == 24 && num_heads_k == 2 ? 2 : 1;
     double softmax_scale = 1.0 / sqrt(double(head_size));
     if (softmax_scale_.has_value()) {
         softmax_scale = softmax_scale_.value();
+    }
+    if (is_qsa && is_fp8) {
+        TORCH_CHECK(std::isfinite(softmax_scale) && softmax_scale > 0.0
+                    && softmax_scale <= std::numeric_limits<float>::max() / 1.4426950408889634,
+                    "FP8 QSA softmax_scale must be positive and its log2 conversion must fit FP32");
     }
     if (!kv_batch_idx_.has_value()) {
         TORCH_CHECK(batch_size == batch_size_k, "batch_size must be equal to batch_size_k");
@@ -1220,7 +1291,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     if (!is_varlen_q) {
         softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
     } else {
-        softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
+        softmax_lse = qsa_v_parts == 1
+            ? torch::empty({num_heads, total_q}, opts.dtype(at::kFloat))
+            : torch::empty({qsa_v_parts*num_heads, total_q}, opts.dtype(at::kFloat)).narrow(0,0,num_heads);
     }
 #else
     if (workspace_ptr) {
@@ -1388,6 +1461,10 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 #endif
     // Always enable PackGQA for Split, and get_pack_gqa requires params.num_splits to decide
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
+#ifdef USE_PPU
+    // QSA packs one query's GQA heads into each tile, including MHA (group 1).
+    if (params.is_qsa && params.is_e4m3) { params.pack_gqa = true; }
+#endif
 
 #ifdef USE_PPU
     params.use_kblockm_128 =
@@ -1550,7 +1627,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
             params.lseaccum_batch_stride = softmax_lse_accum.stride(1);
         } else {
             out_accum = torch::empty({params.num_splits, num_heads, total_q, head_size_v}, opts.dtype(outaccum_type));
-            softmax_lse_accum = torch::empty({params.num_splits, num_heads, total_q}, opts.dtype(at::kFloat));
+            softmax_lse_accum = qsa_v_parts == 1
+                ? torch::empty({params.num_splits, num_heads, total_q}, opts.dtype(at::kFloat))
+                : torch::empty({qsa_v_parts*params.num_splits, num_heads, total_q}, opts.dtype(at::kFloat)).narrow(0,0,params.num_splits);
         }
 #else
         if (workspace_ptr) {
