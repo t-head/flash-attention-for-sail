@@ -255,7 +255,12 @@ public:
                 softmax_scale_log2 *= q_descale * k_descale;
             }
             flash::Softmax<CollectiveMainloop::QsaReplicateQK
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
+                               ? kBlockM / 8 : (Is_QSA ? 4 * kBlockM / NumThreads
+                                                      : 2 * (2 * kBlockM / NumThreads)),
+#else
                                ? kBlockM / 8 : 2 * (2 * kBlockM / NumThreads),
+#endif
                            /*Max_offset=*/!Is_FP8 ? 0 : 8> softmax(softmax_scale_log2);
 
             SeqlenInfo_t seqlen_info{

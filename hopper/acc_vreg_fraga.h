@@ -4,6 +4,9 @@
 
 #pragma once
 #include "cutlass/array.h"
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
+#include "cutlass/numeric_conversion.h"
+#endif
 static CUTLASS_DEVICE int32_t get_lane_id() {
   return threadIdx.x % 32;
 }
@@ -154,6 +157,9 @@ template <typename T> struct NumericArrayConverterPPU<T, float, CONVERTER_BASE_U
   using result_type = cutlass::Array<T, CONVERTER_BASE_UNIT_8>;
   using source_type = cutlass::Array<float, CONVERTER_BASE_UNIT_8>;
   using ElementCompute = T;
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
+  template <bool Packed = false>
+#endif
   CUTLASS_DEVICE
   result_type convert(source_type const &src_const) {
     result_type result;
@@ -184,9 +190,16 @@ template <typename T> struct NumericArrayConverterPPU<T, float, CONVERTER_BASE_U
     }
 #endif
     // convert and pack to fp16
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < src.size(); i++) {
-      result[i] = (T)src[i];
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
+    if constexpr (Packed) {
+      result = cutlass::NumericArrayConverter<T, float, CONVERTER_BASE_UNIT_8>{}(src);
+    } else
+#endif
+    {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < src.size(); i++) {
+        result[i] = (T)src[i];
+      }
     }
 #ifdef SHFL_V1
     result_type final_result;

@@ -652,26 +652,13 @@ inline int get_qsa_num_splits(Flash_fwd_params const& params, int num_n_blocks, 
         && (params.seqlen_k >= 8192 || (params.seqlen_q == 1 && params.seqlen_k >= 2048
             && int64_t(params.num_pages) * params.page_size * params.k_row_stride * 2
                >= int64_t(params.b) * 128 * 1024 * 1024));
-    int const target_mblocks = long_gqa8 ? slots : (params.h / params.h_k <= 16 ? 512 : 256);
+    int const target_mblocks = long_gqa8 ? slots : (params.h / params.h_k <= 16 ? 64 : 256);
     if (params.seqlen_q <= 16 && qsa_mblocks < target_mblocks) {
         int const splits = long_gqa8 ? std::min(128, target_mblocks / qsa_mblocks)
                                    : (target_mblocks + qsa_mblocks / 2) / qsa_mblocks;
         return std::min(splits, std::max(1, num_n_blocks / 4));
     }
     if (params.seqlen_q > 16 && slots / qsa_mblocks > 1) { return std::min(128, slots / qsa_mblocks); }
-    if (qsa_mblocks <= slots) { return 1; }
-    // The combine pass costs an fp32 O write plus read per valid row; past 16 heads, no split pays.
-    if (params.h / params.h_k > 16) { return 1; }
-    // Wave integrality eff(s) = w / ceil(w), with w = qsa_mblocks * s / slots.
-    auto near_integral = [&](int s, int pct) {
-        long long const n = 1LL * qsa_mblocks * s;
-        long long const waves_up = (n + slots - 1) / slots;
-        return 100 * n >= 1LL * pct * slots * waves_up;
-    };
-    if (near_integral(1, 93)) { return 1; }
-    for (int s = 2; s <= 4; ++s) {
-        if (near_integral(s, 97)) { return std::max(1, std::min(s, num_n_blocks)); }
-    }
     return 1;
 }
 #endif
