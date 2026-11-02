@@ -159,7 +159,7 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
     static constexpr bool UsePersistentScheduler = Is_QSA || Varlen || (!Varlen && Is_causal);
     using Scheduler = std::conditional_t<Is_QSA && (QsaConfig::SingleTile || Arch == 80),
         flash::QsaSingleTileScheduler<Varlen, Split,
-            Split && QsaConfig::QueryFirst, Arch == 80>,
+            QsaConfig::QueryFirst, Arch == 80>,
         std::conditional_t<UsePersistentScheduler, SchedulerPersistent, SchedulerSingleTile>>;
     using AttnKernel = std::conditional_t<
         Arch >= 89,
@@ -275,6 +275,10 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
         params.seqlen_k, params.d, params.dv, sizeof(Element),
         params.tile_count_semaphore, params.cu_seqlens_q, params.seqused_q,
         // params.num_m_blocks_ptr,
+#ifdef USE_PPU
+        // Unsplit QueryFirst reuses this slot for selected lengths.
+        Is_QSA && QsaConfig::QueryFirst && !Split ? params.seqused_k :
+#endif
         params.num_splits_dynamic_ptr,
     };
 

@@ -36,16 +36,14 @@ jobs:
   # Stage 3: human approval gate
   human-review:
     name: Human Review Gate
-    # TODO: change to ai-code-review
-    needs: precheck
+    needs: ai-code-review
     uses: t-head/.github/.github/workflows/human-review.yml@main
     secrets: inherit
 
   # Stage 4: FA UT tests. A single reusable job; the PR base branch selects the version.
   fa-ut-tests-ppu:
     name: flash-attention UT Tests PPU (${{ github.base_ref }})
-    # TODO: change to human-review
-    needs: precheck
+    needs: human-review
     if: github.event_name == 'pull_request' && contains(fromJSON('["v2.7.2", "v2.7.4", "v2.8.2"]'), github.base_ref)
     uses: ./.github/workflows/pr-fa-test-ppu.yaml
     with:

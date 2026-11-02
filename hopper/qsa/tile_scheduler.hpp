@@ -46,6 +46,14 @@ public:
         WorkTileInfo work_info {int(blockIdx.x),
             int(QueryFirst ? blockIdx.z : blockIdx.y),
             int(QueryFirst ? blockIdx.y : blockIdx.z), 0};
+        if constexpr (QueryFirst && !Split) {
+            // Interleave heads for short selected lengths.
+            int const* selected = params.num_splits_dynamic_ptr;
+            if (!selected || (selected[params.num_batch - 1] < 512 && selected[params.num_batch / 2] < 512)) {
+                int const linear = int(blockIdx.y) + int(blockIdx.z) * params.num_batch;
+                work_info.bidb = params.nsplits_divmod.divmod(work_info.bidh, linear);
+            }
+        }
         if constexpr (FlattenBatch) {
             work_info.block_idx = int(blockIdx.x) % params.num_blocks;
             work_info.bidb = int(blockIdx.x) / params.num_blocks;

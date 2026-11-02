@@ -136,7 +136,7 @@ def build_inputs(case, dtype, varlen=False):
     return q, k, v, topk, cu, cache
 
 
-def sparse_attention_ref(q, k, v, indices, cu, cache, *, source=False):
+def sparse_attention_ref(q, k, v, indices, cu, cache, *, source=False, return_lse=False):
     """Gather per query, mask sparse columns, and compare FP32 with low precision."""
     topk = indices.shape[-1]
     heads, dim = q.shape[-2:]
@@ -144,6 +144,7 @@ def sparse_attention_ref(q, k, v, indices, cu, cache, *, source=False):
     group = heads // kv_heads
     k, v = k.flatten(0, 1), v.flatten(0, 1)
     ref, pt = torch.empty_like(q), torch.empty_like(q)
+    lse = torch.empty(heads, q.shape[0], device=q.device, dtype=torch.float32) if return_lse else None
     # Bound the gathered FP32 K/V tiles for long prefill sequences.
     chunk = max(1, (128 << 20) // (topk * kv_heads * dim * 4))
     offsets, cache_lengths = cu.tolist(), cache.tolist()
@@ -171,10 +172,12 @@ def sparse_attention_ref(q, k, v, indices, cu, cache, *, source=False):
                 else:
                     scores = torch.einsum("chgd,cthd->chgt", q_, k_) * scale
                 scores.masked_fill_(~valid, float("-inf"))
+                if upcast and return_lse:
+                    lse[:, start:end] = torch.logsumexp(scores, dim=-1).reshape(end - start, heads).T
                 weights = torch.softmax(scores, dim=-1).masked_fill(~valid, 0.0)
                 out = torch.einsum("chgt,cthd->chgd", weights, v_)
                 target[start:end] = out.reshape(end - start, heads, dim)
-    return ref, pt
+    return (ref, pt, lse) if return_lse else (ref, pt)
 
 
 def run_case(case, dtype=torch.bfloat16, *, metadata=True, varlen=False, benchmark=False):
@@ -297,13 +300,13 @@ def main():
 # ---------------------------------------------------------------------------
 
 def _fwd_direct(q, k, v, page_table_3d, cu_seqlens_q, seqused_k, max_seqlen_q,
-                causal=True, num_splits=1, pack_gqa=True):
+                causal=True, num_splits=1, pack_gqa=True, out=None):
     """Call the C++ fwd op directly, bypassing flash_attn_with_kvcache."""
     import flash_attn_3._C
     scale = q.shape[-1] ** -0.5
     return torch.ops.flash_attn_3.fwd(
         q, k, v,
-        None, None, None, None,                    # k_new, v_new, qv, out
+        None, None, None, out,                     # k_new, v_new, qv, out
         cu_seqlens_q, None, None,                  # cu_seqlens_q/k/k_new
         None, seqused_k,                           # seqused_q, seqused_k
         max_seqlen_q, None,                        # max_seqlen_q/k
@@ -343,6 +346,103 @@ def test_qsa_fwd_direct_causal_matches_kvcache():
     out_fwd, *_ = _fwd_direct(q, k, v, pt3d, cu, cache, case.sq)
     assert torch.equal(out_fwd, out_kv), \
         f"max diff {(out_fwd.float() - out_kv.float()).abs().max().item()}"
+
+
+@pytest.mark.parametrize("queries,selected,cache_tokens", [
+    (511, 511, 8192),
+    (512, 512, 8192),
+    (513, 2051, 32768),
+])
+def test_qsa_tp1_prefill_split_boundary(queries, selected, cache_tokens):
+    """Check TP1 auto and explicit splits."""
+    torch.manual_seed(0)
+    device = "cuda"
+    q = torch.randn(queries, 24, 256, device=device, dtype=torch.bfloat16)
+    k = torch.randn(cache_tokens // 16, 16, 2, 256, device=device, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    # Independent queries share one cache and include a top-k tail.
+    indices = torch.randint(cache_tokens, (queries, 2051), device=device, dtype=torch.int32)
+    cu = torch.arange(queries + 1, device=device, dtype=torch.int32)
+    cache = torch.full((queries,), selected, device=device, dtype=torch.int32)
+    ref, pt = sparse_attention_ref(q, k, v, indices, cu, cache)
+    pt_diff = (pt.float() - ref.float()).abs()
+    for splits in (0, 1, 4):
+        result = _fwd_direct(q, k, v, indices.unsqueeze(1), cu, cache, 1,
+                             num_splits=splits)
+        diff = (result[0].float() - ref.float()).abs()
+        assert torch.isfinite(result[0]).all()
+        assert diff.max().item() <= 2 * pt_diff.max().item() + 1e-5
+        assert diff.mean().item() <= 2 * pt_diff.mean().item() + 1e-6
+        if splits == 4:
+            assert result[2] is not None and result[2].shape[0] == splits
+
+
+@pytest.mark.parametrize(
+    "queries,prefix_selected,tail_selected,heads,kv_heads,num_splits",
+    [
+        pytest.param(513, 2051, 200, 3, 1, 0, id="long-prefix-short-tail"),
+        pytest.param(1025, 200, 2051, 24, 2, 2, id="short-prefix-long-tail"),
+    ],
+)
+def test_qsa_prefill_mixed_selected(queries, prefix_selected, tail_selected,
+                                   heads, kv_heads, num_splits):
+    """Check all outputs with mixed selected lengths."""
+    torch.manual_seed(0)
+    device = "cuda"
+    cache_tokens = 8192
+    q = torch.randn(queries, heads, 256, device=device, dtype=torch.bfloat16)
+    k = torch.randn(cache_tokens // 16, 16, kv_heads, 256, device=device, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    indices = torch.randint(cache_tokens, (queries, 2051), device=device, dtype=torch.int32)
+    cu = torch.arange(queries + 1, device=device, dtype=torch.int32)
+    cache = torch.full((queries,), prefix_selected, device=device, dtype=torch.int32)
+    # Vary the last quarter; odd Q also exercises the head mapping.
+    cache[3 * queries // 4:] = tail_selected
+    ref, pt = sparse_attention_ref(q, k, v, indices, cu, cache)
+    result = _fwd_direct(q, k, v, indices.unsqueeze(1), cu, cache, 1, num_splits=num_splits)
+    diff = (result[0].float() - ref.float()).abs()
+    pt_diff = (pt.float() - ref.float()).abs()
+    assert torch.isfinite(result[0]).all()
+    assert diff.max().item() <= 2 * pt_diff.max().item() + 1e-5
+    assert diff.mean().item() <= 2 * pt_diff.mean().item() + 1e-6
+
+
+@pytest.mark.parametrize("heads,kv_heads,k_padding,v_padding,num_splits", [
+    pytest.param(6, 1, 32, 64, 0, id="gqa6-unequal-strides"),
+    pytest.param(16, 2, 0, 0, 1, id="sm89-gqa8-v-window-tail"),
+])
+def test_qsa_prefill_padded_kv_strides(heads, kv_heads, k_padding, v_padding, num_splits):
+    """Check strided M8 outputs and SM89 GQA8's partial final V tile."""
+    if heads == 16 and torch.cuda.get_device_capability() != (8, 9):
+        pytest.skip("SM89 GQA8 V index window")
+    torch.manual_seed(0)
+    queries, cache_tokens, topk = 129, 4096, 2051
+    q = torch.randn(queries, heads, 256, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(cache_tokens // 16, 16, kv_heads, 256 + k_padding,
+                    device=q.device, dtype=q.dtype)[..., :256]
+    v = torch.randn(cache_tokens // 16, 16, kv_heads, 256 + v_padding,
+                    device=q.device, dtype=q.dtype)[..., :256]
+    assert k.stride(1) == kv_heads * (256 + k_padding)
+    assert v.stride(1) == kv_heads * (256 + v_padding)
+    if heads == 16:
+        assert queries * kv_heads > 4 and k.stride(1) == v.stride(1) == 512
+        assert topk % 16 == 3
+    indices = torch.randint(cache_tokens, (queries, topk), device=q.device, dtype=torch.int32)
+    if heads == 16:
+        q.zero_()
+        indices[:, -3:] = cache_tokens - 1
+        v[-1, -1].fill_(64.0)
+    cu = torch.arange(queries + 1, device=q.device, dtype=torch.int32)
+    lengths = torch.tensor([0, 1, 200, 511, 512, 2048, 2051], device=q.device, dtype=torch.int32)
+    cache = lengths[torch.arange(queries, device=q.device) % lengths.numel()]
+    ref, pt, lse_ref = sparse_attention_ref(q, k, v, indices, cu, cache, return_lse=True)
+    result = _fwd_direct(q, k, v, indices.unsqueeze(1), cu, cache, 1, num_splits=num_splits)
+    diff, pt_diff = (result[0].float() - ref.float()).abs(), (pt.float() - ref.float()).abs()
+    assert torch.isfinite(result[0]).all()
+    assert diff.max().item() <= 2 * pt_diff.max().item() + 1e-5
+    assert diff.mean().item() <= 2 * pt_diff.mean().item() + 1e-6
+    torch.testing.assert_close(result[1].float(), lse_ref, rtol=1e-5, atol=1e-4)
+    assert result[2] is None and result[3] is None
 
 
 if __name__ == "__main__":

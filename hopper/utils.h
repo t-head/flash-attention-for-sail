@@ -263,13 +263,27 @@ CUTLASS_DEVICE auto convert_layout_acc_Aregs(Layout0 acc_layout) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #ifdef USE_PPU
-template <typename To_type, typename Engine, typename Layout>
+template <typename To_type,
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
+          bool Packed = false,
+#endif
+          typename Engine, typename Layout>
 inline __device__ auto convert_acc(Tensor<Engine, Layout> const &tensor) {
     using From_type = typename Engine::value_type;
     constexpr int numel = decltype(size(tensor))::value;
     NumericArrayConverterPPU<To_type, From_type, numel> convert_op;
-    auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
-    return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
+    if constexpr (Packed) {
+        static_assert(numel == 8);
+        auto frag = convert_op.template convert<true>(
+            *reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
+        return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
+    } else
+#endif
+    {
+        auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
+        return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
+    }
 }
 #endif
 
@@ -409,6 +423,9 @@ CUTLASS_DEVICE void gemm(TiledMma& tiled_mma, Tensor0 const& tCrA, Tensor1 const
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<bool A_in_regs=false, bool B_in_regs=false, bool SwapAB=false,
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
+         int PrefetchB=1,
+#endif
          typename Tensor0, typename Tensor1,
          typename Tensor2, typename Tensor3, typename Tensor4,
          typename TiledMma, typename TiledCopyA, typename TiledCopyB,
@@ -417,6 +434,10 @@ CUTLASS_DEVICE void gemm_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor
                               Tensor4 const& tCsB, TiledMma tiled_mma,
                               TiledCopyA smem_tiled_copy_A, TiledCopyB smem_tiled_copy_B,
                               ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B, Hook fn) {
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
+    static_assert(PrefetchB == 1 || PrefetchB == 2);
+    static_assert(PrefetchB == 1 || (A_in_regs && !B_in_regs && !SwapAB));
+#endif
     if constexpr (SwapAB) {
         gemm_sm80<B_in_regs, A_in_regs>(acc, tCrB, tCrA, tCsB, tCsA, tiled_mma, smem_tiled_copy_B, smem_tiled_copy_A, smem_thr_copy_B, smem_thr_copy_A, fn);
     } else {
@@ -430,13 +451,32 @@ CUTLASS_DEVICE void gemm_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor
 #ifdef USE_PPU
         #pragma hggc mmatiestrictly
         {
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
+        if constexpr (PrefetchB == 2) {
+            cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
+        }
+#endif
         #pragma unroll
         for (int i = 0; i < size<2>(tCrA); ++i) {
             if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, i), tCrA_copy_view(_, _, i)); }
-            if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, i), tCrB_copy_view(_, _, i)); }
+            if (!B_in_regs) {
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
+                if constexpr (PrefetchB == 2) {
+                    if (i + 1 < size<2>(tCrA)) {
+                        cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
+                    }
+                } else
+#endif
+                {
+                    cute::copy(smem_tiled_copy_B, tCsB(_, _, i), tCrB_copy_view(_, _, i));
+                }
+            }
             if constexpr (!std::is_same_v<Hook, std::nullptr_t>) {
                 if (i == 0) { fn(); }
             }
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
+            if constexpr (PrefetchB == 2) { __ppu_sched_bound(); }
+#endif
             cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
         }
         }
