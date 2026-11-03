@@ -2140,6 +2140,40 @@ def test_flash_attn_kvcache(
     assert (out - out_ref).abs().max().item() <= mult * (out_pt - out_ref).abs().max().item() + 1e-5
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("cache_layout", ["dense", "paged", "indexed"])
+def test_flash_attn_kvcache_scalar_seqlens(cache_layout, dtype):
+    device = "cuda"
+    torch.manual_seed(0)
+    batch_size, nheads, nheads_k, d = 2, 4, 2, 64
+    cache_length = 257
+    q = torch.randn(batch_size, 1, nheads, d, device=device, dtype=dtype)
+    block_table = None
+    cache_batch_idx = None
+    if cache_layout == "paged":
+        cache_shape = (8, 256, nheads_k, d)
+        block_table = torch.tensor([[3, 1], [6, 0]], device=device, dtype=torch.int32)
+    else:
+        cache_batch_size = 5 if cache_layout == "indexed" else batch_size
+        cache_shape = (cache_batch_size, 512, nheads_k, d)
+        if cache_layout == "indexed":
+            cache_batch_idx = torch.tensor([3, 1], device=device, dtype=torch.int32)
+    k_cache = torch.randn(cache_shape, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    kwargs = dict(
+        block_table=block_table,
+        cache_batch_idx=cache_batch_idx,
+        causal=True,
+        num_splits=1,
+        return_softmax_lse=True,
+    )
+    lengths = torch.full((batch_size,), cache_length, device=device, dtype=torch.int32)
+    out_ref, lse_ref = flash_attn_with_kvcache(q, k_cache, v_cache, cache_seqlens=lengths, **kwargs)
+    out, lse = flash_attn_with_kvcache(q, k_cache, v_cache, cache_seqlens=cache_length, **kwargs)
+    torch.testing.assert_close(out, out_ref, rtol=0, atol=0)
+    torch.testing.assert_close(lse, lse_ref, rtol=0, atol=0)
+
+
 def _generate_block_kvcache(seqlen_k, paged_kv_block_size, batch_size, nheads_k, d, device, dtype):
     num_blocks = math.ceil(seqlen_k / paged_kv_block_size) * batch_size * 3
     k_cache_paged = torch.randn(
