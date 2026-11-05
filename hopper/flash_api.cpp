@@ -1376,6 +1376,46 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     // Always enable PackGQA for Split, and get_pack_gqa requires params.num_splits to decide
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
 
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA) && defined(FLASHATTENTION_DISABLE_SM90) && !defined(FLASHATTENTION_DISABLE_SPLIT)
+    // Packing is resolved only after the initial split heuristic. Refine the
+    // automatic count before allocating split buffers, using the same direct
+    // path eligibility as launch and scheduler metadata.
+    if (num_splits <= 0 && qsa_small_decode_2048(params)
+        && qsa_config_supported(params) && qsa_sm89_uses_single_tile(params)
+        && !rotary_cos_.has_value() && !rotary_sin_.has_value()
+        && !q_v_.has_value() && !s_aux_.has_value()
+        // A wide table can still describe short-context prefill. Keep its
+        // existing split policy when the physical cache is small per Q.
+        && int64_t(params.num_pages) * params.page_size >= int64_t(params.total_q) * 256) {
+        int64_t const work = int64_t(params.h_k) * params.total_q;
+        // Small grids use half the static D256/N16 occupancy budget to
+        // limit split-merge work; larger grids can fill the full wave.
+        int const slots = std::max(1, params.num_sm * (work <= 16 ? 8 : 16));
+        int const num_n_blocks = (params.seqlen_k + 15) / 16;
+        bool const tiny_grid = int64_t(params.total_q) * params.h <= 64;
+        int const limit = std::min(tiny_grid ? 64 : 32,
+                                   std::max(1, num_n_blocks / (tiny_grid ? 2 : 4)));
+        int splits = 1;
+        while (splits * 2 <= limit && int64_t(splits * 2) * work <= slots) { splits *= 2; }
+        // Non-power-of-two splits improve the 39-CU TP1 small-query wave.
+        // Keep the compact-cache policy, extend S10 to R10, and use S9 for
+        // R12 over large caches to limit concurrent sparse KV traffic.
+        if (params.num_sm == 39 && params.h == 64 && work >= 32 && work <= 48
+            && limit >= 10) {
+            int64_t const cache_tokens = int64_t(params.num_pages) * params.page_size;
+            if (cache_tokens <= int64_t(params.total_q) * 2048
+                || params.total_q == 10 || params.total_q == 12) {
+                splits = params.total_q == 12
+                    && cache_tokens > int64_t(params.total_q) * 65536 ? 9 : 10;
+            }
+        }
+        // Large-cache GQA16 batches use the existing four-warp pipeline.
+        // Four splits improve sparse-load latency hiding without a large merge.
+        if (qsa_sm89_large_decode(params)) { splits = std::min(4, limit); }
+        params.num_splits = splits;
+    }
+#endif
+
 #ifdef USE_PPU
     params.use_kblockm_128 =
         (params.is_varlen_q &&
