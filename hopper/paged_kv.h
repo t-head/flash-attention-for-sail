@@ -56,7 +56,8 @@ struct PagedKVManager {
     static constexpr int kGmemThreadsPerRow = kBlockKGmem / kGmemElemsPerLoad;
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
     static_assert(!QsaConfig::NativeK || (Is_QSA && QsaConfig::Stages == 1
-        && QsaConfig::RowBytes == 128 && NumThreads == 32 && kBlockN == 16
+        && QsaConfig::RowBytes == 128
+        && ((NumThreads == 32 && kBlockN == 16) || (NumThreads == 64 && (kBlockN == 16 || kBlockN == 32)))
         && kHeadDim == 256 && kGmemElemsPerLoad == 8
         && std::is_same_v<Element, cutlass::bfloat16_t>));
 #endif
@@ -64,7 +65,8 @@ struct PagedKVManager {
     // We assume threads loading the same row are in the same warp. This is for an optimization in PagedKV where
     // these threads share the same page table entry and share the work of computing pointers to paged K and paged V.
     static_assert(cutlass::NumThreadsPerWarp % kGmemThreadsPerRow == 0, "kGmemThreadsPerRow must divide NumThreadsPerWarp");
-    using GmemCopyAtomCpAsync = cute::Copy_Atom<PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<uint128_t>, Element>;
+    using GmemCopyAtomCpAsync = cute::Copy_Atom<std::conditional_t<QsaConfig::CacheKVInL1,
+        PPU_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>, PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<uint128_t>>, Element>;
     using GmemLayoutAtomKVCpAsync = Layout<Shape <Int<NumThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
                                            Stride<Int<kGmemThreadsPerRow>, _1>>;
     using GmemTiledCopyKVCpAsync = decltype(
@@ -109,10 +111,28 @@ struct PagedKVManager {
 #endif
     using TensorKVPtr = decltype(make_tensor<Element*>(Shape<Int<kPageEntryPerThread>>{}));
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
+    // Native K and V use the same swizzled tile. Each lane copies 16 bytes.
+    CUTLASS_DEVICE uint32_t native_kv_copy_base() const {
+        if constexpr (QsaConfig::NativeK) {
+            uint32_t const lane = NumThreads == 64 ? (uint32_t(thread_idx) & 31u) : uint32_t(thread_idx);
+            return (lane & 6u) * uint32_t(kBlockN * 8)
+                | ((((lane >> 3) + (lane & 2u) + ((lane >> 2) & 1u)) & 3u) << 4)
+                | ((lane & 1u) << 3);
+        } else {
+            return 0u;
+        }
+    }
+
+    CUTLASS_DEVICE uint32_t native_kv_copy_offset(uint32_t base, int row, int column) const {
+        uint32_t const packet = NumThreads == 64 ? uint32_t(thread_idx / 32 + row * 2) : uint32_t(row);
+        return (base ^ ((packet & 1u) << 3)) + (packet << 6) + uint32_t(column * kBlockN * 64);
+    }
+
     // Stage 1 reuses each K token index for V.
     static_assert(!ReuseQsaTokenIndex || (Is_QSA && QsaConfig::Stages == 1 && KV_Same_Iter
         && QsaConfig::DirectIndex && QsaConfig::RowBytes == 128
-        && kBlockN == 16 && NumThreads == 32 && kHeadDim == 256 && kHeadDimV == 256
+        && ((kBlockN == 16 && NumThreads == 32) || ((kBlockN == 16 || kBlockN == 32) && NumThreads == 64))
+        && kHeadDim == 256 && kHeadDimV == 256
         && std::is_same_v<Element, cutlass::bfloat16_t>));
 #if defined(USE_PPU) && USE_AIU
     static_assert(!ReuseQsaTokenIndex || !PagedKVAiu);
@@ -644,14 +664,7 @@ struct PagedKVManager {
         Tensor tKcK = gmem_thr_copy_kv.partition_S(cK);
         Tensor t0KcK = gmem_thr0_copy_kv.partition_S(cK);
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
-        uint32_t const qsa_native_k_base = [&]() {
-            if constexpr (QsaConfig::NativeK) {
-                uint32_t const lane = uint32_t(thread_idx);
-                return ((lane & 6u) << 7)
-                    | ((((lane >> 3) + (lane & 2u) + ((lane >> 2) & 1u)) & 3u) << 4)
-                    | ((lane & 1u) << 3);
-            } else { return uint32_t(0); }
-        }();
+        uint32_t const qsa_native_k_base = native_kv_copy_base();
 #endif
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
         uint64_t const qsa_k_stride_bytes = [&] {
@@ -724,8 +737,7 @@ struct PagedKVManager {
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
                     if constexpr (QsaConfig::NativeK) {
                         // Offset within the native K tile; preserve the tensor's base.
-                        uint32_t const offset = (qsa_native_k_base ^ (uint32_t(m & 1) << 3))
-                            + (uint32_t(m) << 6) + (uint32_t(k) << 10);
+                        uint32_t const offset = native_kv_copy_offset(qsa_native_k_base, m, k);
                         auto dst = make_tensor(make_smem_ptr(&sK(_0{}, _0{})) + offset, Shape<_8>{});
                         cute::copy(gmem_tiled_copy_kv.with(QsaConfig::RowBytes ? should_load && qsa_valid : tKpK(_0{}, k)), mK_paged_cur_copy(_, ki), dst);
                     } else
@@ -815,6 +827,11 @@ struct PagedKVManager {
         }();
 #endif
 
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
+        static constexpr bool NativeV = QsaConfig::NativeK && QsaConfig::TsmKV;
+        static_assert(!NativeV || (NumThreads == 64 && kBlockN == 32 && kHeadDimV == 256));
+        uint32_t const native_base = NativeV ? native_kv_copy_base() : 0u;
+#endif
         int const seqlenk_row_limit = seqlen_k - n_block * kBlockN - get<0>(tVcV(_0{}, _0{}, _0{}));
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
         static constexpr bool QsaVIndexWindow = Is_QSA && QsaConfig::DirectIndex && !ReuseQsaTokenIndex
@@ -902,7 +919,16 @@ struct PagedKVManager {
                 #pragma unroll
                 for (int k = 0; k < size<2>(tVsV); ++k) {
                     int const ki = get<1>(tVcV(_0{}, _0{}, k)) / kGmemElemsPerLoad;
-                    cute::copy(gmem_tiled_copy_kv.with((QsaConfig::RowBytes || tVpV(_0{}, k)) && should_load && qsa_valid), mV_paged_cur_copy(_, ki), tVsV(_, m, k));
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
+                    if constexpr (NativeV) {
+                        uint32_t const offset = native_kv_copy_offset(native_base, m, k);
+                        auto dst = make_tensor(make_smem_ptr(&sV(_0{}, _0{})) + offset, Shape<_8>{});
+                        cute::copy(gmem_tiled_copy_kv.with(should_load && qsa_valid), mV_paged_cur_copy(_, ki), dst);
+                    } else
+#endif
+                    {
+                        cute::copy(gmem_tiled_copy_kv.with((QsaConfig::RowBytes || tVpV(_0{}, k)) && should_load && qsa_valid), mV_paged_cur_copy(_, ki), tVsV(_, m, k));
+                    }
                 }
             }
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)

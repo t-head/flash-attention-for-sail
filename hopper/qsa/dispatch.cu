@@ -43,13 +43,24 @@ struct Sm80WarpN : GqaSharedWarpNShort {
 struct Sm80WarpN2 : Sm80WarpN { static constexpr int Warps = 2; };
 struct Sm80WarpN1 : Sm80WarpN2 {
     static constexpr int Warps = 1, PrefetchB = 2;
-    static constexpr bool NativeK = true;
+    static constexpr bool NativeK = true, ReuseTokenIndices = true;
+};
+struct Sm80WideN32 : Sm80WarpN1 {
+    static constexpr int Warps = 2, N = 32, PrefetchB = 1;
+    static constexpr bool TsmKV = true, CacheKVInL1 = true;
+};
+struct Sm80WideN32Late : Sm80WideN32 {
+    static constexpr bool CacheKVInL1 = false;
+    static constexpr bool AdaptiveVWait = true;
 };
 struct Sm80WarpN1M8 : Sm80WarpN1 {
     static constexpr int M = 8, PrefetchB = 1;
-    static constexpr bool NativeK = false;
+    static constexpr bool NativeK = false, ReuseTokenIndices = false;
 };
-struct Sm80WarpNM8 : Sm80WarpN2 { static constexpr int M = 8; };
+struct Sm80WarpNM8 : Sm80WarpN2 {
+    static constexpr int M = 8;
+    static constexpr bool NativeK = true, ReuseTokenIndices = true;
+};
 struct Gqa3Direct : Gqa8Direct { static constexpr int Group = 3, KVStride = 256; };
 struct Gqa3WarpN : Gqa3Direct {
     static constexpr int Warps = 4;
@@ -317,13 +328,51 @@ bool run_qsa_decode_combine(Flash_fwd_params const& p, hggcStream_t stream) {
     return true;
 }
 
+bool run_qsa_sm80_n32_head(Flash_fwd_params& p, hggcStream_t stream) {
+    qsa::launch<qsa::Sm80WideN32, false, false, 80>(p, stream);
+    return true;
+}
+
 bool run_qsa(Flash_fwd_params &p, hggcStream_t stream) {
     using namespace qsa;
     if (!qsa_config_supported(p)) { return false; }
     if (p.arch == 80) {
         if (p.num_splits <= 1 && qsa_small_decode_2048(p) && p.h <= 16 * p.h_k) {
-            if (p.h <= 8 * p.h_k) { launch<Sm80WarpN1M8, false, false, 80>(p, stream); }
+            int64_t const work = int64_t(p.b) * p.h_k;
+            int64_t const cache_tokens = int64_t(p.num_pages) * p.page_size;
+            int64_t const rows = p.b;
+            // Keep N16 in the density band where short-context prefill favors it.
+            bool const dense_wide = work >= 2048 && cache_tokens >= rows
+                && (4 * cache_tokens <= 5 * rows || 16 * cache_tokens >= 23 * rows);
+            int const max_cache_per_row = p.h_k <= 2 && rows >= 512 && rows <= 1024 ? 8192 : 2048;
+            bool const regular_wide = (dense_wide || (work >= 512 && cache_tokens >= 2 * rows))
+                && cache_tokens < max_cache_per_row * rows;
+            bool const medium_decode_wide = p.h == 64 && p.h_k == 4 && p.b >= 80 && p.b <= 96
+                && cache_tokens >= 16384 * rows && cache_tokens < 32768 * rows;
+            if (p.h >= 16 && qsa_sm80_uses_single_tile(p) && (regular_wide || medium_decode_wide)) {
+                // Small four-KV-head grids benefit from overlapping V latency
+                // in this cache-density range.
+                if (p.h_k == 4 && work <= 1024
+                    && cache_tokens >= int64_t(p.b) * 1536
+                    && cache_tokens < int64_t(p.b) * 1792) {
+                    launch<Sm80WideN32Late, false, false, 80>(p, stream);
+                } else {
+                    launch<Sm80WideN32, false, false, 80>(p, stream);
+                }
+                return true;
+            }
+            // The existing split kernel stores final O/LSE directly at S=1.
+            if (p.h == 8 && qsa_sm80_uses_single_tile(p)
+                && !(p.total_q >= 8192 && int64_t(p.num_pages) * p.page_size <= 65536)) {
+                launch<Sm80WarpNM8, true, true, 80>(p, stream);
+            } else if (p.h <= 8 * p.h_k) { launch<Sm80WarpN1M8, false, false, 80>(p, stream); }
             else { launch<Sm80WarpN1, false, false, 80>(p, stream); }
+            return true;
+        }
+        // Reuse the existing two-warp split kernels for GQA8/16.
+        if (p.num_splits > 1 && qsa_sm80_uses_single_tile(p)) {
+            if (p.h == 8) { launch<Sm80WarpNM8, true, true, 80>(p, stream); }
+            else { launch<Sm80WarpN2, true, true, 80>(p, stream); }
             return true;
         }
         if (p.num_splits <= 1 || int64_t(p.b) * p.h_k > 16 || !qsa_small_decode_2048(p)
@@ -461,5 +510,6 @@ bool run_qsa(Flash_fwd_params &p, hggcStream_t stream) {
 
 #else
 bool run_qsa(Flash_fwd_params&, hggcStream_t) { return false; }
+bool run_qsa_sm80_n32_head(Flash_fwd_params&, hggcStream_t) { return false; }
 bool run_qsa_decode_combine(Flash_fwd_params const&, hggcStream_t) { return false; }
 #endif

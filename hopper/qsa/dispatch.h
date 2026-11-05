@@ -6,12 +6,14 @@ struct QsaConfig {
     static constexpr int M = 0, N = 0, Warps = 0, Stages = 0, Group = 1;
     static constexpr int RowBytes = 0, KVStride = 0;
     static constexpr int PrefetchB = 1;
+    static constexpr bool AdaptiveVWait = false;
+    static constexpr bool CacheKVInL1 = false;
     static constexpr bool QRegs = false, TsmQ = false, TsmKV = false;
     static constexpr bool NativeK = false;
     static constexpr bool FixedGroup = false, DirectIndex = false, SingleTile = false;
     static constexpr bool DirectGroupIndex = false;
     static constexpr bool PredicatedQ = true;
-    static constexpr bool QueryFirst = false;
+    static constexpr bool QueryFirst = false, ReuseTokenIndices = false;
 };
 }
 
@@ -95,6 +97,20 @@ inline bool qsa_sm89_uses_single_tile(Flash_fwd_params const& p) {
 #endif
 }
 
+inline bool qsa_sm80_uses_single_tile(Flash_fwd_params const& p) {
+#if defined(USE_PPU) && defined(FLASHATTENTION_DISABLE_SM90)
+    return p.arch == 80 && p.b > 0 && qsa_small_decode_2048(p)
+        && p.num_splits > 0 && p.num_splits <= 128 && !p.seqused_q
+        && p.k_row_stride == p.v_row_stride
+        && ((p.h == 64 && p.h_k == 4 && p.k_row_stride == 1024)
+            || (p.h == 32 && p.h_k == 2 && p.k_row_stride == 512)
+            || (p.h == 16 && p.h_k == 1 && p.k_row_stride == 256)
+            || (p.h == 8 && p.h_k == 1 && p.k_row_stride == 256));
+#else
+    return false;
+#endif
+}
+
 inline bool qsa_uses_single_tile(Flash_fwd_params const& p) {
     return qsa_config_supported(p)
         && (((p.h == 3 * p.h_k || p.h == 6 * p.h_k || p.h == 12 * p.h_k)
@@ -106,11 +122,14 @@ inline bool qsa_uses_single_tile(Flash_fwd_params const& p) {
             || (p.h > 16 * p.h_k && p.h < 32 * p.h_k && p.seqlen_q <= 16
                 && p.b <= 65535 && int64_t(p.h_k) * p.num_splits <= 65535)
             || qsa_gqa32_uses_single_tile(p)
-            || qsa_sm89_uses_single_tile(p));
+            || qsa_sm89_uses_single_tile(p)
+            || qsa_sm80_uses_single_tile(p));
 }
 
 // Returns false without launching when this is not an eligible QSA request.
 bool run_qsa(Flash_fwd_params&, hggcStream_t);
+// Launch the existing N32 kernel on the initial rows, retaining the original output strides.
+bool run_qsa_sm80_n32_head(Flash_fwd_params&, hggcStream_t);
 // A head-parallel SplitKV merge for short QSA decode. Returns false for
 // unsupported shapes so the generic combine kernel remains available.
 bool run_qsa_decode_combine(Flash_fwd_params const&, hggcStream_t);

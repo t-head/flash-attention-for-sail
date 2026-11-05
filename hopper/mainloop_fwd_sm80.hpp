@@ -110,7 +110,7 @@ struct CollectiveMainloopFwdSm80 {
         && QsaConfig::DirectIndex && QsaConfig::SingleTile
         && std::is_same_v<Element, cutlass::bfloat16_t>
         && (kNWarps == 4 || (ArchTag::kMinComputeCapability == 80 && kNWarps == 2))
-        && (kBlockM == 16 || (ArchTag::kMinComputeCapability == 80 && kBlockM == 8)) && kBlockN == 16
+        && (kBlockM == 16 || (ArchTag::kMinComputeCapability == 80 && kBlockM == 8)) && (kBlockN == 16 || (ArchTag::kMinComputeCapability == 80 && kBlockM == 16 && kBlockN == 32 && kNWarps == 2))
         && kHeadDim == 256 && kHeadDimV == 256
         && (!Q_in_regs || ArchTag::kMinComputeCapability == 80) && !PagedKVAiu && !AppendKV && !Is_local;
 #else
@@ -178,6 +178,11 @@ struct CollectiveMainloopFwdSm80 {
         std::conditional_t<std::is_same_v<Element, cutlass::float_e4m3_t>,
                            Tile<Int<kMmaM * kNWarps>, _16, _32>,
                            Tile<Int<kMmaM * kNWarps>, _16, _16>>>>;
+
+    // Replicate a complete wider QK tile; PV still partitions output columns.
+    using TiledMmaQK = std::conditional_t<QsaReplicateQK && kBlockN == 32,
+        TiledMMA<MMA_Atom_Arch, Layout<Shape<_1, _1, _1>>, Tile<Int<kBlockM>, _16, _16>>,
+        TiledMma>;
 
 #if defined(USE_PPU) && !defined(FLASHATTENTION_DISABLE_FP8)
     // Epilogue twin of TiledMma for the zero-shfl FP8 V-direct PV path
@@ -598,10 +603,12 @@ struct CollectiveMainloopFwdSm80 {
         SharedStorage& shared_storage
         ) {
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
-        if constexpr (!ReuseTokens && Is_QSA && QsaConfig::QueryFirst && !Split) {
-            if (std::min(seqlen_info.seqlen_k, int(get<1>(params.shape_pagetable))) >= 2048
+        if constexpr (!ReuseTokens && Is_QSA
+                      && (QsaConfig::ReuseTokenIndices || (QsaConfig::QueryFirst && !Split))) {
+            if (QsaConfig::ReuseTokenIndices
+                || (std::min(seqlen_info.seqlen_k, int(get<1>(params.shape_pagetable))) >= 2048
                 && (get<0>(params.shape_Q) >= 8192
-                    || int64_t(get<0>(params.shape_K)) * get<3>(params.shape_K) < 65536)) {
+                    || int64_t(get<0>(params.shape_K)) * get<3>(params.shape_K) < 65536))) {
                 return mma<true>(params, tOrO, softmax, thread_idx, seqlen_info, block_coord, shared_storage);
             }
         }
@@ -678,9 +685,10 @@ struct CollectiveMainloopFwdSm80 {
         Tensor tVsV = gmem_thr_copy_V.partition_D(sV);
 
         TiledMma tiled_mma;
+        TiledMmaQK tiled_mma_qk;
         auto thr_mma = tiled_mma.get_slice(thread_idx);
         int const qk_thread_idx = QsaReplicateQK ? (thread_idx & 31) : thread_idx;
-        auto thr_mma_qk = tiled_mma.get_slice(qk_thread_idx);
+        auto thr_mma_qk = tiled_mma_qk.get_slice(qk_thread_idx);
 
         // Allocate "fragments/descriptors"
         Tensor tSrQ = thr_mma_qk.partition_fragment_A(sQ);
@@ -715,9 +723,9 @@ struct CollectiveMainloopFwdSm80 {
         // TSM uses a warp-uniform descriptor; LDSM uses lane-local addresses.
         int const qk_tid_thread_slice = QsaReplicateQK ? 0 : tid_thread_slice;
         // Copy Atom retiling
-        auto smem_tiled_copy_Q = make_tiled_copy_A(SmemCopyAtomQ{}, tiled_mma);
+        auto smem_tiled_copy_Q = make_tiled_copy_A(SmemCopyAtomQ{}, tiled_mma_qk);
         auto smem_thr_copy_Q = !PackGQA || QsaTsmQ ? smem_tiled_copy_Q.get_thread_slice(qk_tid_thread_slice) : smem_tiled_copy_Q.get_thread_slice(qk_thread_idx);
-        auto smem_tiled_copy_K = make_tiled_copy_B(SmemCopyAtomK{}, tiled_mma);
+        auto smem_tiled_copy_K = make_tiled_copy_B(SmemCopyAtomK{}, tiled_mma_qk);
         auto smem_tiled_copy_V = make_tiled_copy_B(SmemCopyAtomKVt{}, tiled_mma);
 #if defined(USE_PPU) && USE_AIU
         auto smem_thr_copy_K = !PagedKV || PagedKVAiu || QsaTsmK ? smem_tiled_copy_K.get_thread_slice(qk_tid_thread_slice) : smem_tiled_copy_K.get_thread_slice(qk_thread_idx);
@@ -1048,7 +1056,7 @@ struct CollectiveMainloopFwdSm80 {
 
         if constexpr (!Share_QV_Smem) { preprocess_Q(); }
 
-        flash::Mask<kBlockM, kBlockN, PackGQA, TiledMma, false, Is_QSA> mask(
+        flash::Mask<kBlockM, kBlockN, PackGQA, TiledMmaQK, false, Is_QSA> mask(
             qk_thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
             params.attention_chunk_divmod, params.qhead_per_khead_divmod
         );
@@ -1080,6 +1088,13 @@ struct CollectiveMainloopFwdSm80 {
         };
 
         clear(tOrO);
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
+        bool defer_v_wait = false;
+        if constexpr (QsaConfig::AdaptiveVWait) {
+            int64_t const cache_tokens = int64_t(get<0>(params.shape_K)) * get<3>(params.shape_K);
+            defer_v_wait = cache_tokens >= int64_t(get<0>(params.shape_Q)) * 1024;
+        }
+#endif
 
         auto fwd_step = [&](int const n_block, auto mask_fn, auto is_first_iter_type, auto check_inf_type) {
             static constexpr bool Is_first_iter = decltype(is_first_iter_type)::value;
@@ -1103,7 +1118,7 @@ struct CollectiveMainloopFwdSm80 {
                 cute::cp_async_fence();
             };
 #endif
-            Tensor tSrS = partition_fragment_C(tiled_mma, select<0, 1>(TileShape_MNK{}));
+            Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
             clear(tSrS);
             sync();
             auto load_V_next = [&] {
@@ -1129,7 +1144,7 @@ struct CollectiveMainloopFwdSm80 {
             if constexpr (PagedKVAiu && (kBlockN != kBlockNPagedPerAiuLoad)) {
                 flash::gemm_sm80_kv_paged_aiu<kBlockN, kBlockNPagedPerAiuLoad, kHeadDim, kBlockKGmem, Q_in_regs>(
                     tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
-                    tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
+                    tiled_mma_qk, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
                 );
             } else {
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
@@ -1139,19 +1154,26 @@ struct CollectiveMainloopFwdSm80 {
                 flash::gemm_sm80<Q_in_regs>(
 #endif
                     tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
-                    tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
+                    tiled_mma_qk, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
                 );
             }
 #else
             flash::gemm_sm80<Q_in_regs>(
                 tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
-                tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
+                tiled_mma_qk, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
             );
 #endif
             smem_pipe_write = smem_pipe_write < kStages - 1 ? smem_pipe_write + 1 : 0;
             scoremod_premask_fn(tSrS);
             // Faster to load_K before gemm if we only have 1 stage
 #ifdef USE_PPU
+#if defined(FLASHATTENTION_ENABLE_QSA)
+            if constexpr (QsaConfig::AdaptiveVWait) {
+                if (defer_v_wait) { __syncthreads(); }
+                else { sync(); }
+                load_K_next_prefetched();
+            } else
+#endif
             if constexpr (kStages == 1) {
                 // Adjust the loadV wait point according to the headdim.
                 // Smaller headdim coresponds to shorter QK gemm, and  PagedKV costs longer loading time,
@@ -1247,7 +1269,8 @@ struct CollectiveMainloopFwdSm80 {
                     if constexpr (Is_QSA && ArchTag::kMinComputeCapability == 80 && kBlockM == 8) { return cute::qsa_convert_m8<Element>(tSrS); }
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
                     else if constexpr (Is_QSA) { return flash::convert_acc<Element, QsaConfig::DirectIndex
-                        && std::is_same_v<Element, cutlass::bfloat16_t> && decltype(size(tSrS))::value == 8>(tSrS); }
+                        && std::is_same_v<Element, cutlass::bfloat16_t> && (decltype(size(tSrS))::value == 8 || (ArchTag::kMinComputeCapability == 80
+                        && QsaConfig::SingleTile && kBlockN == 32 && decltype(size(tSrS))::value == 16))>(tSrS); }
 #endif
                     else { return flash::convert_acc<Element>(tSrS); }
                 }
@@ -1279,6 +1302,11 @@ struct CollectiveMainloopFwdSm80 {
             Tensor tOrV = thr_mma.partition_fragment_B(sVt(_, _, _0{}));
 #ifdef USE_PPU
             // Move the waiting of load_V_next to the point before PV gemm for better performance.
+#if defined(FLASHATTENTION_ENABLE_QSA)
+            if constexpr (QsaConfig::AdaptiveVWait) {
+                if (defer_v_wait) { flash::cp_async_wait<1>(); __syncthreads(); }
+            }
+#endif
             if constexpr (kStages == 1 && (kHeadDim <= 96 || (kHeadDim <= 128 && PagedKV))) { flash::cp_async_wait<kStages * 2 - 1>(); __syncthreads(); }
 #if USE_AIU
             if constexpr (Fp8PvNsplit) {
@@ -1334,7 +1362,7 @@ struct CollectiveMainloopFwdSm80 {
 
         auto first_iter_mask_fn = [&](auto& tSrS, int n_block) {
             if constexpr (Is_QSA && (Is_causal || QsaConfig::DirectIndex)) {
-                flash::Mask<kBlockM, kBlockN, PackGQA, TiledMma, false, Is_QSA> topk_mask(
+                flash::Mask<kBlockM, kBlockN, PackGQA, TiledMmaQK, false, Is_QSA> topk_mask(
                     qk_thread_idx, seqlen_q, int(get<1>(params.shape_pagetable)), params.window_size_left, params.window_size_right, 0,
                     params.attention_chunk_divmod, params.qhead_per_khead_divmod);
                 topk_mask.template apply<true, false, false>(tSrS, m_block, n_block);

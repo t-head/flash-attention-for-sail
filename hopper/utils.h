@@ -274,10 +274,21 @@ inline __device__ auto convert_acc(Tensor<Engine, Layout> const &tensor) {
     NumericArrayConverterPPU<To_type, From_type, numel> convert_op;
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
     if constexpr (Packed) {
-        static_assert(numel == 8);
-        auto frag = convert_op.template convert<true>(
-            *reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
-        return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
+        static_assert(numel == 8 || numel == 16);
+        if constexpr (numel == 8) {
+            auto frag = convert_op.template convert<true>(
+                *reinterpret_cast<const cutlass::Array<From_type, numel> *>(tensor.data()));
+            return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
+        } else {
+            cutlass::Array<To_type, numel> frag;
+            #pragma unroll
+            for (int i = 0; i < numel / 8; ++i) {
+                reinterpret_cast<cutlass::Array<To_type, 8> *>(&frag)[i] =
+                    NumericArrayConverterPPU<To_type, From_type, 8>{}.template convert<true>(
+                        reinterpret_cast<const cutlass::Array<From_type, 8> *>(tensor.data())[i]);
+            }
+            return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
+        }
     } else
 #endif
     {
