@@ -167,3 +167,7 @@ bool run_qsa_decode_combine(Flash_fwd_params const&, hggcStream_t);
 #ifdef FLASHATTENTION_QSA_FP8
 bool run_qsa_fp8(Flash_fwd_params&, hggcStream_t);
 #endif
+
+// error must initially be zero; validation only atomically ORs device bitflags.
+void validate_qsa_bwd(Flash_bwd_params const&, int* error, hggcStream_t);
+void run_qsa_bwd(Flash_bwd_params&, hggcStream_t);

@@ -12,6 +12,9 @@
 #include <torch/nn/functional/padding.h>
 #include <ATen/cuda/CUDAContextLight.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
+#include <cmath>
+#include <limits>
 #include <cutlass/numeric_types.h>
 #include "flash.h"
 #ifdef USE_PPU
@@ -2362,6 +2365,134 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     return { dq, dk, dv, softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum };
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+mha_qsa_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at::Tensor v,
+            at::Tensor out, at::Tensor softmax_lse, at::Tensor indices,
+            at::Tensor cu_seqlens_q, int64_t max_seqlen_q,
+            std::optional<at::Tensor> seqused_k,
+            std::optional<double> softmax_scale, bool causal, bool deterministic) {
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA) && !defined(FLASHATTENTION_DISABLE_BACKWARD) && !defined(FLASHATTENTION_DISABLE_HDIM256) && !defined(FLASHATTENTION_DISABLE_SM8x) && !defined(FA3_HLLM_BUILD)
+    CHECK_DEVICE(q);
+    const at::cuda::CUDAGuard device_guard(q.device());
+    TORCH_CHECK(!deterministic && !at::globalContext().deterministicAlgorithms(),
+                "QSA backward uses nondeterministic FP32 atomic accumulation");
+    auto dprops = at::cuda::getCurrentDeviceProperties();
+    const int arch = dprops->major * 10 + dprops->minor;
+    TORCH_CHECK(arch == 80 || arch == 89, "QSA backward requires PPU0010 or PPU0015");
+    const auto dtype = q.scalar_type();
+    TORCH_CHECK(dtype == at::kBFloat16 || dtype == at::kHalf,
+                "QSA backward requires BF16 or FP16 inputs");
+#ifdef FLASHATTENTION_DISABLE_FP16
+    TORCH_CHECK(dtype != at::kHalf, "This flash attention build does not support FP16");
+#endif
+    for (const auto& tensor : {dout, k, v, out, softmax_lse, indices, cu_seqlens_q}) {
+        TORCH_CHECK(tensor.device() == q.device(), "QSA backward tensors must share the same device");
+    }
+    TORCH_CHECK(q.dim() == 3 && q.size(2) == 256,
+                "QSA backward Q must have shape (total_q, heads, 256)");
+    TORCH_CHECK(k.dim() == 4 && k.size(3) == 256 && v.sizes() == k.sizes(),
+                "QSA backward K/V must have shape (num_pages, page_size, kv_heads, 256)");
+    TORCH_CHECK(k.size(0) > 0 && k.size(1) > 0 && k.size(2) > 0 && q.size(1) > 0,
+                "QSA backward requires nonempty physical KV pool and heads");
+    TORCH_CHECK(q.size(1) % k.size(2) == 0 && q.size(1) / k.size(2) <= 32,
+                "QSA backward requires a GQA ratio between 1 and 32");
+    for (const auto& tensor : {dout, q, k, v, out}) {
+        TORCH_CHECK(tensor.scalar_type() == dtype && tensor.stride(-1) == 1,
+                    "QSA backward inputs must have matching dtype and contiguous last dimension");
+    }
+    TORCH_CHECK(dout.sizes() == q.sizes() && out.sizes() == q.sizes(),
+                "QSA backward dout/out must match Q shape");
+    TORCH_CHECK(softmax_lse.scalar_type() == at::kFloat && softmax_lse.dim() == 2,
+                "QSA backward LSE must be FP32 with shape (heads, total_q)");
+    CHECK_SHAPE(softmax_lse, q.size(1), q.size(0));
+    TORCH_CHECK(indices.scalar_type() == at::kInt && indices.dim() == 3
+                    && indices.size(0) == q.size(0) && indices.size(1) == 1
+                    && indices.stride(2) == 1,
+                "QSA backward indices must be int32 (total_q, 1, topk) with contiguous last dimension");
+    TORCH_CHECK(cu_seqlens_q.scalar_type() == at::kInt && cu_seqlens_q.dim() == 1
+                    && cu_seqlens_q.numel() >= 2 && cu_seqlens_q.is_contiguous(),
+                "QSA backward requires contiguous int32 cu_seqlens_q");
+    const int64_t batch = cu_seqlens_q.numel() - 1;
+    for (int64_t size : {q.size(0), q.size(1), k.size(0), k.size(1), k.size(2),
+                         indices.size(2), batch, max_seqlen_q}) {
+        TORCH_CHECK(size >= 0 && size < std::numeric_limits<int>::max(),
+                    "QSA backward dimension is outside the int32 range");
+    }
+    if (seqused_k.has_value()) {
+        const auto& lengths = seqused_k.value();
+        TORCH_CHECK(lengths.device() == q.device() && lengths.scalar_type() == at::kInt
+                        && lengths.dim() == 1 && lengths.numel() == batch && lengths.is_contiguous(),
+                    "QSA backward cache lengths must be contiguous int32 (batch,) on the same device");
+    }
+    const double scale = softmax_scale.value_or(1.0 / std::sqrt(256.0));
+    TORCH_CHECK(std::isfinite(scale) && std::abs(scale) <= std::numeric_limits<float>::max(),
+                "QSA backward softmax_scale must be finite and representable in FP32");
+
+    auto dq = at::empty(q.sizes(), q.options());
+    auto dk = at::empty(k.sizes(), k.options());
+    auto dv = at::empty(v.sizes(), v.options());
+    auto dq_accum = at::zeros(q.sizes(), q.options().dtype(at::kFloat));
+    auto dk_accum = at::zeros(k.sizes(), k.options().dtype(at::kFloat));
+    auto dv_accum = at::zeros(v.sizes(), v.options().dtype(at::kFloat));
+    auto lse = softmax_lse.contiguous();
+    Flash_bwd_params params{};
+    params.q_ptr = q.data_ptr();
+    params.k_ptr = k.data_ptr();
+    params.v_ptr = v.data_ptr();
+    params.o_ptr = out.data_ptr();
+    params.do_ptr = dout.data_ptr();
+    params.q_row_stride = q.stride(0);
+    params.q_head_stride = q.stride(1);
+    params.k_batch_stride = k.stride(0);
+    params.k_row_stride = k.stride(1);
+    params.k_head_stride = k.stride(2);
+    params.v_batch_stride = v.stride(0);
+    params.v_row_stride = v.stride(1);
+    params.v_head_stride = v.stride(2);
+    params.v_dim_stride = 1;
+    params.o_row_stride = out.stride(0);
+    params.o_head_stride = out.stride(1);
+    params.do_row_stride = dout.stride(0);
+    params.do_head_stride = dout.stride(1);
+    params.dq_ptr = dq.data_ptr();
+    params.dk_ptr = dk.data_ptr();
+    params.dv_ptr = dv.data_ptr();
+    params.dq_accum_ptr = dq_accum.data_ptr();
+    params.dk_accum_ptr = dk_accum.data_ptr();
+    params.dv_accum_ptr = dv_accum.data_ptr();
+    params.softmax_lse_ptr = lse.data_ptr();
+    params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
+    params.page_table = indices.data_ptr<int>();
+    params.page_table_batch_stride = indices.stride(0);
+    params.is_causal = causal && seqused_k.has_value();
+    params.seqused_k = params.is_causal ? seqused_k.value().data_ptr<int>() : nullptr;
+    params.b = batch;
+    params.total_q = q.size(0);
+    params.seqlen_q = max_seqlen_q;
+    params.seqlen_k = indices.size(2);
+    params.page_size = k.size(1);
+    params.num_pages = k.size(0);
+    params.h = q.size(1);
+    params.h_k = k.size(2);
+    params.d = params.dv = 256;
+    params.scale_softmax = scale;
+    params.is_bf16 = dtype == at::kBFloat16;
+    params.is_qsa = true;
+    params.arch = arch;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    auto error = at::zeros({}, q.options().dtype(at::kInt));
+    validate_qsa_bwd(params, error.data_ptr<int>(), stream);
+    const int invalid = error.item<int>();
+    TORCH_CHECK(!(invalid & 1), "QSA backward indices must be nonnegative and within the physical KV pool");
+    TORCH_CHECK(!(invalid & 2), "QSA backward cu_seqlens_q offsets or max_seqlen_q are invalid");
+    TORCH_CHECK(!(invalid & 4), "QSA backward cache lengths must be nonnegative");
+    run_qsa_bwd(params, stream);
+    return {dq, dk, dv};
+#else
+    TORCH_CHECK(false, "This build does not support PPU QSA backward");
+#endif
+}
+
 std::tuple<at::Tensor, at::Tensor>
 mha_combine(at::Tensor out_partial,         // num_splits x batch_size x seqlen x num_heads x head_size
             at::Tensor lse_partial,         // num_splits x batch_size x seqlen x num_heads
@@ -2678,6 +2809,11 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "float softcap = 0.0,"
         "bool deterministic = False,"
         "int sm_margin = 0) -> (Tensor(dq!), Tensor(dk!), Tensor(dv!), Tensor, Tensor, Tensor, Tensor, Tensor)");
+    m.def("qsa_bwd("
+        "Tensor dout, Tensor q, Tensor k, Tensor v, Tensor out, Tensor softmax_lse,"
+        "Tensor indices, Tensor cu_seqlens_q, int max_seqlen_q,"
+        "Tensor? seqused_k = None, float? softmax_scale = None,"
+        "bool causal = False, bool deterministic = False) -> (Tensor, Tensor, Tensor)");
     m.def("fwd_combine("
         "Tensor out_partial,"
         "Tensor lse_partial,"
@@ -2713,6 +2849,7 @@ TORCH_LIBRARY(flash_attn_3, m) {
 TORCH_LIBRARY_IMPL(flash_attn_3, CUDA, m) {
     m.impl("fwd", &mha_fwd);
     m.impl("bwd", &mha_bwd);
+    m.impl("qsa_bwd", &mha_qsa_bwd);
     m.impl("fwd_combine", &mha_combine);
     m.impl("get_scheduler_metadata", &mha_fwd_get_scheduler_metadata);
 }
