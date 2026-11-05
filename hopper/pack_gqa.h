@@ -137,9 +137,10 @@ struct PackGQAManager {
                     // TODO: check this
                     cute::copy(gmem_tiled_copy_Q_cp_async.with(QsaConfig::FixedGroup || QsaConfig::DirectGroupIndex || tQpQ(k)), mQ_cur_copy(_, ki), tQsQ(_, m, k));
                 }
-            } else if constexpr (Is_QSA) {
-                // For QSA, invalid rows still participate in the warp-collective softmax on sm89 (hdim256 fast path).
-                // Zero them so they don't poison the rescale decision for valid rows.
+            } else {
+                // Invalid rows still participate in the softmax (e.g. the warp-collective sm89 hdim256 fast path),
+                // and their scores feed the need_rescale decision in Softmax::max_get_scale_skip.
+                // Zero them so uninitialized Q doesn't poison the rescale decision for valid rows.
                 #pragma unroll
                 for (int k = 0; k < size<2>(tQsQ); ++k) { cute::clear(tQsQ(_, m, k)); }
             }
