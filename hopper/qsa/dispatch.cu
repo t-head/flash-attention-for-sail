@@ -17,23 +17,25 @@ struct Gqa8Direct : Gqa8 {
     static constexpr bool DirectIndex = true, SingleTile = true;
 };
 struct Gqa8Varlen : Gqa8Direct { static constexpr bool SingleTile = false; };
-// Qwen3.8 TP8/TP4/TP2/TP1 use groups 3/6/12/12 respectively.
-// Keep the 16-row MMA tile but avoid computing a runtime head divmod, and
-// address each selected token directly when the physical KV row stride fits.
-struct GqaSharedDirect256 : Gqa8Direct { static constexpr int KVStride = 256; static constexpr bool FixedGroup = false, DirectGroupIndex = true; };
-// Large unsplit query batches avoid predicated async copies for unused Q rows.
-struct GqaSharedLong256 : GqaSharedDirect256 { static constexpr int RowBytes = 256; static constexpr bool PredicatedQ = false; };
-struct GqaSharedVarlen256 : GqaSharedDirect256 { static constexpr bool SingleTile = false; };
-struct GqaSharedDirect512 : Gqa8Direct { static constexpr bool FixedGroup = false, DirectGroupIndex = true; };
+// Runtime stride lets GQA8/12/16 share the existing stride-512 instances.
+struct GqaSharedDirect : Gqa8Direct {
+    static constexpr int KVStride = 0;
+    static constexpr bool FixedGroup = false, DirectGroupIndex = true;
+};
 // Group adjacent queries by KV head.
-struct GqaSharedQueryFirst512 : GqaSharedDirect512 { static constexpr bool QueryFirst = true; };
-struct GqaSharedVarlen512 : GqaSharedDirect512 { static constexpr bool SingleTile = false; };
-struct GqaSharedWarpN : GqaSharedDirect256 {
+struct GqaSharedQueryFirst : GqaSharedDirect { static constexpr bool QueryFirst = true; };
+// Share query-first instances across stride-256 and runtime-stride requests.
+using GqaSharedDirect256 = GqaSharedQueryFirst;
+// Large unsplit query batches retain their fixed-stride pipeline.
+struct GqaSharedLong256 : GqaSharedDirect { static constexpr int RowBytes = 256, KVStride = 256; static constexpr bool PredicatedQ = false; };
+struct GqaSharedVarlen256 : GqaSharedDirect { static constexpr int KVStride = 256; static constexpr bool SingleTile = false; };
+struct GqaSharedVarlen512 : GqaSharedDirect { static constexpr bool SingleTile = false; };
+struct GqaSharedWarpN : GqaSharedDirect {
     static constexpr int Warps = 4, Stages = 2;
     static constexpr bool QRegs = false;
 };
 // Single-query decode can share a noncausal instance across groups 3, 6, and 12.
-struct GqaSharedWarpNShort : GqaSharedWarpN { static constexpr int Stages = 1; };
+struct GqaSharedWarpNShort : GqaSharedWarpN { static constexpr int Stages = 1, KVStride = 256; };
 struct Sm80WarpN : GqaSharedWarpNShort {
     static constexpr int KVStride = 0;
     static constexpr bool QRegs = true, TsmQ = false;
@@ -86,7 +88,7 @@ struct Partial : Gqa32N16 {
 };
 struct PartialSingle : Partial { static constexpr bool SingleTile = true; };
 
-// Cache occupancy only for direct, stride-512 QSA loads. The device is refreshed
+// Cache occupancy for direct QSA loads. The device is refreshed
 // on every launch; this cache never interposes the runtime used by other kernels.
 struct OccupancyEntry {
     int device = -1;
@@ -276,6 +278,9 @@ __global__ void decode_combine_kernel(Flash_fwd_params p) {
 
 bool run_qsa_decode_combine(Flash_fwd_params const& p, hggcStream_t stream) {
     bool const small_decode_2048 = qsa_small_decode_2048(p);
+    bool const tiny_grid = small_decode_2048 && qsa_sm89_uses_single_tile(p)
+        && int64_t(p.total_q) * p.h <= 64 && p.num_splits <= 64
+        && !p.seqused_q && !p.num_splits_dynamic_ptr && !p.tile_count_semaphore;
     bool const group12_small = p.h == 12 * p.h_k
         && ((p.b <= 6 && p.h_k == 1 && p.k_row_stride == 256)
             || (p.b <= 2 && p.h_k == 2 && p.k_row_stride == 512))
@@ -285,7 +290,7 @@ bool run_qsa_decode_combine(Flash_fwd_params const& p, hggcStream_t stream) {
     if (!qsa_config_supported(p) || p.d != 256 || p.dv != 256
         || p.seqlen_q != 1 || p.total_q != p.b || p.b > 16
         || p.num_splits <= 1 || p.num_splits > 128
-        || (!group12_small && (p.h_k != 1 || (p.h != 3 && p.h != 6)))
+        || (!tiny_grid && !group12_small && (p.h_k != 1 || (p.h != 3 && p.h != 6)))
         || p.o_head_stride != 256 || p.oaccum_row_stride != 256) { return false; }
     dim3 grid(p.total_q, p.h, 256 / 64);
     if (p.b == 1 && (p.h == 3 || p.h == 6) && small_decode_2048
@@ -332,6 +337,31 @@ bool run_qsa(Flash_fwd_params &p, hggcStream_t stream) {
         } else {
             launch<Sm80WarpN2, true, true, 80>(p, stream);
         }
+        return true;
+    }
+    if (qsa_sm89_uses_single_tile(p)) {
+        if (p.num_splits > 1 && qsa_sm89_large_decode(p)) {
+            launch<GqaSharedWarpN, true>(p, stream);
+            return true;
+        }
+        // Q1's selected list is already causal. Reuse the existing four-warp
+        // instance while its CTAs fit in one wave (six resident CTAs per CU).
+        if (p.h_k == 1 && p.k_row_stride == 256 && p.num_splits > 1
+            && int64_t(p.total_q) * p.h <= 64
+            && int64_t(p.total_q) * p.num_splits <= int64_t(p.num_sm) * 6
+            && qsa_small_decode_2048(p) && !p.seqused_q
+            && !p.num_splits_dynamic_ptr && !p.tile_count_semaphore) {
+            launch<GqaSharedWarpNShort, true, false>(p, stream);
+            return true;
+        }
+        bool const query_first = p.num_splits <= 1
+            && (p.total_q >= 512 || (int64_t(p.total_q) * p.h_k >= 512
+                && int64_t(p.num_pages) * p.page_size >= 512));
+        if (query_first) { launch<GqaSharedQueryFirst, false>(p, stream); }
+        else if (p.k_row_stride == 256 || (p.h == 32 && p.h_k == 2 && p.num_splits > 1)) {
+            launch<GqaSharedQueryFirst>(p, stream);
+        }
+        else { launch<GqaSharedDirect>(p, stream); }
         return true;
     }
     const bool split = p.num_splits > 1;
@@ -381,8 +411,8 @@ bool run_qsa(Flash_fwd_params &p, hggcStream_t stream) {
                        && small_decode_2048
                        // Interleave heads for small batches over large caches.
                        && (p.total_q >= 4096 || int64_t(p.num_pages) * p.page_size < 16384)) {
-                launch<GqaSharedQueryFirst512, false>(p, stream);
-            } else if (direct_grid) { launch<GqaSharedDirect512>(p, stream); }
+                launch<GqaSharedQueryFirst, false>(p, stream);
+            } else if (direct_grid) { launch<GqaSharedDirect>(p, stream); }
             else { launch<GqaSharedVarlen512>(p, stream); }
             return true;
         }
@@ -399,7 +429,7 @@ bool run_qsa(Flash_fwd_params &p, hggcStream_t stream) {
         } else if (p.seqlen_k >= 2048) {
             launch<GqaSharedVarlen512>(p, stream);
         } else {
-            launch<GqaSharedDirect512>(p, stream);
+            launch<GqaSharedDirect>(p, stream);
         }
         return true;
     }

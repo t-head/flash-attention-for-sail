@@ -318,7 +318,8 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
         }
 #ifdef USE_PPU
         int blocks_per_sm;
-        if constexpr (QsaConfig::DirectIndex && QsaConfig::KVStride == 512) {
+        if constexpr (QsaConfig::DirectIndex && (QsaConfig::KVStride == 512
+                      || (Arch == 89 && QsaConfig::KVStride == 0))) {
             qsa::cached_occupancy(device, &blocks_per_sm, reinterpret_cast<const void*>(kernel),
                                   block_dims.x * block_dims.y * block_dims.z, smem_size, 0);
         } else {

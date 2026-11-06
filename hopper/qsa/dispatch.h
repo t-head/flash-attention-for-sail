@@ -29,6 +29,14 @@ inline bool qsa_small_decode_2048(Flash_fwd_params const& p) {
         && p.d == 256 && p.dv == 256;
 }
 
+inline bool qsa_sm89_large_decode(Flash_fwd_params const& p) {
+    return qsa_small_decode_2048(p) && p.arch == 89 && p.num_sm == 39
+        && p.h == 32 && p.h_k == 2
+        && p.k_row_stride == 512 && p.v_row_stride == 512
+        && p.total_q >= 256 && p.total_q < 512
+        && int64_t(p.num_pages) * p.page_size >= int64_t(p.total_q) * 8192;
+}
+
 inline bool qsa_config_supported(Flash_fwd_params const& p) {
 #if defined(USE_PPU) && USE_AIU && !defined(FLASHATTENTION_DISABLE_SM8x) && !defined(FLASHATTENTION_DISABLE_HDIM256) && !defined(FLASHATTENTION_DISABLE_PAGEDKV) && !defined(FLASHATTENTION_DISABLE_PACKGQA) && !defined(FA3_HLLM_BUILD)
     return p.is_qsa && !p.qsa_allow_aiu && p.is_bf16 && p.d == 256 && p.dv == 256
@@ -68,6 +76,25 @@ inline bool qsa_gqa32_uses_single_tile(Flash_fwd_params const& p) {
         && p.b <= 65535 && int64_t(p.h_k) * p.num_splits <= 65535;
 }
 
+inline bool qsa_sm89_uses_single_tile(Flash_fwd_params const& p) {
+#if defined(USE_PPU) && defined(FLASHATTENTION_DISABLE_SM90)
+    return p.arch == 89
+        && p.seqlen_q == 1 && p.total_q == p.b
+        && p.b > 0 && p.b <= 65535
+        && p.num_splits > 0 && int64_t(p.h_k) * p.num_splits <= 65535
+        && p.k_row_stride == p.v_row_stride
+        // Retain persistent scheduling for compact, large GQA8 batches.
+        && !(p.h == 8 && p.h_k == 1 && p.num_splits == 1 && p.total_q >= 8192
+            && int64_t(p.num_pages) * p.page_size <= 65536)
+        && ((p.h == 64 && p.h_k == 4 && p.k_row_stride == 1024)
+            || (p.h == 32 && p.h_k == 2 && p.k_row_stride == 512)
+            || (p.h == 16 && p.h_k == 1 && p.k_row_stride == 256)
+            || (p.h == 8 && p.h_k == 1 && p.k_row_stride == 256));
+#else
+    return false;
+#endif
+}
+
 inline bool qsa_uses_single_tile(Flash_fwd_params const& p) {
     return qsa_config_supported(p)
         && (((p.h == 3 * p.h_k || p.h == 6 * p.h_k || p.h == 12 * p.h_k)
@@ -78,7 +105,8 @@ inline bool qsa_uses_single_tile(Flash_fwd_params const& p) {
              && (p.seqlen_k < 2048 || qsa_uses_long_pipeline(p) || qsa_uses_small_wide_tile(p)))
             || (p.h > 16 * p.h_k && p.h < 32 * p.h_k && p.seqlen_q <= 16
                 && p.b <= 65535 && int64_t(p.h_k) * p.num_splits <= 65535)
-            || qsa_gqa32_uses_single_tile(p));
+            || qsa_gqa32_uses_single_tile(p)
+            || qsa_sm89_uses_single_tile(p));
 }
 
 // Returns false without launching when this is not an eligible QSA request.
