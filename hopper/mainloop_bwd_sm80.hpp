@@ -9,6 +9,7 @@
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
 #include <cutlass/numeric_conversion.h>
+#include <cutlass/barrier.h>
 
 #include "cute/tensor.hpp"
 
@@ -824,6 +825,19 @@ struct CollectiveMainloopBwdSm80 {
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) { return false; }
         }
+
+        // Deterministic dQ: backward tiles are tiled along KV (n_block), so every n_block CTA
+        // atomically accumulates into the same dQ. Serialize those accumulations in n_block order
+        // per (m_block, batch, head), mirroring the SM90 mainloop. The semaphore is zeroed by the
+        // backward preprocess kernel and indexed exactly the same way there.
+        //
+        // For causal attention m_block_min is monotonic in n_block, so every predecessor of a
+        // participating CTA also participates in that m_block and the counter can reach n_block.
+        int const dq_num_batch = params.num_batch;
+        int const dq_num_head = get<2>(params.shape_Q);
+        using DqBarrier = cutlass::GenericBarrier<cutlass::detail::SyncwarpSync>;
+        int *dq_lock_ptr = !Deterministic ? nullptr
+            : params.dq_semaphore + bidb * dq_num_head + bidh;
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
         Tensor sdO = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_do.data()), SmemLayoutdO{});
@@ -1674,6 +1688,14 @@ struct CollectiveMainloopBwdSm80 {
             };
             /** dQ = dS*K */
             auto do_mma_dQ = [&] (auto hook) {
+                if constexpr (Deterministic) {
+                    // DqBarrier uses SyncwarpSync: only the lane-0 of each warp spins and the
+                    // wait is then propagated inside that warp, so the per-warp lane index has
+                    // to be passed. Passing the CTA-wide thread_idx lets warps 1..N run ahead
+                    // and race on the dQ atomicAdd.
+                    DqBarrier::wait_eq(dq_lock_ptr, thread_idx % cutlass::NumThreadsPerWarp,
+                                       m_block * dq_num_batch * dq_num_head, n_block);
+                }
                 Tensor tdQrdQ = partition_fragment_C(tiled_mma_dQ, select<!dQ_swapAB ? 0 : 2, !dQ_swapAB ? 2 : 0>(TileShape_MNK{}));
                 clear(tdQrdQ);
                 Tensor tdQrdS = mma_partition_fragment_AB</*A=*/!dQ_swapAB>(thr_mma_dQ, sdS);
@@ -1798,6 +1820,23 @@ struct CollectiveMainloopBwdSm80 {
 
         };
 
+        // Publish this CTA's dQ contribution for `mb` so that the next n_block CTA may accumulate
+        // into the same dQ tile. The CTA-wide barrier guarantees every warp has issued its
+        // atomicAdd before the electing thread releases the semaphore (same pattern as the
+        // deterministic dK/dV epilogue).
+        auto dq_deterministic_arrive = [&](int mb) {
+            if constexpr (Deterministic) {
+                __syncthreads();
+                // arrive_inc() starts with Sync::sync(), i.e. a full-mask __syncwarp(), so it has
+                // to be entered by a complete warp. The first warp takes part in that __syncwarp()
+                // and only its lane 0 elects to bump the counter.
+                if (thread_idx < cutlass::NumThreadsPerWarp) {
+                    DqBarrier::arrive_inc(dq_lock_ptr, thread_idx % cutlass::NumThreadsPerWarp,
+                                          mb * dq_num_batch * dq_num_head);
+                }
+            }
+        };
+
         // We have separate iterations with causal masking. Not necessary for hdim 128 but for hdim 64
         // this helps quite a bit to not have to do causal masking for most of the iterations.
         if constexpr ((Is_causal || Is_local) && SeparateMaskingIterations) {
@@ -1806,6 +1845,7 @@ struct CollectiveMainloopBwdSm80 {
             CUTLASS_PRAGMA_NO_UNROLL
             for (; m_block < std::min(m_block_max, m_block_masking_max); ++m_block) {
                 bwd_step(m_block, mask_fn);
+                dq_deterministic_arrive(m_block);
             }
         }
 
@@ -1818,6 +1858,7 @@ struct CollectiveMainloopBwdSm80 {
         CUTLASS_PRAGMA_NO_UNROLL
         for (; m_block < m_block_max_before_local_mask; ++m_block) {
             bwd_step(m_block, mask_fn);
+            dq_deterministic_arrive(m_block);
         }
 
         if constexpr (Is_local && SeparateMaskingIterations) {
@@ -1825,6 +1866,7 @@ struct CollectiveMainloopBwdSm80 {
             CUTLASS_PRAGMA_NO_UNROLL
             for (; m_block < m_block_max; ++m_block) {
                 bwd_step(m_block, mask_fn);
+                dq_deterministic_arrive(m_block);
             }
         }
 

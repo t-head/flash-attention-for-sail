@@ -163,6 +163,9 @@ struct CollectiveEpilogueBwd {
         ShapedKV const shape_dV;
         StridedKV const stride_dV;
         int const num_heads_q;
+        // Kept in sync with CollectiveEpilogueBwdGQA: the launch template builds both
+        // Arguments with the same initializer list. Only the GQA epilogue consumes it.
+        int const num_batch;
         int* dk_semaphore;
         int* dv_semaphore;
         int const* cu_seqlens;
@@ -483,6 +486,10 @@ struct CollectiveEpilogueBwdGQA {
         ShapedKV const shape_dVaccum;
         StridedKV const stride_dVaccum;
         int num_heads_q;
+        // Number of sequences. The dk/dv semaphores are laid out as
+        // (num_n_blocks, num_batch, num_heads_kv), so this has to be the real batch count even
+        // for varlen, where shape_dKaccum's batch dim is collapsed to 1.
+        int num_batch;
         int* dk_semaphore;
         int* dv_semaphore;
         int const* cu_seqlens;
@@ -498,6 +505,7 @@ struct CollectiveEpilogueBwdGQA {
         ShapedKV const shape_dVaccum;
         StridedKV const stride_dVaccum;
         cutlass::FastDivmod qhead_per_khead_divmod;
+        int num_batch;
         int* dk_semaphore;
         int* dv_semaphore;
         int const* cu_seqlens = nullptr;
@@ -512,6 +520,7 @@ struct CollectiveEpilogueBwdGQA {
         }
         return {args.ptr_dKaccum, args.shape_dKaccum, args.stride_dKaccum, args.ptr_dVaccum, args.shape_dVaccum, args.stride_dVaccum,
                 cutlass::FastDivmod(cute::ceil_div(args.num_heads_q, get<1>(args.shape_dKaccum))),
+                args.num_batch,
                 args.dk_semaphore, args.dv_semaphore,
                 args.cu_seqlens, args.seqused};
     }
@@ -562,16 +571,18 @@ struct CollectiveEpilogueBwdGQA {
             cute::copy(r2s_tiled_copy_dKVaccum, taccdKVrdV, tdKVsdKVaccum);
         }
 
-        // int const num_batch = params.num_batch;
-        int const num_batch = get<2>(params.shape_dKaccum);
+        int const num_batch = params.num_batch;
         int const num_head_kv = get<1>(params.shape_dKaccum);
         int *lock_ptr = !Deterministic ? nullptr : params.dv_semaphore + bidb * num_head_kv + bidh_kv;
+        // SyncwarpSync propagates the wait inside a warp only, so the lane index (not the
+        // CTA-wide thread index) has to be passed or warps 1..N run ahead of the release.
         using Barrier = cutlass::GenericBarrier<cutlass::detail::SyncwarpSync>;
+        int const lane_idx = thread_idx % cutlass::NumThreadsPerWarp;
 
         // if (thread_idx == 0) { printf("blockIdx.x = %d, blockIdx.y = %d, blockIdx.z = %d, bidb = %d, bidh_kv = %d, lock_ptr = %p, dv_semaphore = %p, num_batch = %d, num_head_kv = %d, n_block = %d, bihd_idx_in_group = %d\n", blockIdx.x, blockIdx.y, blockIdx.z, bidb, bidh_kv, lock_ptr, params.dv_semaphore, num_batch, num_head_kv, n_block, bidh_idx_in_group);}
 
         if constexpr (Deterministic) {
-            Barrier::wait_eq(lock_ptr, thread_idx, n_block * num_batch * num_head_kv, bidh_idx_in_group);
+            Barrier::wait_eq(lock_ptr, lane_idx, n_block * num_batch * num_head_kv, bidh_idx_in_group);
         }
         // if (thread_idx == 0) { printf("After barrier blockIdx.x = %d, blockIdx.y = %d, blockIdx.z = %d, bidb = %d, bidh_kv = %d, lock_ptr = %p, dv_semaphore = %p\n", blockIdx.x, blockIdx.y, blockIdx.z, bidb, bidh_kv, lock_ptr, params.dv_semaphore);}
 #ifndef FLASHATTENTION_DISABLE_SM90
@@ -609,7 +620,13 @@ struct CollectiveEpilogueBwdGQA {
         }
 #endif
         if constexpr (Deterministic) {
-            Barrier::arrive_inc(lock_ptr, thread_idx, n_block * num_batch * num_head_kv);
+            // The release must happen after every warp has issued its atomicAdd, so a CTA-wide
+            // barrier precedes it. arrive_inc() starts with a full-mask __syncwarp(), so the whole
+            // first warp has to enter it, and only its lane 0 bumps the counter.
+            flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+            if (thread_idx < cutlass::NumThreadsPerWarp) {
+                Barrier::arrive_inc(lock_ptr, lane_idx, n_block * num_batch * num_head_kv);
+            }
         }
 
         if constexpr (Use_TMA) {
@@ -621,7 +638,7 @@ struct CollectiveEpilogueBwdGQA {
         // if (thread_idx == 0) { printf("blockIdx.x = %d, blockIdx.y = %d, blockIdx.z = %d, bidb = %d, bidh_kv = %d, lock_ptr = %p, dk_semaphore = %p, num_batch = %d, num_head_kv = %d, n_block = %d, bihd_idx_in_group = %d\n", blockIdx.x, blockIdx.y, blockIdx.z, bidb, bidh_kv, lock_ptr, params.dk_semaphore, num_batch, num_head_kv, n_block, bidh_idx_in_group);}
 
         if constexpr (Deterministic) {
-            Barrier::wait_eq(lock_ptr, thread_idx, n_block * num_batch * num_head_kv, bidh_idx_in_group);
+            Barrier::wait_eq(lock_ptr, lane_idx, n_block * num_batch * num_head_kv, bidh_idx_in_group);
         }
         // if (thread_idx == 0) { printf("After barrier blockIdx.x = %d, blockIdx.y = %d, blockIdx.z = %d, bidb = %d, bidh_kv = %d, lock_ptr = %p, dk_semaphore = %p\n", blockIdx.x, blockIdx.y, blockIdx.z, bidb, bidh_kv, lock_ptr, params.dk_semaphore);}
 #ifndef FLASHATTENTION_DISABLE_SM90
@@ -651,7 +668,13 @@ struct CollectiveEpilogueBwdGQA {
         }
 #endif
         if constexpr (Deterministic) {
-            Barrier::arrive_inc(lock_ptr, thread_idx, n_block * num_batch * num_head_kv);
+            // The release must happen after every warp has issued its atomicAdd, so a CTA-wide
+            // barrier precedes it. arrive_inc() starts with a full-mask __syncwarp(), so the whole
+            // first warp has to enter it, and only its lane 0 bumps the counter.
+            flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+            if (thread_idx < cutlass::NumThreadsPerWarp) {
+                Barrier::arrive_inc(lock_ptr, lane_idx, n_block * num_batch * num_head_kv);
+            }
         }
         // // Tell warp 0 that smem_k and smem_v are ready
         // flash::named_barrier_arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
