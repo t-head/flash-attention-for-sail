@@ -102,8 +102,14 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
-
 #ifdef USE_PPU
+    static constexpr bool PagedFragmentPrefetch =
+        ArchTag::kMinComputeCapability == 89 && kHeadDim == 256 && kHeadDimV == 256
+        && std::is_same_v<Element, cutlass::bfloat16_t> && Is_causal && Varlen
+        && PagedKVAiu && kBlockNPagedPerAiuLoad == 16 && kStages == 1
+        && !Split && !AppendKV && !Is_local && !Has_softcap && !Is_QSA
+        && kBlockM == 64 && kBlockN == 48;
+
     // Each warp executes QK. Give every warp the same valid score
     // tile, while PV continues to distribute its output columns across warps.
     static constexpr bool QsaReplicateQK = Is_QSA && PackGQA && PagedKV
@@ -1127,17 +1133,18 @@ struct CollectiveMainloopFwdSm80 {
             Tensor tSrK = thr_mma_qk.partition_fragment_B(sK(_, _, _0{}));
 #ifdef USE_PPU
             if constexpr (PagedKVAiu && (kBlockN != kBlockNPagedPerAiuLoad)) {
-                flash::gemm_sm80_kv_paged_aiu<kBlockN, kBlockNPagedPerAiuLoad, kHeadDim, kBlockKGmem, Q_in_regs>(
+                flash::gemm_sm80_kv_paged_aiu<kBlockN, kBlockNPagedPerAiuLoad, kHeadDim, kBlockKGmem,
+                    Q_in_regs, false, false,
+                    PagedFragmentPrefetch>(
                     tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
                     tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
                 );
             } else {
+                flash::gemm_sm80<Q_in_regs, false, false
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
-                flash::gemm_sm80<Q_in_regs, false, false,
-                    Is_QSA && !QsaReplicateQK ? QsaConfig::PrefetchB : 1>(
-#else
-                flash::gemm_sm80<Q_in_regs>(
+                    , Is_QSA && !QsaReplicateQK ? QsaConfig::PrefetchB : 1
 #endif
+                    >(
                     tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
                     tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
                 );
@@ -1156,7 +1163,7 @@ struct CollectiveMainloopFwdSm80 {
                 // Adjust the loadV wait point according to the headdim.
                 // Smaller headdim coresponds to shorter QK gemm, and  PagedKV costs longer loading time,
                 // thus we need to move the wait point farther.
-                if constexpr (kHeadDim <= 96 || (kHeadDim <= 128 && PagedKV)) {
+                if constexpr (kHeadDim <= 96 || (kHeadDim <= 128 && PagedKV) || PagedFragmentPrefetch) {
                     // Move the waiting of load_V_next to the point before PV gemm for better performance, and need __syncthreads here to guarantee K in tsm has all been used.
                     // According to the test, it only benefits for headdim <= 128.
                     __syncthreads();
@@ -1279,7 +1286,7 @@ struct CollectiveMainloopFwdSm80 {
             Tensor tOrV = thr_mma.partition_fragment_B(sVt(_, _, _0{}));
 #ifdef USE_PPU
             // Move the waiting of load_V_next to the point before PV gemm for better performance.
-            if constexpr (kStages == 1 && (kHeadDim <= 96 || (kHeadDim <= 128 && PagedKV))) { flash::cp_async_wait<kStages * 2 - 1>(); __syncthreads(); }
+            if constexpr (kStages == 1 && (kHeadDim <= 96 || (kHeadDim <= 128 && PagedKV) || PagedFragmentPrefetch)) { flash::cp_async_wait<kStages * 2 - 1>(); __syncthreads(); }
 #if USE_AIU
             if constexpr (Fp8PvNsplit) {
                 // === N-split PV path (fp8_pv_nsplit_design.md) ===
@@ -1303,15 +1310,17 @@ struct CollectiveMainloopFwdSm80 {
                 // per-warp slab partition: a multi-warp cute TiledMMA
                 // partition_C cannot express contiguous per-warp column
                 // slabs (AtomLayoutN interleaves 16-column atom blocks).
-                flash::gemm_rs_sm80_pv_fp8_nsplit<kBlockM, kBlockN, kHeadDimV, kBlockKGmem, kNWarps,
-                                                  (!PagedKV || PagedKVAiu), SmemLayoutV>(
-                    tOrO, bcast_base, shared_storage.tensors.mainloop.smem_v.data(),
-                    kStages > 1 ? smem_pipe_read : 0, warp_idx, tiled_mma);
+                flash::gemm_rs_sm80_pv_fp8_nsplit<kBlockM,kBlockN,kHeadDimV,kBlockKGmem,kNWarps,
+                    (!PagedKV||PagedKVAiu),SmemLayoutV,
+                    (PagedKV&&PagedKVAiu&&kHeadDim==256&&Is_causal&&kBlockM==64&&kBlockN==64&&kNWarps==4
+                     &&!PackGQA&&!Has_softcap&&!Is_QSA)>(tOrO,bcast_base,
+                    shared_storage.tensors.mainloop.smem_v.data(),smem_pipe_read,warp_idx,tiled_mma);
                 __syncthreads();  // barrier C: all P reads done, safe for load_K_next to refill this K stage
             } else
 #endif
             if constexpr (PagedKVAiu && (kBlockN != kBlockNPagedPerAiuLoad) && (!Is_FP8)) {
-                flash::gemm_rs_sm80_kv_paged_aiu<kBlockN, kBlockNPagedPerAiuLoad, kHeadDimV, kBlockKGmem>(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+                flash::gemm_rs_sm80_kv_paged_aiu<kBlockN, kBlockNPagedPerAiuLoad, kHeadDimV, kBlockKGmem,
+                    PagedFragmentPrefetch, PagedFragmentPrefetch && !PackGQA>(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
             } else if constexpr (Fp8VDirect && !Fp8PvNsplit) {
                 // UseTsmLd = (!PagedKV || PagedKVAiu): TSM on the AIU
                 // cube-blocked tile; else plain LDSM_T on the raw swizzled
@@ -1385,6 +1394,28 @@ struct CollectiveMainloopFwdSm80 {
         {
             softmax.rescale_o(tOrO, scores_scale);
         }
+#ifdef USE_PPU
+        if constexpr (PagedFragmentPrefetch && !PackGQA) {
+            static_assert(decltype(size<2>(tOrO))::value == 16);
+            if (warp_idx & 1) {
+                // Restore logical columns once, retaining ascending K for every accumulator.
+                #pragma unroll
+                for (int n = 0; n < 4; ++n) {
+                    #pragma unroll
+                    for (int m = 0; m < size<1>(tOrO); ++m) {
+                        #pragma unroll
+                        for (int e = 0; e < size<0>(tOrO); ++e) {
+                            float saved = tOrO(e, m, n + 12);
+                            tOrO(e, m, n + 12) = tOrO(e, m, n + 8);
+                            tOrO(e, m, n + 8) = tOrO(e, m, n + 4);
+                            tOrO(e, m, n + 4) = tOrO(e, m, n);
+                            tOrO(e, m, n) = saved;
+                        }
+                    }
+                }
+            }
+        }
+#endif
         if constexpr (Fp8VDirect) {
             // Fp8VDirect: undo the lane-local part of pi_n (d1<->d4, d3<->d6).
             // The remaining cross-lane part is resolved by the epilogue

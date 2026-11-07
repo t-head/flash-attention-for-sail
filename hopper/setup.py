@@ -59,7 +59,10 @@ DISABLE_SM90 = os.getenv("FLASH_ATTENTION_DISABLE_SM90", ("TRUE" if USE_PPU else
 DISABLE_SM80 = os.getenv("FLASH_ATTENTION_DISABLE_SM80", "FALSE") == "TRUE"
 DISABLE_SM89 = os.getenv("FLASH_ATTENTION_DISABLE_SM89", "FALSE") == "TRUE"
 ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR", "FALSE") == "TRUE"
-
+# The native unit contains D192 BF16 WI/WS and FP8 WI paths.
+ENABLE_FWD_FASTPATHS = (USE_PPU and not DISABLE_SM8x and not FA3_HLLM_BUILD
+                        and not DISABLE_HDIM192
+                        and os.getenv("FLASH_ATTENTION_ENABLE_MHA_FAST_PATH", "TRUE") == "TRUE")
 
 # ============================================================================
 # Source file generation
@@ -139,6 +142,7 @@ if not SKIP_CUDA_BUILD:
         + (["-DFLASHATTENTION_DISABLE_SM90"] if DISABLE_SM90 else [])
         + (["-DFLASHATTENTION_ENABLE_VCOLMAJOR"] if ENABLE_VCOLMAJOR else [])
         + ["-DUSE_PPU", "-DUSE_AIU=1"]
+        + (["-DFLASHATTENTION_FWD_FASTPATHS"] if ENABLE_FWD_FASTPATHS else [])
         + (["-DFA3_HOLMES_BUILD"] if FA3_HOLMES_WHEEL else [])
         + (["-DFA3_HLLM_BUILD"] if FA3_HLLM_BUILD else [])
         + (["-DFA3_HLLM_USE_ADDR"] if FA3_HLLM_USE_ADDR else [])
@@ -154,7 +158,8 @@ if not SKIP_CUDA_BUILD:
         + ([192] if not DISABLE_HDIM192 else [])
         + ([256] if not DISABLE_HDIM256 else [])
     )
-    HEAD_DIMENSIONS_FWD_SM80 = HEAD_DIMENSIONS_BWD
+    # softcapall already includes the D192/V128 instances; reduced builds need them explicitly.
+    HEAD_DIMENSIONS_FWD_SM80 = HEAD_DIMENSIONS_BWD + (["192_128"] if DISABLE_SOFTCAP and not DISABLE_HDIM192 else [])
     SPLIT = [""] + (["_split"] if not DISABLE_SPLIT else [])
     PAGEDKV = [""] + (["_paged"] if not DISABLE_PAGEDKV else [])
     SOFTCAP = [""] + (["_softcap"] if not DISABLE_SOFTCAP else [])
@@ -178,6 +183,9 @@ if not SKIP_CUDA_BUILD:
     if not DISABLE_SPLIT:
         sources += ["flash_fwd_combine.cu"]
     sources += ["flash_prepare_scheduler.cu"]
+    if ENABLE_FWD_FASTPATHS:
+        sources += ["flash_fwd_fastpaths.cu"]
+
 
     if ENABLE_QSA:
         sources += ["qsa/dispatch.cu"]
@@ -252,9 +260,9 @@ class CachedWheelsCommand(_bdist_wheel):
 
 class PerSourceBuildExtension(BuildExtension):
     """
-    BuildExtension that adds -mllvm -ppu-register-margin=2 only for backward
-    headdim 128 CUDA sources. This is done by post-processing the ninja build
-    file to add per-source cuda_post_cflags overrides.
+    Apply measured PPU backend options only to their intended CUDA sources.
+    Existing backward hdim128 register margins are preserved; long prefill WI
+    disables copy-before-coalescing, which otherwise adds registers and latency.
     """
 
     def build_extensions(self):
@@ -262,23 +270,38 @@ class PerSourceBuildExtension(BuildExtension):
 
         original_write_ninja_file = torch_ext._write_ninja_file
 
-        def write_ninja_file_with_register_margin(path, *args, **kwargs):
+        def write_ninja_file_with_source_flags(path, *args, **kwargs):
             original_write_ninja_file(path, *args, **kwargs)
-            self._patch_ninja_register_margin(path)
+            self._patch_ninja_source_flags(path)
 
-        torch_ext._write_ninja_file = write_ninja_file_with_register_margin
+        torch_ext._write_ninja_file = write_ninja_file_with_source_flags
         try:
             super().build_extensions()
         finally:
             torch_ext._write_ninja_file = original_write_ninja_file
 
     @staticmethod
-    def _patch_ninja_register_margin(path):
+    def _patch_ninja_source_flags(path):
         if not os.path.exists(path):
             return
         with open(path, "r") as f:
             lines = f.read().splitlines()
 
+        # Copy the global value into a per-edge override, so every unrelated
+        # source retains its original flags and there is no recursive binding.
+        global_cuda_flags = next((line.split("=", 1)[1].strip() for line in lines
+                                  if line.startswith("cuda_post_cflags =")), "")
+        mha_flags = global_cuda_flags.replace("-sort-copy-before-coalesce=true",
+                                               "-sort-copy-before-coalesce=false")
+        if "-sort-copy-before-coalesce=false" not in mha_flags:
+            mha_flags += " -mllvm -sort-copy-before-coalesce=false"
+        fp8_rr_flags = " -mllvm -ppu-force-vregrr=true"
+        source_flags = {
+            "flash_fwd_fastpaths.cu": mha_flags,
+            "flash_fwd_hdim256_e4m3_paged_sm80.cu": mha_flags + fp8_rr_flags,
+            # GQA head packing keeps the global copy schedule for short queries.
+            "flash_fwd_hdim256_e4m3_paged_packgqa_sm80.cu": global_cuda_flags + fp8_rr_flags,
+        }
         new_lines = []
         margin_flags = f"-mllvm -ppu-register-margin=1"
         for line in lines:
@@ -291,7 +314,11 @@ class PerSourceBuildExtension(BuildExtension):
                 parts = line.split()
                 if len(parts) >= 4 and parts[2].startswith("cuda_compile"):
                     src = parts[3]
-                    if "flash_bwd_hdim128_" in src and src.endswith(".cu"):
+                    # The aggregate and no-softcap files instantiate the same kernel family.
+                    source = os.path.basename(src).replace("_softcapall_", "_")
+                    if USE_PPU and source in source_flags:
+                        new_lines.append(f"  cuda_post_cflags = {source_flags[source]}")
+                    elif "flash_bwd_hdim128_" in src and src.endswith(".cu"):
                         new_lines.append(
                             f"  cuda_post_cflags = $cuda_post_cflags {margin_flags}"
                         )
