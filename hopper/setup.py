@@ -59,6 +59,13 @@ DISABLE_SM90 = os.getenv("FLASH_ATTENTION_DISABLE_SM90", ("TRUE" if USE_PPU else
 DISABLE_SM80 = os.getenv("FLASH_ATTENTION_DISABLE_SM80", "FALSE") == "TRUE"
 DISABLE_SM89 = os.getenv("FLASH_ATTENTION_DISABLE_SM89", "FALSE") == "TRUE"
 ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR", "FALSE") == "TRUE"
+# Build availability is separate from the per-instance QSA/FP8 path selection.
+ENABLE_QSA_FP8 = (
+    os.getenv("FLASH_ATTENTION_ENABLE_QSA_FP8", "TRUE") == "TRUE"
+    and ENABLE_QSA and USE_PPU and not FA3_HLLM_BUILD
+    and not (DISABLE_FP8 or DISABLE_HDIM256 or DISABLE_SM8x or DISABLE_SM89
+             or DISABLE_PAGEDKV or DISABLE_PACKGQA)
+)
 
 
 # ============================================================================
@@ -128,6 +135,7 @@ if not SKIP_CUDA_BUILD:
         + (["-DFLASHATTENTION_DISABLE_FP8"] if DISABLE_FP8 else [])
         + (["-DFLASHATTENTION_DISABLE_VARLEN"] if DISABLE_VARLEN else [])
         + (["-DFLASHATTENTION_ENABLE_QSA"] if ENABLE_QSA else [])
+        + (["-DFLASHATTENTION_QSA_FP8"] if ENABLE_QSA_FP8 else [])
         + (["-DFLASHATTENTION_DISABLE_CLUSTER"] if DISABLE_CLUSTER else [])
         + (["-DFLASHATTENTION_DISABLE_HDIM64"] if DISABLE_HDIM64 else [])
         + (["-DFLASHATTENTION_DISABLE_HDIM96"] if DISABLE_HDIM96 else [])
@@ -181,6 +189,8 @@ if not SKIP_CUDA_BUILD:
 
     if ENABLE_QSA:
         sources += ["qsa/dispatch.cu"]
+        if ENABLE_QSA_FP8:
+            sources += ["qsa/fp8.cu"]
 
     include_dirs = [
         str(Path(this_dir)),

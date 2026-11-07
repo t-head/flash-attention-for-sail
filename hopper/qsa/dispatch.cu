@@ -335,6 +335,11 @@ bool run_qsa_sm80_n32_head(Flash_fwd_params& p, hggcStream_t stream) {
 
 bool run_qsa(Flash_fwd_params &p, hggcStream_t stream) {
     using namespace qsa;
+#ifdef FLASHATTENTION_QSA_FP8
+    if (qsa_fp8_config_supported(p) && p.pack_gqa) {
+        return run_qsa_fp8(p, stream);
+    }
+#endif
     if (!qsa_config_supported(p)) { return false; }
     if (p.arch == 80) {
         if (p.num_splits <= 1 && qsa_small_decode_2048(p) && p.h <= 16 * p.h_k) {
