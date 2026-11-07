@@ -553,6 +553,57 @@ void run_mha_fwd_combine(Flash_fwd_params &params, hggcStream_t stream, bool ena
     #endif
 }
 
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA) && defined(FLASHATTENTION_DISABLE_SM90) && !defined(FLASHATTENTION_DISABLE_SPLIT) && !defined(FA3_HLLM_BUILD)
+static bool run_qsa_sm80_split_tail(Flash_fwd_params const& p, at::Tensor const& lse, hggcStream_t stream) {
+    if (p.num_sm != 20 || p.h != 32 || p.h_k != 2 || p.num_splits != 1
+        || !p.seqused_k || p.kv_batch_idx || p.cu_seqlens_k
+        || !qsa_config_supported(p) || !qsa_sm80_uses_single_tile(p)) {
+        return false;
+    }
+
+    // N32 admits eight CTAs per CU. Split a small residual wave to expose
+    // more parallel work without allocating partials for the full grid.
+    int const rows_per_wave = p.num_sm * 8 / p.h_k;
+    int const tail_rows = p.b % rows_per_wave;
+    int const head_rows = p.b - tail_rows;
+    int64_t const cache_tokens = int64_t(p.num_pages) * p.page_size;
+    if (head_rows != 5 * rows_per_wave || tail_rows == 0 || tail_rows > rows_per_wave / 4
+        || cache_tokens < int64_t(p.b) * 2 || cache_tokens > int64_t(p.b) * 64) {
+        return false;
+    }
+
+    Flash_fwd_params head = p;
+    head.b = head_rows;
+    // For this one-query-per-sequence path, the prefix of cu_seqlens_q
+    // already describes the rebased tail. Shift row-indexed inputs instead.
+    Flash_fwd_params tail = p;
+    tail.total_q = tail.b = tail_rows;
+    tail.q_ptr = static_cast<at::BFloat16*>(p.q_ptr) + head_rows * p.q_row_stride;
+    tail.o_ptr = static_cast<at::BFloat16*>(p.o_ptr) + head_rows * p.o_row_stride;
+    tail.page_table += head_rows * p.page_table_batch_stride;
+    tail.seqused_k += head_rows;
+    tail.num_splits = 4;
+
+    auto partial_o = at::empty({tail.num_splits, p.h, tail_rows, p.dv}, lse.options());
+    auto partial_lse = at::empty({tail.num_splits, p.h, tail_rows}, lse.options());
+    auto tail_lse = at::empty({p.h, tail_rows}, lse.options());
+    tail.oaccum_ptr = partial_o.data_ptr();
+    tail.oaccum_split_stride = partial_o.stride(0);
+    tail.oaccum_head_stride = partial_o.stride(1);
+    tail.oaccum_row_stride = partial_o.stride(2);
+    tail.softmax_lseaccum_ptr = partial_lse.data_ptr();
+    tail.lseaccum_split_stride = partial_lse.stride(0);
+    tail.lseaccum_head_stride = partial_lse.stride(1);
+    tail.softmax_lse_ptr = tail_lse.data_ptr();
+
+    if (!run_qsa_sm80_n32_head(head, stream)) { return false; }
+    run_mha_fwd(tail, stream);
+    run_mha_fwd_combine(tail, stream);
+    lse.narrow(-1, head_rows, tail_rows).copy_(tail_lse);
+    return true;
+}
+#endif
+
 inline bool get_pagedkv_tma(Flash_fwd_params const& params) {
     if (params.arch < 90 || !params.page_table || params.leftpad_k || params.knew_ptr) { return false; }
     // This needs to match the kernel configs
@@ -1381,22 +1432,48 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     // automatic count before allocating split buffers, using the same direct
     // path eligibility as launch and scheduler metadata.
     if (num_splits <= 0 && qsa_small_decode_2048(params)
-        && qsa_config_supported(params) && qsa_sm89_uses_single_tile(params)
+        && qsa_config_supported(params)
+        && (qsa_sm89_uses_single_tile(params) || qsa_sm80_uses_single_tile(params))
         && !rotary_cos_.has_value() && !rotary_sin_.has_value()
         && !q_v_.has_value() && !s_aux_.has_value()
         // A wide table can still describe short-context prefill. Keep its
         // existing split policy when the physical cache is small per Q.
         && int64_t(params.num_pages) * params.page_size >= int64_t(params.total_q) * 256) {
         int64_t const work = int64_t(params.h_k) * params.total_q;
-        // Small grids use half the static D256/N16 occupancy budget to
-        // limit split-merge work; larger grids can fill the full wave.
-        int const slots = std::max(1, params.num_sm * (work <= 16 ? 8 : 16));
+        // Limit merge work for SM80's two-warp tiles and small SM89 grids.
+        int const slots = std::max(1, params.num_sm * (params.arch == 80
+            ? (params.h == 8 ? 16 : 24) : (work <= 16 ? 8 : 16)));
         int const num_n_blocks = (params.seqlen_k + 15) / 16;
         bool const tiny_grid = int64_t(params.total_q) * params.h <= 64;
-        int const limit = std::min(tiny_grid ? 64 : 32,
+        int const limit = std::min(tiny_grid && params.arch != 80 ? 64 : 32,
                                    std::max(1, num_n_blocks / (tiny_grid ? 2 : 4)));
         int splits = 1;
         while (splits * 2 <= limit && int64_t(splits * 2) * work <= slots) { splits *= 2; }
+        // Larger SM80 grids already have enough unsplit work.
+        if (params.arch == 80 && work >= int64_t(params.num_sm) * 8) { splits = 1; }
+        if (params.arch == 80 && params.num_sm == 20) {
+            int64_t const rows = params.b;
+            int64_t const cache_tokens = int64_t(params.num_pages) * params.page_size;
+            // Tune split counts for small GQA16 grids over large caches.
+            if (params.h == 64 && params.h_k == 4) {
+                if (cache_tokens >= 131072 * rows && cache_tokens < 196608 * rows) {
+                    if (rows >= 11 && rows <= 14) { splits = 3; }
+                    else if (rows == 16) { splits = 2; }
+                    else if (rows >= 20 && rows <= 22 && cache_tokens < 163840 * rows) { splits = 8; }
+                } else if (rows >= 28 && rows <= 32
+                           && cache_tokens >= 65536 * rows && cache_tokens < 81920 * rows) {
+                    splits = 6;
+                }
+            } else if (params.h == 32 && params.h_k == 2) {
+                if (splits == 8 && rows >= 23 && rows <= 26
+                    && cache_tokens >= 163840 * rows && cache_tokens < 196608 * rows) {
+                    splits = 3;
+                } else if (splits == 4 && rows >= 44 && rows <= 52
+                           && cache_tokens >= 106496 * rows && cache_tokens < 114688 * rows) {
+                    splits = 8;
+                }
+            }
+        }
         // Non-power-of-two splits improve the 39-CU TP1 small-query wave.
         // Keep the compact-cache policy, extend S10 to R10, and use S9 for
         // R12 over large caches to limit concurrent sparse KV traffic.
@@ -1703,7 +1780,11 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 #endif
     if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
-        run_mha_fwd(params, stream);
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA) && defined(FLASHATTENTION_DISABLE_SM90) && !defined(FLASHATTENTION_DISABLE_SPLIT) && !defined(FA3_HLLM_BUILD)
+        bool const launched_tail = num_splits <= 0 && run_qsa_sm80_split_tail(params, softmax_lse, stream);
+        if (!launched_tail)
+#endif
+        { run_mha_fwd(params, stream); }
         if (params.num_splits > 1) {
             if (out_type == at::ScalarType::BFloat16) {
                 // Since we want output in BF16. Otherwise fwd_combine will output to FP16
