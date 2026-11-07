@@ -12,6 +12,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cutlass/numeric_types.h>
 #include "flash.h"
+#include "flash_fwd_fastpaths.h"
 #ifdef USE_PPU
 #include "qsa/dispatch.h"
 #endif
@@ -487,6 +488,11 @@ void run_mha_fwd_qsa(Flash_fwd_params &params, hggcStream_t stream) {
 #endif
 
 void run_mha_fwd(Flash_fwd_params &params, hggcStream_t stream) {
+#ifdef FLASHATTENTION_FWD_FASTPATHS
+    if (flash::try_run_mha_fast_path(params, stream)) {
+        return;
+    }
+#endif
     // HEADDIM_SWITCH(params.d, [&] {
     //     run_mha_fwd_<cutlass::half_t, kHeadSize>(params, stream);
     // });
