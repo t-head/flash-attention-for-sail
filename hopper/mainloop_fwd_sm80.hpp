@@ -19,6 +19,9 @@
 #include "paged_kv.h"
 #include "rotary.h"
 #include "utils.h"
+#ifdef FLASHATTENTION_QSA_FP8
+#include "qsa/fp8_mma.h"
+#endif
 #ifdef USE_PPU
 #include "qsa/mma_sm80_m8.h"
 #endif
@@ -63,11 +66,16 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr bool PackGQA = PackGQA_;
     static constexpr bool Split = Split_;
     static constexpr bool Is_QSA = Is_QSA_;
+#ifdef FLASHATTENTION_QSA_FP8
+    static constexpr bool Is_QSA_FP8 = Is_QSA && Is_FP8;
+#else
+    static constexpr bool Is_QSA_FP8 = false;
+#endif
     // QSA topk lists are pre-filtered for causality, and their column indices are positions within
     // the sparse topk list rather than absolute token positions. Treat causal masking as a no-op.
     static constexpr bool Effective_Is_causal = Is_causal && !Is_QSA;
     static constexpr bool V_colmajor = Is_FP8 && false;  // only row-major for now
-    static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
+    static constexpr bool Transpose_V = Is_FP8 && !V_colmajor && !Is_QSA_FP8;
 #if defined(USE_PPU) && USE_AIU && !defined(FLASHATTENTION_DISABLE_FP8)
     // FP8 V register-direct path: assemble MMA B fragments straight from the
     // raw sV tile — TSM b16.trans for non-paged / paged-AIU, plain
@@ -264,16 +272,29 @@ struct CollectiveMainloopFwdSm80 {
         decltype(tile_to_shape(SmemLayoutAtomQKVSwizzle{}, make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})))>;
 
 #if defined(USE_PPU) && !defined(FLASHATTENTION_DISABLE_FP8)
-    using SmemLayoutV_ROW = std::conditional_t<!PagedKV || PagedKVAiu,
+    using SmemLayoutV_ROW_Default = std::conditional_t<!PagedKV || PagedKVAiu,
         decltype(tile_to_shape(SmemLayoutAtomQKV{}, make_shape(shape<2>(TileShape_MNK_PV{}), shape<1>(TileShape_MNK_PV{}), Int<kStages>{}))),
         decltype(tile_to_shape(SmemLayoutAtomQKVSwizzle{}, make_shape(shape<2>(TileShape_MNK_PV{}), shape<1>(TileShape_MNK_PV{}), Int<kStages>{})))>;
+    // FP8 QSA alone uses padded row-major V.
+    static constexpr int VSmemStride = kHeadDimV + 16;
+    using SmemLayoutV_ROW = std::conditional_t<Is_QSA_FP8,
+        Layout<Shape<Int<kBlockN>,Int<kHeadDimV>,Int<kStages>>, Stride<Int<VSmemStride>,_1,Int<kBlockN*VSmemStride>>>, SmemLayoutV_ROW_Default>;
     // Transposed view of SmemLayoutV_ROW. Under FP8 (V-direct) it only shapes
     // the tOrV B fragment and tOsVt (never consumed); BF16 uses it for the
     // tOsVt smem reads.
-    using SmemLayoutVt = decltype(
-        composition(SmemLayoutV_ROW{},
-                    make_ordered_layout(make_shape(shape<1>(TileShape_MNK_PV{}), shape<2>(TileShape_MNK_PV{}), Int<kStages>{}),
-                                        Step<_2, _1, _3>{})));
+    static constexpr auto make_smem_layout_vt() {
+        if constexpr (Is_QSA_FP8) {
+            static_assert(kBlockN == 32);
+            return tile_to_shape(
+                composition(Swizzle<1, 4, 3>{}, Layout<Shape<_8, _32>, Stride<_32, _1>>{}),
+                make_shape(Int<kHeadDimV>{}, Int<kBlockN>{}, Int<kStages>{}));
+        } else {
+            return composition(SmemLayoutV_ROW{},
+                make_ordered_layout(make_shape(shape<1>(TileShape_MNK_PV{}), shape<2>(TileShape_MNK_PV{}), Int<kStages>{}),
+                                    Step<_2, _1, _3>{}));
+        }
+    }
+    using SmemLayoutVt = decltype(make_smem_layout_vt());
     using SmemLayoutV = std::conditional_t<V_colmajor, SmemLayoutVt, SmemLayoutV_ROW>;
 #else
     using SmemLayoutV = std::conditional_t<!PagedKV || PagedKVAiu,
@@ -311,7 +332,8 @@ struct CollectiveMainloopFwdSm80 {
     using SmemCopyAtomQ = std::conditional_t<!PackGQA || QsaTsmQ, Copy_Atom<SmemCopyOpQ, Element>, std::conditional_t<QsaReplicateQK && kBlockM == 8, Copy_Atom<PPU_U32x2_LDSM_N, Element>, SmemCopyAtom>>;
 #endif
     using SmemCopyAtomK = std::conditional_t<!PagedKV || PagedKVAiu || QsaTsmK, Copy_Atom<SmemCopyOpK, Element>, SmemCopyAtom>;
-    using SmemCopyAtomKVt = std::conditional_t<!PagedKV || PagedKVAiu || QsaTsmKV, Copy_Atom<SmemCopyOpKVt, Element>, SmemCopyAtomTransposed>;
+    using SmemCopyAtomKVt = std::conditional_t<Is_QSA_FP8, SmemCopyAtom,
+        std::conditional_t<!PagedKV || PagedKVAiu || QsaTsmKV, Copy_Atom<SmemCopyOpKVt, Element>, SmemCopyAtomTransposed>>;
 #else
     static constexpr bool QsaTsmQ = false, QsaTsmKV = false, QsaTsmK = false;
     using SmemCopyAtomQ = SmemCopyAtom;
@@ -428,8 +450,32 @@ struct CollectiveMainloopFwdSm80 {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
     };
-
-    using TensorStorage = std::conditional_t<Share_QV_Smem, TensorStorageSharedQV, TensorStorageSeparateQV>;
+    using TensorStorageDefault = std::conditional_t<Share_QV_Smem, TensorStorageSharedQV, TensorStorageSeparateQV>;
+    static constexpr bool Share_KV_Smem = Is_QSA_FP8 && QsaConfig::ShareKV;
+    static_assert(!Share_KV_Smem || (kStages == 1 && !Q_in_regs), "Shared KV requires serialized single-stage loads");
+#ifdef FLASHATTENTION_QSA_FP8
+    struct CUTE_ALIGNAS(128) QsaTensorStorageSharedQV {
+        union {
+            cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>> smem_v;
+            cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
+        };
+        // TSM K must follow the padded Q/V tile at a tile-aligned base.
+        alignas(4096) cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
+    };
+    struct CUTE_ALIGNAS(128) QsaTensorStorageSharedKV {
+        union {
+            cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>> smem_v;
+            cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
+        };
+        alignas(4096) cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
+    };
+    using TensorStorage = std::conditional_t<Is_QSA_FP8,
+        std::conditional_t<Share_QV_Smem, QsaTensorStorageSharedQV,
+            std::conditional_t<Share_KV_Smem, QsaTensorStorageSharedKV, TensorStorageSeparateQV>>,
+        TensorStorageDefault>;
+#else
+    using TensorStorage = TensorStorageDefault;
+#endif
 
     // Host side kernel arguments
     struct Arguments {
@@ -650,18 +696,20 @@ struct CollectiveMainloopFwdSm80 {
         Tensor gQ = local_tile(make_mix_tensor_like(mQ), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
         Tensor mK = make_tensor(make_gmem_ptr(params.ptr_K + seqlen_info.offset_k * get<0>(params.stride_K)), params.shape_K, params.stride_K)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
         Tensor gK = local_tile(make_mix_tensor_like(mK), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
+        auto ptr_V = params.ptr_V;
+        if constexpr (Is_QSA_FP8) { ptr_V += (blockIdx.x % QsaConfig::VParts) * kHeadDimV; }
 #if defined(USE_PPU) && !defined(FLASHATTENTION_DISABLE_FP8)
         Tensor gV = [&]() -> auto {
             if constexpr (V_colmajor) {
-                Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V + seqlen_info.offset_k * get<0>(params.stride_V)), select<1, 0, 2, 3>(params.shape_K), select<1, 0, 2, 3>(params.stride_V))(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
+                Tensor mV = make_tensor(make_gmem_ptr(ptr_V + seqlen_info.offset_k * get<0>(params.stride_V)), select<1, 0, 2, 3>(params.shape_K), select<1, 0, 2, 3>(params.stride_V))(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
                 return local_tile(make_mix_tensor_like(mV), select<2, 1>(TileShape_MNK{}), make_coord(_0{}, _));  // (K, N, _)
             } else {
-                Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V + seqlen_info.offset_k * get<0>(params.stride_V)), shape_V, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
+                Tensor mV = make_tensor(make_gmem_ptr(ptr_V + seqlen_info.offset_k * get<0>(params.stride_V)), shape_V, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
                 return local_tile(make_mix_tensor_like(mV), select<2, 1>(TileShape_MNK_PV{}), make_coord(_, _0{}));  // (N, K, _)
             }
         }();
 #else
-        Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V + seqlen_info.offset_k * get<0>(params.stride_V)), shape_V, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
+        Tensor mV = make_tensor(make_gmem_ptr(ptr_V + seqlen_info.offset_k * get<0>(params.stride_V)), shape_V, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
         Tensor gV = local_tile(make_mix_tensor_like(mV), select<2, 1>(TileShape_MNK_PV{}), make_coord(_, _0{}));  // (N, K, _)
 #endif
         Tensor gS_aux = make_tensor(make_gmem_ptr(params.ptr_S_aux), make_shape(get<2>(params.shape_Q)));
@@ -729,7 +777,8 @@ struct CollectiveMainloopFwdSm80 {
         auto smem_tiled_copy_V = make_tiled_copy_B(SmemCopyAtomKVt{}, tiled_mma);
 #if defined(USE_PPU) && USE_AIU
         auto smem_thr_copy_K = !PagedKV || PagedKVAiu || QsaTsmK ? smem_tiled_copy_K.get_thread_slice(qk_tid_thread_slice) : smem_tiled_copy_K.get_thread_slice(qk_thread_idx);
-        auto smem_thr_copy_V = (!PagedKV || PagedKVAiu || QsaTsmKV) ? smem_tiled_copy_V.get_thread_slice(tid_thread_slice) : smem_tiled_copy_V.get_thread_slice(thread_idx);
+        auto smem_thr_copy_V = Is_QSA_FP8 ? smem_tiled_copy_V.get_thread_slice(thread_idx)
+            : (!PagedKV || PagedKVAiu || QsaTsmKV) ? smem_tiled_copy_V.get_thread_slice(tid_thread_slice) : smem_tiled_copy_V.get_thread_slice(thread_idx);
 #else
         auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(qk_thread_idx);
         auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(thread_idx);
@@ -844,7 +893,7 @@ struct CollectiveMainloopFwdSm80 {
                 return PagedKVManager_t(
                     params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
                     params.ptr_K, params.shape_K, params.stride_K,
-                    params.ptr_V, params.headdim_v, params.stride_V,
+                    ptr_V, params.headdim_v, params.stride_V,
                     params.page_size_divmod, params.page_size_divmod,
                     bidb_kv, bidh_kv, thread_idx, Is_QSA ? std::min(seqlen_info.seqlen_k, int(get<1>(params.shape_pagetable))) : seqlen_info.seqlen_k, seqlen_info.leftpad_k,
                     0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/,
@@ -854,7 +903,7 @@ struct CollectiveMainloopFwdSm80 {
                 return PagedKVManager_t(
                     params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
                     params.ptr_K, params.shape_K, params.stride_K,
-                    params.ptr_V, params.headdim_v, params.stride_K,
+                    ptr_V, params.headdim_v, params.stride_K,
                     params.page_size_divmod, params.page_size_divmod,
                     bidb_kv, bidh_kv, thread_idx, Is_QSA ? std::min(seqlen_info.seqlen_k, int(get<1>(params.shape_pagetable))) : seqlen_info.seqlen_k, seqlen_info.leftpad_k,
                     0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/,
@@ -866,7 +915,7 @@ struct CollectiveMainloopFwdSm80 {
         PagedKVManager_t paged_kv_manager(
             params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
             params.ptr_K, params.shape_K, params.stride_K,
-            params.ptr_V, params.headdim_v, params.stride_V,
+            ptr_V, params.headdim_v, params.stride_V,
             params.page_size_divmod,
             params.page_size_divmod /*blockN_per_page_size_divmod, not used since we don't use TMA*/,
             bidb_kv, bidh_kv, thread_idx, Is_QSA ? std::min(seqlen_info.seqlen_k, int(get<1>(params.shape_pagetable))) : seqlen_info.seqlen_k, seqlen_info.leftpad_k,
@@ -1082,9 +1131,18 @@ struct CollectiveMainloopFwdSm80 {
             cute::cp_async_fence();
         };
 
+        auto sync_threads = [] {
+            if constexpr (Is_QSA_FP8 && QsaConfig::FixedGroup && QsaConfig::Group == 6) {
+                static_assert(NumMmaThreads == 32);
+                __syncwarp();
+            } else {
+                __syncthreads();
+            }
+        };
+
         auto sync = [&] {
             flash::cp_async_wait<kStages * 2 - 2>();
-            __syncthreads();
+            sync_threads();
         };
 
         clear(tOrO);
@@ -1098,7 +1156,8 @@ struct CollectiveMainloopFwdSm80 {
 
         auto fwd_step = [&](int const n_block, auto mask_fn, auto is_first_iter_type, auto check_inf_type) {
             static constexpr bool Is_first_iter = decltype(is_first_iter_type)::value;
-            static constexpr bool Check_inf = decltype(check_inf_type)::value;
+            static constexpr bool TrimHighRows = Is_QSA_FP8 && QsaConfig::FixedGroup && QsaConfig::Group == 6;
+            static constexpr bool Check_inf = decltype(check_inf_type)::value || TrimHighRows;
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
             static constexpr bool QsaTileIndexPipeline = Is_QSA && PagedKV
                 && QsaConfig::DirectIndex && !PagedKVAiu && kStages == 1
@@ -1138,13 +1197,17 @@ struct CollectiveMainloopFwdSm80 {
                 }
 #endif
             };
+            if constexpr (Is_QSA_FP8 && !Share_KV_Smem) { load_V_next(); }
+            auto qk_prefetch = [&] {
+                if constexpr (!Is_QSA_FP8) { load_V_next(); }
+            };
             Tensor tSrQ_cur = cute::conditional_return<Q_in_regs>(tSrQ, thr_mma_qk.partition_fragment_A(sQ));
             Tensor tSrK = thr_mma_qk.partition_fragment_B(sK(_, _, _0{}));
 #ifdef USE_PPU
             if constexpr (PagedKVAiu && (kBlockN != kBlockNPagedPerAiuLoad)) {
                 flash::gemm_sm80_kv_paged_aiu<kBlockN, kBlockNPagedPerAiuLoad, kHeadDim, kBlockKGmem, Q_in_regs>(
                     tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
-                    tiled_mma_qk, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
+                    tiled_mma_qk, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, qk_prefetch
                 );
             } else {
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
@@ -1154,66 +1217,86 @@ struct CollectiveMainloopFwdSm80 {
                 flash::gemm_sm80<Q_in_regs>(
 #endif
                     tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
-                    tiled_mma_qk, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
+                    tiled_mma_qk, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, qk_prefetch
                 );
             }
 #else
             flash::gemm_sm80<Q_in_regs>(
                 tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
-                tiled_mma_qk, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
+                tiled_mma_qk, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, qk_prefetch
             );
 #endif
+            if constexpr (Is_QSA_FP8) {
+                sync_threads();
+                if constexpr (Share_KV_Smem) { load_V_next(); }
+            }
             smem_pipe_write = smem_pipe_write < kStages - 1 ? smem_pipe_write + 1 : 0;
             scoremod_premask_fn(tSrS);
-            // Faster to load_K before gemm if we only have 1 stage
+            if constexpr (Is_QSA_FP8) {
+                if constexpr (Share_KV_Smem) { if constexpr (!TrimHighRows) { sync(); } }
+                else { load_K_next(); }
+                mask_fn(tSrS, n_block);
+                if constexpr (TrimHighRows) {
+                    // Padded high rows have no observable output. Make their
+                    // probability mass identically zero, keeping the six live rows unchanged.
+                #pragma unroll
+                    for (int i = 0; i < size(tSrS); ++i) {
+                        if ((i % 8) & 2) tSrS(i) = -INFINITY;
+                    }
+                }
+            } else {
+                // Faster to load_K before gemm if we only have 1 stage
 #ifdef USE_PPU
 #if defined(FLASHATTENTION_ENABLE_QSA)
-            if constexpr (QsaConfig::AdaptiveVWait) {
-                if (defer_v_wait) { __syncthreads(); }
-                else { sync(); }
-                load_K_next_prefetched();
-            } else
+                if constexpr (QsaConfig::AdaptiveVWait) {
+                    if (defer_v_wait) { __syncthreads(); }
+                    else { sync(); }
+                    load_K_next_prefetched();
+                } else
 #endif
-            if constexpr (kStages == 1) {
-                // Adjust the loadV wait point according to the headdim.
-                // Smaller headdim coresponds to shorter QK gemm, and  PagedKV costs longer loading time,
-                // thus we need to move the wait point farther.
-                if constexpr (kHeadDim <= 96 || (kHeadDim <= 128 && PagedKV)) {
-                    // Move the waiting of load_V_next to the point before PV gemm for better performance, and need __syncthreads here to guarantee K in tsm has all been used.
-                    // According to the test, it only benefits for headdim <= 128.
-                    __syncthreads();
+                if constexpr (kStages == 1) {
+                    // Adjust the loadV wait point according to the headdim.
+                    // Smaller headdim coresponds to shorter QK gemm, and  PagedKV costs longer loading time,
+                    // thus we need to move the wait point farther.
+                    if constexpr (kHeadDim <= 96 || (kHeadDim <= 128 && PagedKV)) {
+                        // Move the waiting of load_V_next to the point before PV gemm for better performance, and need __syncthreads here to guarantee K in tsm has all been used.
+                        // According to the test, it only benefits for headdim <= 128.
+                        __syncthreads();
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
-                    if constexpr (QsaTileIndexPipeline) { load_K_next_prefetched(); }
-                    else { load_K_next(); }
+                        if constexpr (QsaTileIndexPipeline) { load_K_next_prefetched(); }
+                        else { load_K_next(); }
 #else
-                    load_K_next();
+                        load_K_next();
 #endif
-                } else if constexpr (kHeadDim <= 192) {
-                    __ppu_sched_bound();   // prevent compiler moving the loadV wait instruction to the middle of QK gemm, to slightly delay the wait point.
-                    sync();
+                    } else if constexpr (kHeadDim <= 192) {
+                        __ppu_sched_bound();   // prevent compiler moving the loadV wait instruction to the middle of QK gemm, to slightly delay the wait point.
+                        sync();
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
-                    if constexpr (QsaTileIndexPipeline) { load_K_next_prefetched(); }
-                    else { load_K_next(); }
+                        if constexpr (QsaTileIndexPipeline) { load_K_next_prefetched(); }
+                        else { load_K_next(); }
 #else
-                    load_K_next();
+                        load_K_next();
 #endif
-                } else {
-                    sync();
+                    } else {
+                        sync();
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
-                    if constexpr (QsaTileIndexPipeline) { load_K_next_prefetched(); }
-                    else { load_K_next(); }
+                        if constexpr (QsaTileIndexPipeline) { load_K_next_prefetched(); }
+                        else { load_K_next(); }
 #else
-                    load_K_next();
+                        load_K_next();
 #endif
+                    }
                 }
-            }
 #else
-            if constexpr (kStages == 1) { sync(); load_K_next(); }
+                if constexpr (kStages == 1) { sync(); load_K_next(); }
 #endif
-            mask_fn(tSrS, n_block);
+                mask_fn(tSrS, n_block);
+            }
 #ifdef USE_PPU
             auto scores_scale = [&]() {
-                if constexpr (FA4SkipRescaleO) {
+                if constexpr (Is_QSA_FP8) {
+                    return softmax.template max_get_scale<Is_first_iter, Check_inf, true>(tSrS);
+                } else if constexpr (FA4SkipRescaleO) {
                     return softmax.template max_get_scale_skip<Is_first_iter, Check_inf>(tSrS);
                 } else {
                     return softmax.template max_get_scale<Is_first_iter, Check_inf>(tSrS);
@@ -1247,8 +1330,13 @@ struct CollectiveMainloopFwdSm80 {
             } else
 #endif
             {
-                softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf,
-                                                /*SeparateExp2=*/Fp8PvNsplit>(tSrS);
+                if constexpr (Is_QSA_FP8) {
+                    // Keep the validated QSA schedule; upstream leaves other paths opt-in.
+                    softmax.template online_softmax<Is_first_iter, Check_inf, /*SeparateExp2=*/true, /*QsaFp8=*/true>(tSrS);
+                } else {
+                    softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf,
+                                                    /*SeparateExp2=*/Fp8PvNsplit>(tSrS);
+                }
             }
 #ifdef USE_PPU
             if constexpr (FA4SkipRescaleO && !Fp8PvNsplit) {
@@ -1290,14 +1378,22 @@ struct CollectiveMainloopFwdSm80 {
 #endif
 #ifdef USE_PPU
             if constexpr (!Fp8PvNsplit) {
-                if constexpr ((!Is_first_iter) && (!FA4SkipRescaleO)) { softmax.rescale_o(tOrO, scores_scale); }
+                if constexpr ((!Is_first_iter) && (!FA4SkipRescaleO)) {
+                    if constexpr (Is_QSA_FP8) { softmax.template rescale_o<true>(tOrO, scores_scale); }
+                    else { softmax.rescale_o(tOrO, scores_scale); }
+                }
             }
 #else
             if constexpr (!Is_first_iter) { softmax.rescale_o(tOrO, scores_scale); }
 #endif
-            // Fp8PvNsplit defer this sync
-            if constexpr (!Fp8PvNsplit) {
-                if constexpr (kStages > 1) { sync(); }
+            if constexpr (Is_QSA_FP8) {
+                if constexpr (!Share_KV_Smem && kStages == 1) { flash::cp_async_wait<1>(); sync_threads(); }
+                if constexpr (Share_KV_Smem && TrimHighRows) { sync(); }
+            } else {
+                // Fp8PvNsplit defer this sync
+                if constexpr (!Fp8PvNsplit) {
+                    if constexpr (kStages > 1) { sync(); }
+                }
             }
             Tensor tOrV = thr_mma.partition_fragment_B(sVt(_, _, _0{}));
 #ifdef USE_PPU
@@ -1308,6 +1404,73 @@ struct CollectiveMainloopFwdSm80 {
             }
 #endif
             if constexpr (kStages == 1 && (kHeadDim <= 96 || (kHeadDim <= 128 && PagedKV))) { flash::cp_async_wait<kStages * 2 - 1>(); __syncthreads(); }
+#ifdef FLASHATTENTION_QSA_FP8
+            if constexpr (Is_QSA_FP8) {
+                // Use FA's hardware b16 V-direct load and pi_k/pi_n mapping.
+                // Preserve the QSA FP32 add and shared-tile ownership schedule.
+                // The causal API sets window_size_right=0. Mask prior accumulator
+                // bits with this runtime zero to keep a compiler-visible dependency
+                // across six PV products without changing their operands.
+                if constexpr (TrimHighRows && Share_KV_Smem) {
+                    static_assert(kBlockN == 32 && kHeadDimV == 256 && kStages == 1);
+                    auto load_v_fragment = [&](int nn) {
+                        const auto* base = shared_storage.tensors.mainloop.smem_v.data() + nn * 16;
+                        return qsa_fp8_load_v_direct<VSmemStride>(base);
+                    };
+                    auto pv = [&](auto &vb, int nn) {
+                        auto rb = make_tensor(reinterpret_cast<Element*>(&vb), Layout<Shape<_16>>{});
+                        #pragma unroll
+                        for (int mm = 0; mm < size<1>(tOrO); ++mm) {
+                            auto ap = tOrP(_, mm, 0);
+                            auto cp = tOrO(_, mm, nn);
+                            qsa_fp8_mma_fp32_add_sixhead(ap, rb, cp, 0U);
+                        }
+                    };
+                    decltype(load_v_fragment(0)) v_fragments[16];
+                    #pragma unroll
+                    for (int i = 0; i < 16; ++i) v_fragments[i] = load_v_fragment(i);
+                    // Every lane has read all V operands. K may now
+                    // overwrite the shared tile while PV uses registers.
+                    sync_threads();
+                    load_K_next();
+                    #pragma unroll
+                    for (int i = 0; i < 16; ++i) pv(v_fragments[i], i);
+                } else {
+                    unsigned pv_dependencies[6] = {0};
+                    #pragma unroll
+                    for (int kk = 0; kk < kBlockN / 32; ++kk) {
+                        auto load_v_fragment = [&](int nn) {
+                            const auto* base = shared_storage.tensors.mainloop.smem_v.data()
+                                + (kStages > 1 ? smem_pipe_read : 0)*kBlockN*VSmemStride
+                                + kk*32*VSmemStride + nn*16;
+                            return qsa_fp8_load_v_direct<VSmemStride>(base);
+                        };
+                        decltype(load_v_fragment(0)) fragments[2];
+                        fragments[0] = load_v_fragment(0);
+                        #pragma unroll
+                        for (int nn = 0; nn < kHeadDimV / 16; ++nn) {
+                            if (nn + 1 < kHeadDimV / 16) fragments[(nn + 1) % 2] = load_v_fragment(nn + 1);
+                            auto rb = make_tensor(reinterpret_cast<Element*>(&fragments[nn % 2]), Layout<Shape<_16>>{});
+                            #pragma unroll
+                            for (int mm = 0; mm < size<1>(tOrO); ++mm) {
+                                auto ap = tOrP(_,mm,kk);
+                                auto cp = tOrO(_,mm,nn);
+                                if constexpr (Is_QSA && QsaConfig::FixedGroup && QsaConfig::Group == 6) {
+                                    qsa_fp8_mma_fp32_add_sixhead(ap, rb, cp, 0U);
+                                } else {
+                                    qsa_fp8_mma_fp32_add(ap, rb, cp,
+                                        (pv_dependencies[nn % 6] & unsigned(params.window_size_right)));
+                                }
+                                unsigned dep = __float_as_uint(cp(0));
+                                #pragma unroll
+                                for (int ci=1; ci<8; ++ci) dep ^= __float_as_uint(cp(ci));
+                                pv_dependencies[nn % 6] = dep;
+                            }
+                        }
+                    }
+                }
+            } else
+#endif
 #if USE_AIU
             if constexpr (Fp8PvNsplit) {
                 // === N-split PV path (fp8_pv_nsplit_design.md) ===
@@ -1356,7 +1519,12 @@ struct CollectiveMainloopFwdSm80 {
 #else
             flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
 #endif
-            if constexpr (kStages > 1) { load_K_next(); }
+            if constexpr (Is_QSA_FP8) {
+                sync_threads();
+                if constexpr (Share_KV_Smem && !TrimHighRows) { load_K_next(); } // The six-head path prefetched K after its final V read.
+            } else {
+                if constexpr (kStages > 1) { load_K_next(); }
+            }
             smem_pipe_read = smem_pipe_read < kStages - 1 ? smem_pipe_read + 1 : 0;
         };
 
