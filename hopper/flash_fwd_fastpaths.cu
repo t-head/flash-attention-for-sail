@@ -213,8 +213,6 @@ __device__ __forceinline__ void update_bf16_row_max(
         a = max_op(a, max_op(max_op(score[n][0], score[n][1]), max_op(score[n][4], score[n][5])));
         b = max_op(b, max_op(max_op(score[n][2], score[n][3]), max_op(score[n][6], score[n][7])));
     }
-    // A warp vote is sufficient when every lane's local scores remain
-    // below the running maximum. Reduce across lanes only for an update.
     if (!__any_sync(0xffffffff, a * scale > mx0 || b * scale > mx1)) return;
 #pragma unroll
     for (int delta = 1; delta <= 2; delta *= 2) {
@@ -365,7 +363,7 @@ __global__ __launch_bounds__(NT) void mha_wi_bf16_guarded(Flash_fwd_params p, in
                 mx1 = b == -INFINITY ? 0.f : b;
             }
         }
-        else if constexpr (Retry) {
+        else {
             update_bf16_row_max(score, acc, scale, mx0, mx1, sum0, sum1);
         }
         int rp[N / 16][4];
@@ -382,88 +380,6 @@ __global__ __launch_bounds__(NT) void mha_wi_bf16_guarded(Flash_fwd_params p, in
 #pragma unroll
             for (int e = 0; e < 4; e++)
                 rp[n][e] = Ops::pack(score[n][e * 2], score[n][e * 2 + 1]);
-        }
-        if constexpr (!Retry) if (t > 0 && __any_sync(0xffffffff, z0 > 16777216.f || z1 > 16777216.f)) {
-#pragma unroll
-            for (int n = 0; n < N / 16; n++) {
-#pragma unroll
-                for (int e = 0; e < 8; e++)
-                    score[n][e] = 0.f;
-            }
-#pragma hggc mmatiestrictly
-            {
-#pragma unroll
-                for (int d = 0; d < 12; d++) {
-                    {
-#pragma unroll
-                        for (int n = 0; n < N / 16; n++) {
-                            int rk[4];
-                            Ops::ldm<false, 64, 1>(rk, kt + n * 128 + (d / 4) * N * 8 + (d % 4) * 2);
-                            Ops::mma(score[n], rq[d], rk);
-                        }
-                    }
-                }
-            }
-            bool masked = (t + 1) * N > klen;
-            masked = masked || (t + 1) * N > qstart + group * 64 + klen - qlen + 1;
-            if (uniform(int(masked))) {
-#pragma unroll
-                for (int n = 0; n < N / 16; n++) {
-#pragma unroll
-                    for (int e = 0; e < 8; e++) {
-                        int r = w * 16 + lane / 4 + ((e >> 1) & 1) * 8;
-                        int c = t * N + n * 16 + (lane & 3) * 2 + ((e >> 2) & 1) * 8 + (e & 1);
-                        bool valid = c < klen;
-                        valid = valid && c <= qstart + r + klen - qlen;
-                        if (!valid)
-                            score[n][e] = -INFINITY;
-                    }
-                }
-            }
-            float a = -INFINITY, b = -INFINITY;
-#pragma unroll
-            for (int n = 0; n < N / 16; n++) {
-                a = fmaxf(a, fmaxf(fmaxf(score[n][0], score[n][1]), fmaxf(score[n][4], score[n][5])));
-                b = fmaxf(b, fmaxf(fmaxf(score[n][2], score[n][3]), fmaxf(score[n][6], score[n][7])));
-            }
-#pragma unroll
-            for (int delta = 1; delta <= 2; delta *= 2) {
-                a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, delta));
-                b = fmaxf(b, __shfl_xor_sync(0xffffffff, b, delta));
-            }
-            a *= scale;
-            b *= scale;
-            a = fmaxf(mx0, a);
-            b = fmaxf(mx1, b);
-            bool update = (a > mx0 || b > mx1);
-            if (__any_sync(0xffffffff, update)) {
-                float alpha0 = update ? exp2f(mx0 - a) : 1.f, alpha1 = update ? exp2f(mx1 - b) : 1.f;
-                mx0 = update ? a : mx0;
-                mx1 = update ? b : mx1;
-                sum0 *= alpha0;
-                sum1 *= alpha1;
-#pragma unroll
-                for (int n = 0; n < 8; n++) {
-#pragma unroll
-                    for (int e = 0; e < 8; e++)
-                        acc[n][e] *= ((e >> 1) & 1) ? alpha1 : alpha0;
-                }
-            }
-            z0 = 0.f;
-            z1 = 0.f;
-#pragma unroll
-            for (int n = 0; n < N / 16; n++) {
-#pragma unroll
-                for (int e = 0; e < 8; e++) {
-                    float z = exp2f(fmaf(score[n][e], scale, -(((e >> 1) & 1) ? mx1 : mx0)));
-                    score[n][e] = z;
-                }
-                z0 += (score[n][0] + score[n][1]) + (score[n][4] + score[n][5]);
-                z1 += (score[n][2] + score[n][3]) + (score[n][6] + score[n][7]);
-#pragma unroll
-                for (int e = 0; e < 4; e++)
-                    rp[n][e] = Ops::pack(score[n][e * 2], score[n][e * 2 + 1]);
-            }
         }
         sum0 += z0;
         sum1 += z1;
@@ -506,7 +422,6 @@ __global__ __launch_bounds__(NT) void mha_wi_bf16_guarded(Flash_fwd_params p, in
         sum1 += __shfl_xor_sync(0xffffffff, sum1, delta);
     }
     float inv0 = sum0 > 0 ? __ppu_rcpf(sum0) : 0.f, inv1 = sum1 > 0 ? __ppu_rcpf(sum1) : 0.f;
-    bool retry = false;
 #pragma unroll
     for (int n = 0; n < 8; n++) {
 #pragma unroll
@@ -514,7 +429,6 @@ __global__ __launch_bounds__(NT) void mha_wi_bf16_guarded(Flash_fwd_params p, in
             int r = w * 16 + lane / 4 + ((e >> 1) & 1) * 8;
             int c = n * 16 + (lane & 3) * 2 + ((e >> 2) & 1) * 8 + (e & 1);
             if (qstart + r < qlen) {
-                if constexpr (!Retry) retry |= !isfinite(acc[n][e]);
                 o[int64_t(qstart + r) * p.o_row_stride + c] = B16(acc[n][e] * (((e >> 1) & 1) ? inv1 : inv0));
                 if (n == 0 && (lane & 3) == 0 && e < 4 && (e & 1) == 0) {
                     float sum = ((e >> 1) & 1) ? sum1 : sum0;
@@ -524,10 +438,6 @@ __global__ __launch_bounds__(NT) void mha_wi_bf16_guarded(Flash_fwd_params p, in
                 }
             }
         }
-    }
-    if constexpr (!Retry) {
-        if (__any_sync(0xffffffff, retry) && lane == 0)
-            atomicOr(retry_flags + 1 + int64_t(blockIdx.y) * gridDim.x + blockIdx.x, 1 << blockIdx.z);
     }
 #endif
 }
@@ -763,8 +673,10 @@ __global__ __launch_bounds__(NT) void mha_wi_bf16_peeled(Flash_fwd_params p, int
                 }
             }
         }
-        if constexpr (Retry)
-            update_bf16_row_max(score, acc, scale, mx0, mx1, sum0, sum1);
+        int vt = int(reinterpret_cast<uintptr_t>(s.qv.v[slot]) / 16);
+        int rv_first[4];
+        Ops::ldm<true, 1, 64>(rv_first, vt);
+        update_bf16_row_max(score, acc, scale, mx0, mx1, sum0, sum1);
         int rp[N / 16][4];
         float z0 = 0, z1 = 0;
 #pragma unroll
@@ -780,91 +692,8 @@ __global__ __launch_bounds__(NT) void mha_wi_bf16_peeled(Flash_fwd_params p, int
             for (int e = 0; e < 4; e++)
                 rp[n][e] = Ops::pack(score[n][e * 2], score[n][e * 2 + 1]);
         }
-        if constexpr (!Retry) if (__any_sync(0xffffffff, z0 > 16777216.f || z1 > 16777216.f)) {
-#pragma unroll
-            for (int n = 0; n < N / 16; n++) {
-#pragma unroll
-                for (int e = 0; e < 8; e++)
-                    score[n][e] = 0.f;
-            }
-#pragma hggc mmatiestrictly
-            {
-#pragma unroll
-                for (int d = 0; d < 12; d++) {
-                    {
-#pragma unroll
-                        for (int n = 0; n < N / 16; n++) {
-                            int rk[4];
-                            Ops::ldm<false, 64, 1>(rk, kt + n * 128 + (d / 4) * N * 8 + (d % 4) * 2);
-                            Ops::mma(score[n], rq[d], rk);
-                        }
-                    }
-                }
-            }
-            bool masked = (first + t + 1) * N > klen;
-            masked = masked || (first + t + 1) * N > qstart + group * 64 + klen - qlen + 1;
-            if (uniform(int(masked))) {
-#pragma unroll
-                for (int n = 0; n < N / 16; n++) {
-#pragma unroll
-                    for (int e = 0; e < 8; e++) {
-                        int r = w * 16 + lane / 4 + ((e >> 1) & 1) * 8;
-                        int c = (first + t) * N + n * 16 + (lane & 3) * 2 + ((e >> 2) & 1) * 8 + (e & 1);
-                        bool valid = c < klen;
-                        valid = valid && c <= qstart + r + klen - qlen;
-                        if (!valid)
-                            score[n][e] = -INFINITY;
-                    }
-                }
-            }
-            float a = -INFINITY, b = -INFINITY;
-#pragma unroll
-            for (int n = 0; n < N / 16; n++) {
-                a = fmaxf(a, fmaxf(fmaxf(score[n][0], score[n][1]), fmaxf(score[n][4], score[n][5])));
-                b = fmaxf(b, fmaxf(fmaxf(score[n][2], score[n][3]), fmaxf(score[n][6], score[n][7])));
-            }
-#pragma unroll
-            for (int delta = 1; delta <= 2; delta *= 2) {
-                a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, delta));
-                b = fmaxf(b, __shfl_xor_sync(0xffffffff, b, delta));
-            }
-            a *= scale;
-            b *= scale;
-            a = fmaxf(mx0, a);
-            b = fmaxf(mx1, b);
-            bool update = (a > mx0 || b > mx1);
-            if (__any_sync(0xffffffff, update)) {
-                float alpha0 = update ? exp2f(mx0 - a) : 1.f, alpha1 = update ? exp2f(mx1 - b) : 1.f;
-                mx0 = update ? a : mx0;
-                mx1 = update ? b : mx1;
-                sum0 *= alpha0;
-                sum1 *= alpha1;
-#pragma unroll
-                for (int n = 0; n < 8; n++) {
-#pragma unroll
-                    for (int e = 0; e < 8; e++)
-                        acc[n][e] *= ((e >> 1) & 1) ? alpha1 : alpha0;
-                }
-            }
-            z0 = 0.f;
-            z1 = 0.f;
-#pragma unroll
-            for (int n = 0; n < N / 16; n++) {
-#pragma unroll
-                for (int e = 0; e < 8; e++) {
-                    float z = exp2f(fmaf(score[n][e], scale, -(((e >> 1) & 1) ? mx1 : mx0)));
-                    score[n][e] = z;
-                }
-                z0 += (score[n][0] + score[n][1]) + (score[n][4] + score[n][5]);
-                z1 += (score[n][2] + score[n][3]) + (score[n][6] + score[n][7]);
-#pragma unroll
-                for (int e = 0; e < 4; e++)
-                    rp[n][e] = Ops::pack(score[n][e * 2], score[n][e * 2 + 1]);
-            }
-        }
         sum0 += z0;
         sum1 += z1;
-        int vt = int(reinterpret_cast<uintptr_t>(s.qv.v[slot]) / 16);
 #pragma hggc mmatiestrictly
         {
 #pragma unroll
@@ -872,9 +701,13 @@ __global__ __launch_bounds__(NT) void mha_wi_bf16_peeled(Flash_fwd_params p, int
                 {
 #pragma unroll
                     for (int n = 0; n < 8; n++) {
-                        int rv[4];
-                        Ops::ldm<true, 1, 64>(rv, vt + (n / 4) * N * 8 + (n % 4) * 2 + d * 128);
-                        Ops::mma(acc[n], rp[d], rv);
+                        if (d == 0 && n == 0) {
+                            Ops::mma(acc[n], rp[d], rv_first);
+                        } else {
+                            int rv[4];
+                            Ops::ldm<true, 1, 64>(rv, vt + (n / 4) * N * 8 + (n % 4) * 2 + d * 128);
+                            Ops::mma(acc[n], rp[d], rv);
+                        }
                     }
                 }
             }
@@ -903,7 +736,6 @@ __global__ __launch_bounds__(NT) void mha_wi_bf16_peeled(Flash_fwd_params p, int
         sum1 += __shfl_xor_sync(0xffffffff, sum1, delta);
     }
     float inv0 = sum0 > 0 ? __ppu_rcpf(sum0) : 0.f, inv1 = sum1 > 0 ? __ppu_rcpf(sum1) : 0.f;
-    bool retry = false;
 #pragma unroll
     for (int n = 0; n < 8; n++) {
 #pragma unroll
@@ -911,7 +743,6 @@ __global__ __launch_bounds__(NT) void mha_wi_bf16_peeled(Flash_fwd_params p, int
             int r = w * 16 + lane / 4 + ((e >> 1) & 1) * 8;
             int c = n * 16 + (lane & 3) * 2 + ((e >> 2) & 1) * 8 + (e & 1);
             if (qstart + r < qlen) {
-                if constexpr (!Retry) retry |= !isfinite(acc[n][e]);
                 if constexpr (Splits > 1) {
                     partial[int64_t(qstart + r) * V + c] = acc[n][e] * (((e >> 1) & 1) ? inv1 : inv0);
                     if (n == 0 && (lane & 3) == 0 && e < 4 && (e & 1) == 0) {
@@ -931,10 +762,6 @@ __global__ __launch_bounds__(NT) void mha_wi_bf16_peeled(Flash_fwd_params p, int
                 }
             }
         }
-    }
-    if constexpr (!Retry) {
-        if (__any_sync(0xffffffff, retry) && lane == 0)
-            atomicOr(retry_flags + 1 + int64_t(blockIdx.y) * gridDim.x + blockIdx.x, 1 << blockIdx.z);
     }
 #endif
 }
@@ -1805,21 +1632,8 @@ static bool try_run_mha_bf16_wi(Flash_fwd_params &p, hggcStream_t stream, int ma
         workspace.params.seqlen_k = int(std::min(int64_t(p.seqlen_k),
             ((work_k + wi::N - 1) / wi::N) * wi::N));
     }
-    workspace.params.num_splits = splits;  // Internal partition count for the retry policy.
-    int64_t const query_tiles = (int64_t(p.seqlen_q) + wi::BM - 1) / wi::BM;
-    // Count, per-query/head/batch split masks, alignment, then bounded tile coordinates.
-    int const retry_capacity = mha::mha_ws_retry_capacity(workspace.params);
-    int64_t const flag_words = mha::mha_retry_queue_offset(int64_t(p.b) * p.h * query_tiles)
-        + retry_capacity * (sizeof(mha::MhaRetryTile) / sizeof(int));
-    auto retry_flags = at::zeros({flag_words},
-        at::TensorOptions().device(at::kCUDA).dtype(at::kInt));
-    launch_mha_bf16_wi_by_layout<false>(workspace.params, splits, stream, retry_flags.data_ptr<int>());
-    // Deferred normalization can overflow PV on finite, unusually large V.
-    // Test completed accumulators once at writeback, then repair only the
-    // affected query tiles and KV partitions with exact online maxima. Sparse
-    // retries reuse WS and compact partials; dense retries keep WI. All flags
-    // and slot mappings are fresh on every caller-stream graph replay.
-    launch_mha_bf16_wi_by_layout<true>(workspace.params, splits, stream, retry_flags.data_ptr<int>());
+    workspace.params.num_splits = splits;
+    launch_mha_bf16_wi_by_layout<false>(workspace.params, splits, stream, nullptr);
     return true;
 }
 
