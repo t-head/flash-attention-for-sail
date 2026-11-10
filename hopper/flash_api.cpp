@@ -14,6 +14,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cutlass/numeric_types.h>
 #include "flash.h"
+#include "flash_fwd_fastpaths.h"
 #ifdef USE_PPU
 #include "qsa/dispatch.h"
 #endif
@@ -489,7 +490,12 @@ void run_mha_fwd_qsa(Flash_fwd_params &params, hggcStream_t stream) {
 }
 #endif
 
-void run_mha_fwd(Flash_fwd_params &params, hggcStream_t stream) {
+void run_mha_fwd(Flash_fwd_params &params, hggcStream_t stream, int max_seqlen_k = -1) {
+#ifdef FLASHATTENTION_FWD_FASTPATHS
+    if (flash::try_run_mha_fast_path(params, stream, max_seqlen_k)) {
+        return;
+    }
+#endif
     // HEADDIM_SWITCH(params.d, [&] {
     //     run_mha_fwd_<cutlass::half_t, kHeadSize>(params, stream);
     // });
@@ -1863,7 +1869,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         bool const launched_tail = num_splits <= 0 && run_qsa_sm80_split_tail(params, softmax_lse, stream);
         if (!launched_tail)
 #endif
-        { run_mha_fwd(params, stream); }
+        { run_mha_fwd(params, stream, max_seqlen_k_.value_or(-1)); }
         if (params.num_splits > 1) {
             if (out_type == at::ScalarType::BFloat16) {
                 // Since we want output in BF16. Otherwise fwd_combine will output to FP16

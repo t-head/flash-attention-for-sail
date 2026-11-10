@@ -67,6 +67,10 @@ ENABLE_QSA_FP8 = (
              or DISABLE_PAGEDKV or DISABLE_PACKGQA)
 )
 
+# The native unit contains D192 BF16 and FP8 WI paths.
+ENABLE_FWD_FASTPATHS = (USE_PPU and not DISABLE_SM8x and not FA3_HLLM_BUILD
+                        and not DISABLE_HDIM192
+                        and os.getenv("FLASH_ATTENTION_ENABLE_MHA_FAST_PATH", "TRUE") == "TRUE")
 
 # ============================================================================
 # Source file generation
@@ -147,6 +151,7 @@ if not SKIP_CUDA_BUILD:
         + (["-DFLASHATTENTION_DISABLE_SM90"] if DISABLE_SM90 else [])
         + (["-DFLASHATTENTION_ENABLE_VCOLMAJOR"] if ENABLE_VCOLMAJOR else [])
         + ["-DUSE_PPU", "-DUSE_AIU=1"]
+        + (["-DFLASHATTENTION_FWD_FASTPATHS"] if ENABLE_FWD_FASTPATHS else [])
         + (["-DFA3_HOLMES_BUILD"] if FA3_HOLMES_WHEEL else [])
         + (["-DFA3_HLLM_BUILD"] if FA3_HLLM_BUILD else [])
         + (["-DFA3_HLLM_USE_ADDR"] if FA3_HLLM_USE_ADDR else [])
@@ -162,7 +167,8 @@ if not SKIP_CUDA_BUILD:
         + ([192] if not DISABLE_HDIM192 else [])
         + ([256] if not DISABLE_HDIM256 else [])
     )
-    HEAD_DIMENSIONS_FWD_SM80 = HEAD_DIMENSIONS_BWD
+    # softcapall already includes the D192/V128 instances; reduced builds need them explicitly.
+    HEAD_DIMENSIONS_FWD_SM80 = HEAD_DIMENSIONS_BWD + (["192_128"] if DISABLE_SOFTCAP and not DISABLE_HDIM192 else [])
     SPLIT = [""] + (["_split"] if not DISABLE_SPLIT else [])
     PAGEDKV = [""] + (["_paged"] if not DISABLE_PAGEDKV else [])
     SOFTCAP = [""] + (["_softcap"] if not DISABLE_SOFTCAP else [])
@@ -186,6 +192,8 @@ if not SKIP_CUDA_BUILD:
     if not DISABLE_SPLIT:
         sources += ["flash_fwd_combine.cu"]
     sources += ["flash_prepare_scheduler.cu"]
+    if ENABLE_FWD_FASTPATHS:
+        sources += ["flash_fwd_fastpaths.cu"]
 
     if ENABLE_QSA:
         sources += ["qsa/dispatch.cu"]

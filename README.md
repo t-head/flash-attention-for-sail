@@ -549,6 +549,45 @@ pytest -q -s tests/test_flash_attn.py
 pytest -q -s hopper/test_flash_attn.py
 ```
 
+## PPU warp-interleaved MHA forward
+
+ZW-M890P can select WI for causal BF16 and E4M3 attention with QK/V head
+sizes 192/128. Fixed, packed varlen, and packed Q with page64 KV are supported.
+WI interleaves query groups over a three-stage AIU KV pipeline. BF16 updates
+the online softmax maximum before packing probabilities; it does not defer
+maximum updates or recompute QK. FP8 reuses the existing online softmax and
+uses E4M3 for both QK and PV.
+
+Selection uses useful sequence work and query-grid wave utilization, without
+model names, head-count lists or a batch=1 restriction. Unsupported semantics
+and unprofitable shapes retain the upstream kernels. For paged KV, forward
+the existing `max_seqlen_k` argument as a used-length bound. Page-table capacity
+remains separate for addressing; device `cache_seqlens` still controls masking
+and actual lengths, including graph replay. Omitting the bound retains the
+upstream path.
+
+BF16 ragged queries map a compact tile grid from device sequence lengths,
+so empty batch slots do not expand the launch to batch times maxQ. Uniform
+queries retain the original grid.
+
+Long BF16 KV ranges can use two partitions when this improves wave utilization.
+Normalized FP32 partials use the existing split-combine implementation. The
+split, head-dimension, dtype and paged-KV build switches remain effective.
+FP8 WI optionally packs V for its MMA layout on the caller's stream. Workspace
+is bounded by twice the page-aligned V storage, 1/64 of total device memory,
+and 1/8 of currently driver-free memory; insufficient space retains the native
+path. CUDA graph capture retains its selected workspace until graph release,
+so allocate KV capacity before capturing graphs.
+
+Run `cudafy.py` and build in a separate worktree. Set
+`FLASH_ATTENTION_ENABLE_MHA_FAST_PATH=FALSE` to omit the WI translation unit.
+WI uses the same backend compiler options as the native forward kernels.
+Targeted layout, stream, graph and precision checks reuse the existing runner:
+
+```bash
+python -m pytest hopper/test_flash_attn.py -k 'mha_wi' -v
+```
+
 ## Issue Reporting
 Please submit a Code Issue if you encounter any problems!
 

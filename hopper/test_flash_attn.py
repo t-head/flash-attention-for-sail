@@ -43,6 +43,7 @@ DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE
 DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE"
 DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
 DISABLE_HDIMV = os.getenv("FLASH_ATTENTION_DISABLE_HDIMV", "FALSE") == "TRUE"
+ENABLE_MHA_FAST_PATH = os.getenv("FLASH_ATTENTION_ENABLE_MHA_FAST_PATH", "TRUE") == "TRUE"
 
 COMPILED_HDIMS = (
     []
@@ -1187,3 +1188,684 @@ def test_flash3_bw_compatibility() -> None:
         "int attention_chunk=0, bool has_softcap=False, int num_splits=0, bool? pack_gqa=None, "
         "int sm_margin=0) -> Tensor"
     ))
+
+
+def _mha_profiled_call(run):
+    """Run once and return CUDA kernel names for route assertions."""
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        result = run()
+        torch.cuda.synchronize()
+    return result, [event.name for event in prof.events()]
+
+
+def _mha_wi_enabled():
+    """Check the test build and current device before requiring a WI route."""
+    return (ENABLE_MHA_FAST_PATH
+            and torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count == 39)
+
+
+def _mha_wi_paged_kv(k, v, klens):
+    """Materialize random physical pages while retaining dense K/V as the reference."""
+    heads, page_size = k.shape[1], 64
+    pages = sum((n + page_size - 1) // page_size for n in klens) + 1
+    kc = torch.empty(pages, page_size, heads, k.shape[-1], device=k.device, dtype=k.dtype)
+    vc = torch.empty(pages, page_size, heads, v.shape[-1], device=v.device, dtype=v.dtype)
+    table = torch.full((len(klens), (max(klens) + 63) // 64 + 1), -1,
+                       device=k.device, dtype=torch.int32)
+    lengths = torch.tensor(klens, device=k.device, dtype=torch.int32)
+    permutation = torch.randperm(pages, device=k.device)
+    def refresh(lengths_cpu, reverse_pages=False):
+        table.fill_(-1)
+        lengths.copy_(torch.tensor(lengths_cpu, device=k.device, dtype=torch.int32))
+        order = permutation.flip(0) if reverse_pages else permutation
+        offset = ko = 0
+        for batch, n in enumerate(lengths_cpu):
+            count = (n + page_size - 1) // page_size
+            ids = order[offset:offset + count]
+            table[batch, :count] = ids.to(torch.int32)
+            for source, cache in [(k, kc), (v, vc)]:
+                padded = torch.empty(count * page_size, heads, source.shape[-1],
+                                     device=source.device, dtype=source.dtype)
+                padded.view(torch.uint8).zero_()
+                padded[:n].copy_(source[ko:ko + n])
+                cache.view(torch.uint8)[ids] = padded.view(count, page_size, heads, source.shape[-1]).view(torch.uint8)
+            ko += n
+            offset += count
+    refresh(klens)
+    return kc, vc, table, lengths, refresh
+
+
+@pytest.mark.parametrize("heads", [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96])
+@pytest.mark.parametrize("qlens,klens,causal,expected_route", [
+    ([32], [8192], True, "native"),
+    ([8192], [8192], True, "guarded"),
+    ([8192], [32768], True, "peeled"),
+    ([8192], [8192], False, "native"),
+    ([32, 65], [8192, 16385], True, "native"),
+    ([32, 0, 33, 1], [8192, 0, 16385, 0], True, "native"),
+    ([8192, 257, 0], [8192, 4097, 0], True, "guarded-compact"),
+    ([8192, 0, 513], [32768, 0, 1025], True, "peeled-compact"),
+    ([8192, 257], [8192, 4097], False, "native"),
+    ([8192, 513], [8192, 0], True, "guarded-compact"),
+    ([32] * 8, [8192] * 8, True, "native"),
+    ([32] * 16, [8192] * 16, True, "native"),
+    ([8192] * 8, [8192] * 8, True, "guarded"),
+    ([4096], [90112], True, "peeled"),
+    ([4096] * 2, [90112] * 2, True, "peeled"),
+    ([4096], [90112], False, "native"),
+    ([1024], [16385], True, None),
+    ([4096], [262144], True, "peeled"),
+    ([512] * 4, [4096] * 4, True, None),
+    ([64], [16384], True, "native"),
+    ([32, 32], [131072, 65536], True, "native"),
+    ([32, 0, 32, 0], [8192, 0, 16385, 0], True, "native"),
+    ([65, 65], [8193, 8193], True, "native"),
+    ([1024], [90112], True, None),
+    ([1024] * 3, [90112] * 3, True, "peeled"),
+    ([1024, 1023, 1022], [90112, 65535, 0], True, "peeled-compact"),
+    ([1192], [9540], True, None),
+    ([2385], [9540], True, None),
+    ([65536] + [0] * 31, [65536] + [0] * 31, True, "peeled-compact"),
+    ([65536] + [0] * 32, [65536] + [0] * 32, True, "peeled-compact"),
+    ([65536] + [0] * 63, [65536] + [0] * 63, True,
+     {"packed": "peeled-compact", "paged64": "native"}),
+    ([65536] + [1] * 63, [65536] + [1024] * 63, True,
+     {"packed": "peeled-compact", "paged64": "native"}),
+    ([65536] * 2 + [0] * 62, [65536] * 2 + [0] * 62, True, "peeled-compact"),
+    ([0] * 64, [0] * 64, True, "native"),
+], ids=["native", "wi-guarded", "wi-peeled", "wi-noncausal",
+        "batch2-native-ragged", "batch4-native-empty", "batch3-wi-ragged",
+        "batch3-wi-peeled", "batch2-wi-noncausal", "batch2-wi-empty-kv",
+        "batch8-native", "batch16-native", "batch8-wi", "wi-long-prefix",
+        "batch2-wi-long-prefix", "wi-noncausal-long-prefix", "wi-short-query-many-heads",
+        "wi-large-kv", "wi-batch4-short-query", "native-two-query-tiles",
+        "native-long-ragged-kv", "native-adaptive-splits-empty", "native-query-and-page-tail",
+        "wi-kv-partition", "batch3-wi-kv-partition", "batch3-wi-kv-partition-ragged",
+        "paged-wave-tail-short", "paged-wave-tail-long", "batch32-empty",
+        "batch33-empty", "batch64-empty", "batch64-nearly-empty",
+        "batch64-two-nonempty", "batch64-all-empty"])
+@pytest.mark.parametrize("layout", ["packed", "paged64", "fixed"])
+def test_mha_wi_bf16(heads, qlens, klens, causal, expected_route, layout):
+    if cuda_cap != 89 or not torch.cuda.get_device_name().startswith("ZW-M890P"):
+        pytest.skip("WI requires the qualified device")
+    if DISABLE_HDIM192:
+        pytest.skip("D192 was disabled at build time")
+    fixed, paged = layout == "fixed", layout == "paged64"
+    if paged and DISABLE_PAGEDKV:
+        pytest.skip("Paged KV was disabled at build time")
+    if fixed and (len(set(qlens)) != 1 or len(set(klens)) != 1):
+        pytest.skip("Fixed tensors require uniform sequence lengths")
+    torch.manual_seed(sum(qlens) + sum(klens) + heads)
+    q, k, v = [torch.randn(n, heads, d, device="cuda", dtype=torch.bfloat16)
+               for n, d in [(sum(qlens), 192), (sum(klens), 192), (sum(klens), 128)]]
+    def cumulative(lengths):
+        return torch.tensor([0, *itertools.accumulate(lengths)], device="cuda", dtype=torch.int32)
+    cq, ck = cumulative(qlens), cumulative(klens)
+    from flash_attn_interface import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
+    if paged:
+        kc, vc, table, lengths, refresh = _mha_wi_paged_kv(k, v, klens)
+    def forward():
+        if fixed:
+            batch = len(qlens)
+            out, lse, *_ = flash_attn_func(
+                q.view(batch, qlens[0], heads, 192),
+                k.view(batch, klens[0], heads, 192),
+                v.view(batch, klens[0], heads, 128),
+                causal=causal, num_splits=1, pack_gqa=False, return_attn_probs=True)
+            return out.flatten(0, 1), lse.permute(1, 0, 2).reshape(heads, -1)
+        if paged:
+            return flash_attn_with_kvcache(q, kc, vc, page_table=table,
+                cache_seqlens=lengths, cu_seqlens_q=cq, max_seqlen_q=max(qlens),
+                max_seqlen_k=max(klens), causal=causal, num_splits=1,
+                pack_gqa=False, return_softmax_lse=True)
+        return flash_attn_varlen_func(q, k, v, cq, ck, max(qlens), max(klens),
+                                     causal=causal, num_splits=1, pack_gqa=False, return_attn_probs=True)
+    def check(out, lse):
+        qo = ko = 0
+        for qn, kn in zip(qlens, klens):
+            if qn:
+                rows = torch.arange(qn, device="cuda") if qn <= 128 else torch.tensor(
+                    [0, qn // 2, qn - 1], device="cuda")
+                qr, kr, vr = q[qo + rows].float(), k[ko:ko + kn].float(), v[ko:ko + kn].float()
+                valid = torch.arange(kn, device="cuda")[None, :] <= rows[:, None] + kn - qn
+                if not causal:
+                    valid.fill_(True)
+                scores = torch.einsum("rhd,khd->rhk", qr * (192 ** -.5), kr)
+                scores.masked_fill_(~valid[:, None, :], float("-inf"))
+                probabilities = torch.nan_to_num(torch.softmax(scores, dim=-1), nan=0.0)
+                expected = torch.einsum("rhk,khd->rhd", probabilities, vr)
+                torch.testing.assert_close(out[qo + rows].float(), expected, atol=.015, rtol=.015)
+                torch.testing.assert_close(lse[:, qo + rows].T, torch.logsumexp(scores, dim=-1),
+                                           atol=.0001, rtol=.0001)
+            qo += qn
+            ko += kn
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        # These route expectations apply to the specified heads and all three
+        # layouts above. Other cases retain their independent numerical checks.
+        route = expected_route.get(layout) if isinstance(expected_route, dict) else expected_route
+        if route is not None and heads in (6, 12, 24) and _mha_wi_enabled():
+            result, kernels = _mha_profiled_call(forward)
+            wi_kernels = [name for name in kernels if "mha_wi_bf16_" in name]
+            if route == "native":
+                assert not wi_kernels, kernels
+            else:
+                kernel = "mha_wi_bf16_" + route.removesuffix("-compact")
+                selected = [name for name in wi_kernels if kernel in name]
+                assert selected, kernels
+                if route.endswith("-compact"):
+                    assert any(",true>" in name.replace(" ", "") for name in selected), kernels
+            out, lse = result[:2]
+        else:
+            out, lse, *_ = forward()
+        check(out, lse)
+        if sum(qlens) and (len(qlens) > 1 or fixed):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out, lse, *_ = forward()
+            # Change both data and per-sequence offsets without changing the
+            # packed allocation or the host maximum sequence lengths.
+            q.mul_(.75)
+            k.neg_()
+            v.mul_(.5)
+            qlens, klens = qlens[::-1], klens[::-1]
+            cq.copy_(cumulative(qlens))
+            ck.copy_(cumulative(klens))
+            if paged:
+                refresh(klens, reverse_pages=True)
+            graph.replay()
+            check(out, lse)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+
+
+@pytest.mark.parametrize("seqlen_q,seqlen_k,heads", [
+    (2048, 16384, 8), (2048, 32768, 8), (1024, 90112, 24),
+], ids=["guarded", "peeled", "peeled-kv-partition"])
+@pytest.mark.parametrize("layout", ["fixed", "packed", "paged64"])
+@pytest.mark.parametrize("batch", [1, 2])
+def test_mha_wi_bf16_large_values(seqlen_q, seqlen_k, heads, layout, batch):
+    if cuda_cap != 89 or not torch.cuda.get_device_name().startswith("ZW-M890P"):
+        pytest.skip("WI requires the qualified device")
+    if DISABLE_HDIM192:
+        pytest.skip("D192 was disabled at build time")
+    if layout == "paged64" and DISABLE_PAGEDKV:
+        pytest.skip("Paged KV was disabled at build time")
+    # Keep stable FP32 accumulation finite even in native single-partition
+    # fallback. Deferred probabilities still overflow PV.
+    large = 2.**111 if batch == 1 else 2.**108
+    qlens = [seqlen_q] * batch
+    klens = [seqlen_k] * batch
+    if batch > 1 and layout != "fixed":
+        qlens[-1] += -1 if seqlen_q == seqlen_k else 1
+        klens[-1] -= 1
+    qprefix, kprefix = [0], [0]
+    for qn, kn in zip(qlens, klens):
+        qprefix.append(qprefix[-1] + qn)
+        kprefix.append(kprefix[-1] + kn)
+    q = torch.zeros(sum(qlens), heads, 192, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros(sum(klens), heads, 192, device="cuda", dtype=torch.bfloat16)
+    v = torch.zeros(sum(klens), heads, 128, device="cuda", dtype=torch.bfloat16)
+    q[:, :, 0] = 1
+    k[:, :, 0] = 18
+    for offset in kprefix[:-1]:
+        k[offset:offset + 128, :, 0] = 6
+    v[:, -1, -1] = large
+    cq = torch.tensor(qprefix, device="cuda", dtype=torch.int32)
+    ck = torch.tensor(kprefix, device="cuda", dtype=torch.int32)
+    kwargs = dict(causal=True, softmax_scale=1., num_splits=1, pack_gqa=False)
+    values = v
+    if layout == "fixed":
+        def run():
+            return flash_attn_func(q.view(batch, seqlen_q, heads, 192),
+                k.view(batch, seqlen_k, heads, 192), v.view(batch, seqlen_k, heads, 128),
+                return_attn_probs=True, **kwargs)
+    elif layout == "packed":
+        def run():
+            return flash_attn_varlen_func(q, k, v, cq, ck, max(qlens), max(klens),
+                                          return_attn_probs=True, **kwargs)
+    else:
+        kc, vc, table, lengths, _ = _mha_wi_paged_kv(k, v, klens)
+        values = vc
+        def run():
+            return flash_attn_with_kvcache(q, kc, vc, page_table=table,
+                cache_seqlens=lengths, cu_seqlens_q=cq, max_seqlen_q=max(qlens),
+                max_seqlen_k=max(klens), return_softmax_lse=True, **kwargs)
+    def check(result, value, head):
+        out, lse = result[:2]
+        assert torch.isfinite(out).all()
+        expected = torch.zeros_like(out, dtype=torch.float32)
+        expected[..., head, -1] = 1
+        torch.testing.assert_close(out.float() / value, expected, atol=.015, rtol=.015)
+        for bi, (qn, kn) in enumerate(zip(qlens, klens)):
+            count = torch.arange(qn, device="cuda").float() + kn - qn + 1
+            first = count.clamp(max=128)
+            shifted = torch.logaddexp(first.log() + 6, (count - first).log() + 18)
+            expected_lse = torch.where(q[qprefix[bi]:qprefix[bi + 1], :, 0].T.bool(),
+                                       shifted[None, :], count.log()[None, :])
+            actual_lse = lse[bi] if layout == "fixed" else lse[:, qprefix[bi]:qprefix[bi + 1]]
+            torch.testing.assert_close(actual_lse, expected_lse, atol=.0001, rtol=.0001)
+    # Require the selected schedule only when this build/device supports WI.
+    if _mha_wi_enabled():
+        result, kernels = _mha_profiled_call(run)
+        kernel = "mha_wi_bf16_guarded" if seqlen_k < 32768 else "mha_wi_bf16_peeled"
+        assert any(kernel in name for name in kernels), kernel
+        check(result, large, heads - 1)
+    else:
+        check(run(), large, heads - 1)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = run()
+    # Reuse one graph while changing batch/tile/head location, value sign
+    # and score range. Online normalization must not depend on prior replays.
+    for value, pattern, head in [(large, "all", heads - 1), (1., "all", heads - 1),
+            (-large, "last", 0), (.25, "none", 0), (large, "first", 0),
+            (large, "all", heads - 1), (1., "none", heads - 1)]:
+        values.zero_()
+        values[..., head, -1] = value
+        q.zero_()
+        if pattern == "all":
+            q[:, :, 0] = 1
+        elif pattern == "last":
+            start = qprefix[-2] + ((qlens[-1] - 1) // 256) * 256
+            q[start:qprefix[-1], head, 0] = 1
+        elif pattern == "first":
+            q[:min(256, qlens[0]), head, 0] = 1
+        graph.replay()
+        check(result, value, head)
+
+
+@pytest.mark.parametrize("seqlen_q,seqlen_k,heads,splits", [
+    (1024, 90112, 24, 2),
+], ids=["wi-split-merge"])
+@pytest.mark.parametrize("layout", ["fixed", "packed", "paged64"])
+def test_mha_wi_bf16_split_large_values(seqlen_q, seqlen_k, heads, splits, layout):
+    if not _mha_wi_enabled():
+        pytest.skip("This regression requires WI internal KV splitting")
+    if DISABLE_SPLIT:
+        pytest.skip("Split-combine was disabled at build time")
+    if cuda_cap != 89 or not torch.cuda.get_device_name().startswith("ZW-M890P"):
+        pytest.skip("WI requires the qualified device")
+    if DISABLE_HDIM192 or (layout == "paged64" and DISABLE_PAGEDKV):
+        pytest.skip("Required D192/paged support was disabled at build time")
+    q = torch.zeros(seqlen_q, heads, 192, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros(seqlen_k, heads, 192, device="cuda", dtype=torch.bfloat16)
+    v = torch.zeros(seqlen_k, heads, 128, device="cuda", dtype=torch.bfloat16)
+    q[..., 0] = 1
+    # One unit probability per partition keeps each PV accumulator finite.
+    # Equal partition LSEs expose overflow only in the subsequent split merge.
+    step = seqlen_k // splits
+    k[::step, :, 0] = 256
+    cq = torch.tensor([0, seqlen_q], device="cuda", dtype=torch.int32)
+    ck = torch.tensor([0, seqlen_k], device="cuda", dtype=torch.int32)
+    kwargs = dict(causal=True, softmax_scale=1., num_splits=1, pack_gqa=False)
+    if layout == "paged64":
+        kc, vc, table, lengths, refresh = _mha_wi_paged_kv(k, v, [seqlen_k])
+        # Keep the capacity exact so the internal KV split boundaries match
+        # the peaked keys above; workspace-capacity behavior is tested below.
+        table = table[:, :seqlen_k // 64]
+    def run():
+        if layout == "fixed":
+            return flash_attn_func(q[None], k[None], v[None], return_attn_probs=True, **kwargs)
+        if layout == "packed":
+            return flash_attn_varlen_func(q, k, v, cq, ck, seqlen_q, seqlen_k,
+                                          return_attn_probs=True, **kwargs)
+        return flash_attn_with_kvcache(q, kc, vc, page_table=table,
+            cache_seqlens=lengths, cu_seqlens_q=cq, max_seqlen_q=seqlen_q,
+            max_seqlen_k=seqlen_k, return_softmax_lse=True, **kwargs)
+    large = 2.**127
+    def set_values(signs):
+        v.zero_()
+        for split, sign in enumerate(signs):
+            v[split * step, :, -1] = sign * large
+        if layout == "paged64":
+            refresh([seqlen_k])
+    def check(result, signs):
+        out, lse = result[:2]
+        assert torch.isfinite(out).all()
+        expected = torch.zeros_like(out, dtype=torch.float32)
+        expected[..., -1] = sum(signs) / splits
+        torch.testing.assert_close(out.float() / large, expected, atol=.015, rtol=.015)
+        torch.testing.assert_close(lse, torch.full_like(lse, 256 + math.log(splits)),
+                                   atol=.0001, rtol=.0001)
+    signs = [1] * splits
+    set_values(signs)
+    result, kernels = _mha_profiled_call(run)
+    assert any("mha_wi_bf16_" in name for name in kernels), kernels
+    check(result, signs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = run()
+    for signs in [[1, 1, -1] + [0] * (splits - 3) if splits > 2 else [1, -1],
+                  [0] * splits, [-1] * splits]:
+        set_values(signs)
+        graph.replay()
+        check(result, signs)
+
+
+@pytest.mark.parametrize("layout", ["fixed", "packed", "paged64"])
+@pytest.mark.parametrize("dot,positive_count", [(77.5, 267), (56.68603515625, 59)])
+def test_mha_wi_bf16_finite_cancellation(layout, dot, positive_count):
+    if cuda_cap != 89 or not torch.cuda.get_device_name().startswith("ZW-M890P"):
+        pytest.skip("WI requires the qualified device")
+    if DISABLE_HDIM192 or (layout == "paged64" and DISABLE_PAGEDKV):
+        pytest.skip("Required D192/paged support was disabled at build time")
+    qlen, klen, heads = 16384, 49152, 6
+    q = torch.zeros(qlen, heads, 192, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros(klen, heads, 192, device="cuda", dtype=torch.bfloat16)
+    v = torch.zeros(klen, heads, 128, device="cuda", dtype=torch.bfloat16)
+    high = torch.tensor(dot, dtype=torch.bfloat16).item()
+    low = torch.tensor(dot - high, dtype=torch.bfloat16).item()
+    q[..., :2] = 1
+    k[..., 0] = -1024
+    k[:positive_count, :, 0] = 0
+    k[384, :, 0], k[384, :, 1] = high, low
+    v[:positive_count, :, 0], v[384, :, 0] = 128, -128
+    cq = torch.tensor([0, qlen], device="cuda", dtype=torch.int32)
+    ck = torch.tensor([0, klen], device="cuda", dtype=torch.int32)
+    kwargs = dict(causal=True, num_splits=1, pack_gqa=False)
+    if layout == "fixed":
+        run = lambda: flash_attn_func(q[None], k[None], v[None], return_attn_probs=True, **kwargs)
+    elif layout == "packed":
+        run = lambda: flash_attn_varlen_func(q, k, v, cq, ck, qlen, klen, return_attn_probs=True, **kwargs)
+    else:
+        kc, vc, table, lengths, _ = _mha_wi_paged_kv(k, v, [klen])
+        run = lambda: flash_attn_with_kvcache(q, kc, vc, cu_seqlens_q=cq,
+            max_seqlen_q=qlen, cache_seqlens=lengths, page_table=table,
+            max_seqlen_k=klen, return_softmax_lse=True, **kwargs)
+    out, lse = run()[:2]
+    probability = math.exp((high + low) / math.sqrt(192))
+    expected = 128 * (positive_count - probability) / (positive_count + probability)
+    torch.testing.assert_close(out[..., 0].float(), torch.full_like(out[..., 0].float(), expected),
+                               atol=.015, rtol=.015)
+    assert not torch.count_nonzero(out[..., 1:])
+    torch.testing.assert_close(lse, torch.full_like(lse, math.log(positive_count + probability)),
+                               atol=.0001, rtol=.0001)
+    if _mha_wi_enabled():
+        _, names = _mha_profiled_call(run)
+        assert any("mha_wi_bf16_" in name for name in names)
+
+
+@pytest.mark.parametrize("paged", [False, True], ids=["packed", "paged64"])
+@pytest.mark.parametrize("capacity", [1048576, 16384], ids=["over-cap", "within-cap"])
+def test_mha_wi_fp8_workspace(paged, capacity):
+    if cuda_cap != 89 or not torch.cuda.get_device_name().startswith("ZW-M890P"):
+        pytest.skip("FP8 WI requires the qualified device")
+    if DISABLE_FP8 or DISABLE_HDIM192:
+        pytest.skip("D192 FP8 was disabled at build time")
+    if paged and DISABLE_PAGEDKV:
+        pytest.skip("Paged KV was disabled at build time")
+    from flash_attn_interface import _flash_attn_forward
+    batch, qn, kn = 2, 8192, 16384
+    head_dim, value_dim, heads, heads_k = 192, 128, 6, 6
+    torch.manual_seed(42)
+    q, k, v = [torch.randn(n, h, d, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+               for n, h, d in [(batch * qn, heads, head_dim),
+                               (batch * kn, heads_k, head_dim), (batch * kn, heads_k, value_dim)]]
+    cq = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * qn
+    ck = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * kn
+    used_q = torch.full((batch,), qn, device="cuda", dtype=torch.int32)
+    used_k = torch.full((batch,), kn, device="cuda", dtype=torch.int32)
+    table = None
+    if paged:
+        k = k.view(-1, 64, heads_k, head_dim)
+        v = v.view(-1, 64, heads_k, value_dim)
+        table = torch.zeros(batch, capacity // 64, device="cuda", dtype=torch.int32)
+        table[:, :kn // 64] = torch.arange(batch * kn // 64, device="cuda",
+                                          dtype=torch.int32).view(batch, -1)
+    def run(generic=False):
+        return _flash_attn_forward(q, k, v, cu_seqlens_q=cq,
+            cu_seqlens_k=None if paged else ck, seqused_q=used_q if generic else None,
+            seqused_k=used_k if paged else None, page_table=table,
+            max_seqlen_q=qn, max_seqlen_k=capacity, causal=True, num_splits=1, pack_gqa=False)
+    reference = run(generic=True)
+    torch.cuda.synchronize()
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    allocated = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    result, kernels = _mha_profiled_call(run)
+    # Bound both selected-WI scratch and over-cap native fallback. Include
+    # output, LSE and a small scheduler allowance in the measured live peak.
+    output_bytes = result[0].numel() * result[0].element_size() + result[1].numel() * 4
+    storage_limit = 2 * v.numel() * v.element_size()
+    assert torch.cuda.max_memory_allocated() - allocated <= output_bytes + storage_limit + 1024**2
+    selected_wi = any("mha_wi_fp8" in name for name in kernels)
+    packed_bytes = batch * ((capacity + 63) // 64) * 64 * heads_k * value_dim
+    if capacity == kn and _mha_wi_enabled() and packed_bytes <= total_bytes // 64:
+        # Leave headroom for output/profiler allocations before requiring WI.
+        if free_bytes >= 16 * packed_bytes + output_bytes:
+            assert selected_wi, kernels
+    elif capacity > 2 * kn or not ENABLE_MHA_FAST_PATH:
+        assert not selected_wi, kernels
+    def check(actual, expected):
+        for a, b in zip(actual[:2], expected[:2]):
+            assert torch.isfinite(a).all()
+            torch.testing.assert_close(a, b, atol=.001, rtol=.001)
+    check(result, reference)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    v.copy_(-v.float())
+    graph.replay()
+    check(captured, run(generic=True))
+
+
+
+
+
+
+@pytest.mark.parametrize("descale_layout", ["per-head", "broadcast", "batch-broadcast", "kv-broadcast", "none"])
+@pytest.mark.parametrize("heads", [6, 12])
+@pytest.mark.parametrize("qlens,klens", [
+    ([8192], [8192]),
+    ([8193], [16385]),
+    ([8192, 8192], [8192, 16384]),
+    ([8192, 8192], [16384, 16384]),
+    ([16384, 257, 0], [32769, 4097, 0]),
+    ([32768, 0, 33, 1], [32768, 0, 0, 129]),
+    ([1024] * 8, [2048] * 8),
+    ([8192] + [257] * 15, [8192] + [513] * 15),
+    ([9174], [9174]),
+    ([11128] * 3, [11128] * 3),
+], ids=["batch1", "batch1-tail", "batch2-prefix", "batch2-fixed", "batch3-ragged",
+        "batch4-empty", "batch8", "batch16-ragged", "self-tail", "batch3-self-tail"])
+@pytest.mark.parametrize("layout", ["fixed", "packed", "paged64"])
+def test_mha_wi_fp8(heads, qlens, klens, descale_layout, layout):
+    if layout == "fixed" and (len(set(qlens)) != 1 or len(set(klens)) != 1):
+        pytest.skip("Fixed tensors require uniform sequence lengths")
+    paged = layout == "paged64"
+    if paged and DISABLE_PAGEDKV:
+        pytest.skip("Paged KV was disabled at build time")
+    if cuda_cap != 89 or not torch.cuda.get_device_name().startswith("ZW-M890P"):
+        pytest.skip("PPU0015 specialization")
+    if DISABLE_FP8 or DISABLE_HDIM192:
+        pytest.skip("Required FP8/D192 support was disabled at build time")
+    torch.manual_seed(sum(qlens) + sum(klens) + heads)
+    dtype = torch.float8_e4m3fn
+    q, k, v = [torch.randn(n, heads, d, device="cuda", dtype=torch.bfloat16).to(dtype)
+               for n, d in [(sum(qlens), 192), (sum(klens), 192), (sum(klens), 128)]]
+    batch = len(qlens)
+    scale_rows = 1 if descale_layout in ("broadcast", "batch-broadcast") else batch
+    scale_cols = 1 if descale_layout in ("broadcast", "kv-broadcast") else heads
+    scale_storage = [torch.empty(scale_rows, scale_cols, device="cuda").uniform_(.7, 1.3)
+                     for _ in range(3)] if descale_layout != "none" else []
+    scales = [s.expand(batch, heads) for s in scale_storage] if scale_storage else [None] * 3
+    if descale_layout == "kv-broadcast":
+        scales[0] = None
+    def cumulative(lengths):
+        return torch.tensor([0, *itertools.accumulate(lengths)], device="cuda", dtype=torch.int32)
+    cq, ck = cumulative(qlens), cumulative(klens)
+    from flash_attn_interface import _flash_attn_forward
+    if layout == "fixed":
+        # Leave gaps between batches to exercise batch strides independently
+        # of row strides in WI and V packing, including graph replay.
+        fixed_inputs = [torch.empty(batch, 2 * n, heads, d, device="cuda", dtype=dtype)[:, :n]
+                        for n, d in [(qlens[0], 192), (klens[0], 192), (klens[0], 128)]]
+        for dst, src in zip(fixed_inputs, (q, k, v)):
+            dst.copy_(src.view(dst.shape))
+    if paged:
+        from flash_attn_interface import flash_attn_with_kvcache
+        kc, vc, table, lengths, refresh = _mha_wi_paged_kv(k, v, klens)
+    def run(generic=False):
+        if layout == "fixed":
+            kwargs = dict(causal=True, num_splits=1, pack_gqa=False,
+                          q_descale=scales[0], k_descale=scales[1], v_descale=scales[2])
+            if generic:
+                used_q = torch.tensor(qlens, device="cuda", dtype=torch.int32)
+                return _flash_attn_forward(*fixed_inputs, seqused_q=used_q, **kwargs)
+            return flash_attn_func(*fixed_inputs, return_attn_probs=True, **kwargs)
+        if paged:
+            if generic:
+                # Explicit used-Q lengths force the original generic paged
+                # kernel with the same N128 tile, pages, lengths and descales.
+                return _flash_attn_forward(q, kc, vc, cu_seqlens_q=cq,
+                    seqused_q=torch.tensor(qlens, device="cuda", dtype=torch.int32),
+                    seqused_k=lengths, page_table=table, max_seqlen_q=max(qlens),
+                    max_seqlen_k=max(klens), causal=True, num_splits=1, pack_gqa=False,
+                    q_descale=scales[0], k_descale=scales[1], v_descale=scales[2])
+            return flash_attn_with_kvcache(q, kc, vc, page_table=table,
+                cache_seqlens=lengths, cu_seqlens_q=cq, max_seqlen_q=max(qlens),
+                max_seqlen_k=max(klens), causal=True, num_splits=1, pack_gqa=False,
+                q_descale=scales[0], k_descale=scales[1], v_descale=scales[2],
+                return_softmax_lse=True)
+        # Explicit used-Q lengths force the generic path while preserving the
+        # same batch, sequence lengths and N128 tile. An extra empty sequence
+        # cannot force fallback once WI supports multiple sequences.
+        used_q = torch.tensor(qlens, device="cuda", dtype=torch.int32) if generic else None
+        return flash_attn_varlen_func(q, k, v, cq, ck, max(qlens), max(klens),
+            seqused_q=used_q, causal=True, num_splits=1, pack_gqa=False,
+            q_descale=scales[0], k_descale=scales[1], v_descale=scales[2], return_attn_probs=True)
+    def check(result):
+        generic = run(generic=True)
+        assert torch.isfinite(result[0]).all() and not torch.isnan(result[1]).any()
+        qo = ko = 0
+        for batch_idx, (qn, kn) in enumerate(zip(qlens, klens)):
+            if qn:
+                rows = torch.arange(qn, device="cuda") if qn <= 64 else torch.unique(torch.cat([
+                    torch.arange(8, device="cuda"), torch.arange(qn - 8, qn, device="cuda"),
+                    torch.linspace(0, qn - 1, 24, device="cuda").long()]))
+                qd = q[qo + rows].float().transpose(0, 1)
+                kd, vd = k[ko:ko + kn].float().transpose(0, 1), v[ko:ko + kn].float().transpose(0, 1)
+                for tensor, scale in zip((qd, kd, vd), scales):
+                    if scale is not None:
+                        tensor.mul_(scale[batch_idx, :, None, None])
+                scores = torch.matmul(qd, kd.transpose(-1, -2)) * (192 ** -.5)
+                scores.masked_fill_(torch.arange(kn, device="cuda")[None, None, :]
+                                   > rows[None, :, None] + kn - qn, -torch.inf)
+                expected = (torch.matmul(torch.nan_to_num(scores.softmax(-1), nan=0.), vd).transpose(0, 1),
+                            scores.logsumexp(-1))
+                if layout == "fixed":
+                    selected = ((result[0][batch_idx, rows].float(), generic[0][batch_idx, rows].float()),
+                                (result[1][batch_idx, :, rows], generic[1][batch_idx, :, rows]))
+                else:
+                    selected = ((result[0][qo + rows].float(), generic[0][qo + rows].float()),
+                                (result[1][:, qo + rows], generic[1][:, qo + rows]))
+                # Preserve the existing generic-FP8 max/mean error gate per
+                # sequence for both O and LSE. Check masked rows separately so
+                # infinities cannot inflate the finite-value tolerance.
+                for ref, (actual, baseline) in zip(expected, selected):
+                    finite = torch.isfinite(ref)
+                    assert torch.equal(torch.isneginf(actual), torch.isneginf(ref))
+                    assert torch.equal(torch.isneginf(baseline), torch.isneginf(ref))
+                    if finite.any():
+                        err, old_err = (actual[finite] - ref[finite]).abs(), (baseline[finite] - ref[finite]).abs()
+                        slack = 2 * torch.finfo(torch.float32).eps * max(1., ref[finite].abs().max().item())
+                        assert err.max().item() <= old_err.max().item() + slack
+                        assert err.double().mean().item() <= old_err.double().mean().item() + slack
+            qo += qn
+            ko += kn
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        check(run())
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = run()
+            for x in (q, k, v):
+                x.copy_(torch.randn(x.shape, device="cuda", dtype=torch.bfloat16).to(dtype))
+            for scale in scale_storage:
+                scale.uniform_(.7, 1.3)
+            if layout == "fixed":
+                for dst, src in zip(fixed_inputs, (q, k, v)):
+                    dst.copy_(src.view(dst.shape))
+            # Move empty/ragged sequences between batch slots without changing
+            # buffer sizes or the host maximum sequence lengths.
+            qlens, klens = qlens[::-1], klens[::-1]
+            cq.copy_(cumulative(qlens))
+            ck.copy_(cumulative(klens))
+            if paged:
+                refresh(klens, reverse_pages=True)
+            graph.replay()
+        torch.cuda.current_stream().wait_stream(stream)
+        check(captured)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+
+
+@pytest.mark.parametrize("dtype,qlens,klens,heads,capacity,route", [
+    (torch.bfloat16, [2048], [2048], 8, 16384, "native"),
+    (torch.bfloat16, [4096], [4096], 12, 32768, "wi"),
+    (torch.bfloat16, [2688], [2688], 12, 32768, "native"),
+    (torch.bfloat16, [2814], [2814], 12, 32768, "wi"),
+    (torch.bfloat16, [3072], [3072], 12, 32768, "wi"),
+    (torch.bfloat16, [4094], [4094], 12, 32768, "wi"),
+    (torch.bfloat16, [32], [8192], 6, 32768, "native"),
+    (torch.float8_e4m3fn, [8192], [8192], 6, 16384, "native"),
+    (torch.float8_e4m3fn, [8192], [16384], 6, 32768, "wi"),
+    (torch.float8_e4m3fn, [11128], [11128], 6, 32768, "native"),
+    (torch.float8_e4m3fn, [8192], [12288], 6, 16384, "wi"),
+    (torch.float8_e4m3fn, [8192], [16255], 6, 16384, "wi"),
+    (torch.float8_e4m3fn, [16384], [16384], 6, 32768, "wi"),
+    (torch.float8_e4m3fn, [8192], [16384], 6, 65536, "wi"),
+    (torch.float8_e4m3fn, [8192], [16384], 6, 1048576, "wi"),
+    (torch.bfloat16, [5142, 5142, 5142, 1], [8193] * 4, 31, 8256, "wi"),
+])
+@pytest.mark.parametrize("provide_bound", [False, True], ids=["unknown-work", "bounded-work"])
+def test_mha_wi_paged_workload(dtype, qlens, klens, heads, capacity, route, provide_bound):
+    """Capacity cannot establish useful work; replay still uses device lengths."""
+    if cuda_cap != 89 or not torch.cuda.get_device_name().startswith("ZW-M890P"):
+        pytest.skip("WI requires the qualified device")
+    if DISABLE_HDIM192 or DISABLE_PAGEDKV or (dtype == torch.float8_e4m3fn and DISABLE_FP8):
+        pytest.skip("Required D192/paged/dtype support was disabled at build time")
+    from flash_attn_interface import _flash_attn_forward
+    qn, kn, batch = max(qlens), max(klens), len(qlens)
+    torch.manual_seed(qn + kn + heads)
+    q, k, v = [torch.randn(n, heads, d, device="cuda", dtype=torch.bfloat16).to(dtype)
+               for n, d in [(sum(qlens), 192), (batch * capacity, 192), (batch * capacity, 128)]]
+    kc, vc, table, lengths, _ = _mha_wi_paged_kv(k, v, [capacity] * batch)
+    table = table[:, :capacity // 64]
+    lengths.fill_(kn)
+    cq = torch.tensor([0] + qlens, device="cuda", dtype=torch.int32).cumsum(0, dtype=torch.int32)
+    used_q = torch.tensor(qlens, device="cuda", dtype=torch.int32)
+    def run(generic=False):
+        return _flash_attn_forward(q, kc, vc, cu_seqlens_q=cq,
+            seqused_q=used_q if generic else None, seqused_k=lengths,
+            page_table=table, max_seqlen_q=qn,
+            max_seqlen_k=kn if provide_bound else None,
+            causal=True, num_splits=1, pack_gqa=False)
+    result, kernels = _mha_profiled_call(run)
+    expected = route if provide_bound and ENABLE_MHA_FAST_PATH else "native"
+    actual = "wi" if any("mha_wi_" in name for name in kernels) else "native"
+    # Exact route expectations are qualified on the 39-CU device. FP8 may
+    # still select WI on other CU counts, where work estimates differ.
+    if not ENABLE_MHA_FAST_PATH or _mha_wi_enabled():
+        assert actual == expected, (expected, kernels)
+    def check(actual):
+        reference = run(generic=True)
+        torch.testing.assert_close(actual[0], reference[0], atol=.015, rtol=.015)
+        torch.testing.assert_close(actual[1], reference[1], atol=.001, rtol=.0001)
+    check(result)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    # A host work bound must not truncate actual lengths or packed V addressing,
+    # including replay lengths above the originally advertised estimate.
+    for length in [kn // 2, min(capacity, kn + 4096), 0, kn]:
+        lengths.fill_(length)
+        graph.replay()
+        check(captured)
