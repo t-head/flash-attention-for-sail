@@ -42,7 +42,7 @@ template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element,
 #endif
 #ifdef USE_PPU
           bool PackGQA, bool Split, bool V_colmajor, bool kBlockM128, bool kBlockM16, bool kBlockN16, bool Is_QSA=false
-          , class QsaConfig = flash::QsaConfig
+          , class QsaConfig = flash::QsaConfig, bool UsePagedFragmentPrefetch = true
           >
 #else
           bool PackGQA, bool Split, bool V_colmajor>
@@ -99,7 +99,7 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
     using TileShape_MNK_PV = cute::Shape<Int<kBlockM>, Int<kHeadDimV>, Int<kBlockN>>;
     using ClusterShape = cute::Shape<Int<ClusterM>, _1, _1>;
 #ifndef FLASHATTENTION_DISABLE_SM90
-    using CollectiveMainloop = std::conditional_t<
+    using CollectiveMainloopBase = std::conditional_t<
         Arch >= 90,
         flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::PPU0015, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor>,
         flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, ArchTag, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split>
@@ -107,14 +107,35 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
 #else
 #if defined(USE_PPU) && USE_AIU
     static constexpr int kBlockNPagedPerAiuLoad = kBlockN % kBlockNPagedPerAiuLoad_ == 0 ? kBlockNPagedPerAiuLoad_ : 16;   // kBlockNPagedPerAiuLoad_ = 64 or 16
-    using CollectiveMainloop = flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, ArchTag, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, PagedKVAiu, kBlockNPagedPerAiuLoad, AppendKV, PackGQA, Split, ElementS, Is_QSA
+    using CollectiveMainloopBase = flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, ArchTag, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, PagedKVAiu, kBlockNPagedPerAiuLoad, AppendKV, PackGQA, Split, ElementS, Is_QSA
             , QsaConfig
             >;
 #else
-    using CollectiveMainloop = flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, ArchTag, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split, ElementS, Is_QSA
+    using CollectiveMainloopBase = flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, ArchTag, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split, ElementS, Is_QSA
             , QsaConfig
             >;
 #endif
+#endif
+#if defined(USE_PPU) && defined(FLASHATTENTION_DISABLE_SM90)
+    // Keep short or decode-dominated batches on a stock-only instance.
+    // Mean query work uses existing metadata and avoids the branch/code cost
+    // even when one long sequence raises the batch maximum.
+    if constexpr (UsePagedFragmentPrefetch && CollectiveMainloopBase::PagedFragmentPrefetchSupported) {
+        if (int64_t(params.total_q) < int64_t(params.b) * CollectiveMainloopBase::MinPagedPrefetchQueryRows
+            || params.seqlen_k < CollectiveMainloopBase::MinPagedPrefetchKeyRows) {
+            return run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, Element, ElementOut,
+                Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA,
+#if USE_AIU
+                PagedKVAiu, kBlockNPagedPerAiuLoad_,
+#endif
+                AppendKV, HasQv, PackGQA, Split, V_colmajor,
+                kBlockM128, kBlockM16, kBlockN16, Is_QSA, QsaConfig, false>(params, stream);
+        }
+    }
+    using CollectiveMainloop = std::conditional_t<UsePagedFragmentPrefetch,
+        CollectiveMainloopBase, flash::MainloopFwdNoPagedPrefetch<CollectiveMainloopBase>>;
+#else
+    using CollectiveMainloop = CollectiveMainloopBase;
 #endif
 #if defined(USE_PPU)
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, Split, false, Is_QSA

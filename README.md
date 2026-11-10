@@ -549,6 +549,84 @@ pytest -q -s tests/test_flash_attn.py
 pytest -q -s hopper/test_flash_attn.py
 ```
 
+## PPU causal prefill optimizations
+
+On ZW-M890P, FA3 selects the following paths from the existing MHA inputs:
+
+| Path | Dtype | QK / V head dimensions | Layouts |
+|---|---|---|---|
+| WI / WS | BF16 | 192 / 128 | Fixed, packed varlen, packed Q + page64 KV |
+| WI | E4M3 | 192 / 128 | Fixed, packed varlen, packed Q + page64 KV |
+| Native paged mainloop | BF16 / E4M3 | 256 / 256 | Packed Q + paged KV |
+
+WI interleaves query groups over a three-stage AIU KV pipeline. Long KV can
+be partitioned into two ranges when this improves query-grid wave utilization;
+the FP32 partial-output/LSE merge is shared with WS. WS separates
+QK/softmax and PV into producer and consumer warps; underfilled query grids can
+use 1, 2, 4, or 8 KV partitions, including the final merge. Selection follows
+useful work, reuse and wave utilization rather than model names, a head-count
+whitelist or a batch=1 restriction. BF16 WI/WS is qualified for the 39-CU device.
+Paged WI compares rounded native waves after its actual internal KV partition
+choice; eligibility and launch share that partition policy.
+Fixed batches use their batch strides; packed and paged batches use device
+sequence lengths and offsets, including tails and empty sequences.
+For paged WI/WS, pass the existing `max_seqlen_k` argument as a bound on
+used KV lengths. Page-table capacity remains separate for addressing and
+workspace sizing; it is not evidence of useful work. Omitting that bound
+retains native execution. Actual lengths still come from `cache_seqlens`,
+including graph replay; the bound does not truncate attention.
+Short KV ranges retain the native implementation when they cannot amortize
+the WI pipeline; page gathers require more work than contiguous K/V.
+
+D256 BF16 reuses the native M64/N48 paged mainloop with QK/PV fragment prefetch
+and a delayed V wait. Short or decode-dominated batches select a stock-only kernel;
+mixed batches select the fragment schedule using each sequence's actual Q length
+and useful causal KV work. D256 E4M3 retains the native M64/N64 N-split PV layout
+and reads V directly without a prepacking workspace. Qualified causal tiles
+without GQA head packing prepare paired PV operand fragments together; other
+tiles keep the upstream schedule. The per-source copy option
+(`-sort-copy-before-coalesce=false`) applies to the WI/WS unit and FP8 without
+GQA head packing; both FP8 paged units use `-ppu-force-vregrr=true`. The GQA
+head-packing unit keeps the global copy schedule to avoid short-query regressions.
+D192 E4M3 WI packs V
+for its MMA layout while preserving the original N128 tile and KV traversal;
+its generic fallback reads V directly with the upstream fragment schedule.
+Both QK and PV use E4M3 on the FP8 paths.
+FP8 packing estimates reuse using a conservative per-sequence query-length
+bound from existing host metadata. Strongly ragged batches may retain the
+native implementation without allocating the packing workspace.
+
+These paths optimize causal prefill. Noncausal attention and unsupported
+features/layouts retain generic dispatch; there are no added decode-specific
+tile, GQA or split policies. The public API is unchanged; paged callers must
+forward the KV work bound described above to enable WI/WS.
+WI V packing and merges execute on the caller's stream and participate in
+CUDA graph replay. Optional V packing is limited to twice the page-aligned
+V storage, 1/64 of device memory, and 1/8 of currently driver-free memory.
+Paged FP8 launches V packing from the used-KV work estimate rather than the
+reserved page-table capacity. Grid-stride page processing still covers lengths
+that grow during graph replay, while buffer strides retain the full capacity.
+Selection combines causal reuse with steady-state work; it does not impose a
+fixed capacity-to-used-length ratio.
+Insufficient free space selects the generic path before allocating scratch; an
+eager scratch-allocation OOM also falls back. Graph capture fixes that choice
+and retains any captured workspace until the graph is released, so allocate
+KV capacity before capturing graphs. These limits preserve headroom but do not
+reserve memory for future KV growth.
+
+The usual `cd hopper && python setup.py build_ext` workflow applies after
+running `cudafy.py` in a separate build worktree. Setting
+`FLASH_ATTENTION_ENABLE_MHA_FAST_PATH=FALSE` omits the BF16 WI/WS and FP8 WI
+translation unit; it does not disable improvements in the shared mainloop.
+The existing head-dimension, FP8 and paged-KV build switches still apply.
+
+Targeted layout, stream, graph replay and FP8 error-reference tests use the
+existing test runner:
+
+```bash
+python -m pytest hopper/test_flash_attn.py -k 'mha_wi or mha_paged or varlen_fp8_empty_kv' -v
+```
+
 ## Issue Reporting
 Please submit a Code Issue if you encounter any problems!
 

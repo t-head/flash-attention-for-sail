@@ -513,7 +513,7 @@ CUTLASS_DEVICE void gemm_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor
 
 #ifdef USE_PPU
 template<int kBlockN, int kBlockNPagedPerAiuLoad, int kHeadDim, int kBlockKSmem,
-         bool A_in_regs=false, bool B_in_regs=false, bool SwapAB=false,
+         bool A_in_regs=false, bool B_in_regs=false, bool SwapAB=false, bool Prefetch=false,
          typename Tensor0, typename Tensor1,
          typename Tensor2, typename Tensor3, typename Tensor4,
          typename TiledMma, typename TiledCopyA, typename TiledCopyB,
@@ -523,7 +523,7 @@ CUTLASS_DEVICE void gemm_sm80_kv_paged_aiu(Tensor0 &acc, Tensor1 &tCrA, Tensor2 
                                            TiledCopyA smem_tiled_copy_A, TiledCopyB smem_tiled_copy_B,
                                            ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B, Hook fn) {
     if constexpr (SwapAB) {
-        gemm_sm80_kv_paged_aiu<kBlockN, kBlockNPagedPerAiuLoad, kHeadDim, kBlockKSmem, B_in_regs, A_in_regs>(acc, tCrB, tCrA, tCsB, tCsA, tiled_mma, smem_tiled_copy_B, smem_tiled_copy_A, smem_thr_copy_B, smem_thr_copy_A, fn);
+        gemm_sm80_kv_paged_aiu<kBlockN, kBlockNPagedPerAiuLoad, kHeadDim, kBlockKSmem, B_in_regs, A_in_regs, false, Prefetch>(acc, tCrB, tCrA, tCsB, tCsA, tiled_mma, smem_tiled_copy_B, smem_tiled_copy_A, smem_thr_copy_B, smem_thr_copy_A, fn);
     } else {
         CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
         CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
@@ -537,6 +537,37 @@ CUTLASS_DEVICE void gemm_sm80_kv_paged_aiu(Tensor0 &acc, Tensor1 &tCrA, Tensor2 
         int MMA_K_PER_TILE = size<2>(tCrB) / (kHeadDim / kBlockKSmem);
         Tensor tCsB_rTile = make_tensor(tCsB.data(), tCsB.layout());
         Tensor tCsB_sTile = make_tensor(tCsB.data(), tCsB.layout());
+        if constexpr (Prefetch) {
+            // Issue the next K fragment while the current fragment feeds MMA.
+            auto load = [&](int i) {
+            if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, i), tCrA_copy_view(_, _, i)); }
+            if (!B_in_regs) {
+                tCsB_rTile.data() = tCsB_sTile.data();
+                for (int n = 0; n < size<1>(tCrB) / (kBlockNPagedPerAiuLoad / 16); n++) {
+                    #pragma unroll
+                    for (int j = 0; j < kBlockNPagedPerAiuLoad / 16; j++) {
+                        cute::copy(smem_tiled_copy_B, tCsB_rTile(_, j, i % MMA_K_PER_TILE), tCrB_copy_view(_, n * (kBlockNPagedPerAiuLoad / 16) + j, i));
+                    }
+                    tCsB_rTile.data() = tCsB_rTile.data() + OFFSET_MMA_N;
+                }
+                if ((i + 1) % MMA_K_PER_TILE == 0) {
+                    tCsB_sTile.data() = tCsB_sTile.data() + OFFSET_TILE;
+                }
+            }
+            };
+            load(0);
+            #pragma hggc mmatiestrictly
+            {
+            #pragma unroll
+            for (int i = 0; i < size<2>(tCrA); ++i) {
+                if (i + 1 < size<2>(tCrA)) { load(i + 1); }
+                if constexpr (!std::is_same_v<Hook, std::nullptr_t>) {
+                    if (i == 0) { fn(); }
+                }
+                cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+            }
+            }
+        } else {
         #pragma hggc mmatiestrictly
         {
         #pragma unroll
@@ -559,6 +590,7 @@ CUTLASS_DEVICE void gemm_sm80_kv_paged_aiu(Tensor0 &acc, Tensor1 &tCrA, Tensor2 
                 if (i == 0) { fn(); }
             }
             cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+        }
         }
         }
     }
@@ -603,7 +635,7 @@ CUTLASS_DEVICE void gemm_rs_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Ten
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #ifdef USE_PPU
-template<int kBlockN, int kBlockNPagedPerAiuLoad, int kHeadDim, int kBlockKSmem,
+template<int kBlockN, int kBlockNPagedPerAiuLoad, int kHeadDim, int kBlockKSmem, bool Prefetch=false, bool RotateColumns=false,
          typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
          typename TiledMma, typename TiledCopy, typename ThrCopy>
 CUTLASS_DEVICE void gemm_rs_sm80_kv_paged_aiu(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsB,
@@ -615,6 +647,39 @@ CUTLASS_DEVICE void gemm_rs_sm80_kv_paged_aiu(Tensor0 &acc, Tensor1 &tCrA, Tenso
     int MMA_K_PER_TILE = size<1>(tCrB) / (kHeadDim / kBlockKSmem);
     Tensor tCsB_rTile = make_tensor(tCsB.data(), tCsB.layout());
     Tensor tCsB_sTile = make_tensor(tCsB.data(), tCsB.layout());
+    if constexpr (Prefetch) {
+        static_assert(kBlockNPagedPerAiuLoad == 16);
+        // Stream two V fragments instead of keeping a whole output row live.
+        auto load = [&](int i, int n) {
+            int physical_n = n;
+            if constexpr (RotateColumns) {
+                static_assert(kHeadDim == 256 && decltype(size<1>(tCrB))::value == 16);
+                // Odd query warps start a D64 plane later, in the same V allocation.
+                int odd_warp = __ppu_read_firstlane(unsigned((threadIdx.x / 32) & 1));
+                physical_n = (n + odd_warp * 4) % 16;
+            }
+            auto src = make_tensor(tCsB.data() + i * OFFSET_MMA_N
+                                   + (physical_n / MMA_K_PER_TILE) * OFFSET_TILE, tCsB.layout());
+            cute::copy(smem_tiled_copy_B, src(_, physical_n % MMA_K_PER_TILE, _0{}),
+                       tCrB_copy_view(_, n, i));
+        };
+        load(0, 0);
+        #pragma hggc mmatiestrictly
+        {
+        #pragma unroll
+        for (int i = 0; i < size<2>(tCrA); ++i) {
+            #pragma unroll
+            for (int n = 0; n < size<1>(tCrB); ++n) {
+                if (n + 1 < size<1>(tCrB)) { load(i, n + 1); }
+                else if (i + 1 < size<2>(tCrA)) { load(i + 1, 0); }
+                #pragma unroll
+                for (int m = 0; m < size<1>(tCrA); ++m) {
+                    cute::gemm(tiled_mma, tCrA(_, m, i), tCrB(_, n, i), acc(_, m, n));
+                }
+            }
+        }
+        }
+    } else {
     #pragma hggc mmatiestrictly
     {
     #pragma unroll
@@ -634,6 +699,7 @@ CUTLASS_DEVICE void gemm_rs_sm80_kv_paged_aiu(Tensor0 &acc, Tensor1 &tCrA, Tenso
         for (int j = 0; j < kBlockNPagedPerAiuLoad / 16; ++j) {
             cute::gemm(tiled_mma, tCrA(_, _, i * (kBlockNPagedPerAiuLoad / 16) + j), tCrB(_, _, i * (kBlockNPagedPerAiuLoad / 16) + j), acc);
         }
+    }
     }
     }
 }
@@ -897,7 +963,7 @@ CUTLASS_DEVICE void rescale_o_nsplit(Tensor0 &acc_o, const float* scale_smem) {
 // A loads are batched per mk (MMA_M*4 u32 live) instead of whole-tile to cap
 // register pressure (fp8_pv_nsplit_design.md §6).
 template<int kBlockM, int kBlockN, int kHeadDimV, int kBlockKGmem, int kNWarps,
-         bool UseTsmLd, typename SmemLayoutVRaw,
+         bool UseTsmLd, typename SmemLayoutVRaw, bool RetainBPair=false,
          typename Tensor0, typename TiledMma>
 CUTLASS_DEVICE void gemm_rs_sm80_pv_fp8_nsplit(Tensor0 &acc, const void *smem_p, void *smem_v,
                                                int stage, int warp_idx, TiledMma tiled_mma) {
@@ -969,20 +1035,40 @@ CUTLASS_DEVICE void gemm_rs_sm80_pv_fp8_nsplit(Tensor0 &acc, const void *smem_p,
             tCrA32(2, m, mk) = val.z;
             tCrA32(3, m, mk) = val.w;
         }
-        // permute the staged pair and emit the MMAs.
+
+        auto prepare_b = [&](int np, int h) {
+            int const mn = 2 * np + h;
+            tCrB32(0, mn, mk) = __byte_perm(rA_all[np][2 * h + 0], rA_all[np][2 * h + 1], 0x6420u);
+            tCrB32(1, mn, mk) = __byte_perm(rB_all[np][2 * h + 0], rB_all[np][2 * h + 1], 0x6420u);
+            tCrB32(2, mn, mk) = __byte_perm(rA_all[np][2 * h + 0], rA_all[np][2 * h + 1], 0x7531u);
+            tCrB32(3, mn, mk) = __byte_perm(rB_all[np][2 * h + 0], rB_all[np][2 * h + 1], 0x7531u);
+        };
+        auto multiply_b = [&](int mn) {
+            #pragma unroll
+            for (int m = 0; m < MMA_M; ++m) {
+                cute::gemm(tiled_mma, tCrA(_, m, mk), tCrB(_, mn, mk), acc(_, m, mn));
+            }
+        };
         #pragma unroll
         for (int np = 0; np < MMA_NP; ++np) {
-            #pragma unroll
-            for (int h = 0; h < 2; ++h) {
-                const int mn = 2 * np + h;
-                tCrB32(0, mn, mk) = __byte_perm(rA_all[np][2 * h + 0], rA_all[np][2 * h + 1], 0x6420u);
-                tCrB32(1, mn, mk) = __byte_perm(rB_all[np][2 * h + 0], rB_all[np][2 * h + 1], 0x6420u);
-                tCrB32(2, mn, mk) = __byte_perm(rA_all[np][2 * h + 0], rA_all[np][2 * h + 1], 0x7531u);
-                tCrB32(3, mn, mk) = __byte_perm(rB_all[np][2 * h + 0], rB_all[np][2 * h + 1], 0x7531u);
-                // Emit the 16x16x32 atom MMA(s) for this n-tile immediately,
+            if constexpr (RetainBPair) {
+                prepare_b(np, 0);
+                prepare_b(np, 1);
+                // Keep the two B atoms live together so a later matrix load
+                // does not overwrite the first atom while MMA consumes it.
+                // Register operands only: no memory fence is required here.
+                asm volatile("" ::
+                    "r"(tCrB32(0, 2*np, mk)), "r"(tCrB32(1, 2*np, mk)),
+                    "r"(tCrB32(2, 2*np, mk)), "r"(tCrB32(3, 2*np, mk)),
+                    "r"(tCrB32(0, 2*np+1, mk)), "r"(tCrB32(1, 2*np+1, mk)),
+                    "r"(tCrB32(2, 2*np+1, mk)), "r"(tCrB32(3, 2*np+1, mk)));
+                multiply_b(2 * np);
+                multiply_b(2 * np + 1);
+            } else {
                 #pragma unroll
-                for (int m = 0; m < MMA_M; ++m) {
-                    cute::gemm(tiled_mma, tCrA(_, m, mk), tCrB(_, mn, mk), acc(_, m, mn));
+                for (int h = 0; h < 2; ++h) {
+                    prepare_b(np, h);
+                    multiply_b(2 * np + h);
                 }
             }
         }
