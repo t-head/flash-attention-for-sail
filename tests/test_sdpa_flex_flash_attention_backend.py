@@ -1307,6 +1307,52 @@ class TestDoubleBackward:
 # V. Long-sequence numerics
 # --------------------------------------------------------------------------
 class TestLongSequence:
+    @pytest.mark.parametrize("seed", [0, 123, 2026])
+    def test_fp32_uniform_long_reduction(self, seed):
+        torch.manual_seed(seed)
+        q = torch.zeros(1, 8, 1024, 32, device=DEVICE, requires_grad=True)
+        k = torch.zeros_like(q, requires_grad=True)
+        v = torch.randn_like(q, requires_grad=True)
+        grad_out = torch.randn_like(q)
+        mask = (torch.arange(1024, device=DEVICE)[None, None, None, :] < 512).expand(1, 1, 1024, -1)
+        out = _run_arb(q, k, v, mask=mask)
+        out.backward(grad_out)
+        ref_out = v.detach()[:, :, :512].double().mean(dim=-2, keepdim=True).expand_as(out)
+        ref_dv = torch.zeros_like(v, dtype=torch.float64)
+        ref_dv[:, :, :512] = grad_out.double().sum(dim=-2, keepdim=True) / 512
+        for actual, reference in ((out, ref_out), (v.grad, ref_dv)):
+            relative_l2 = (actual.double() - reference).norm() / reference.norm()
+            assert relative_l2.item() < 8e-7, relative_l2.item()
+        assert torch.count_nonzero(q.grad) == 0
+        assert torch.count_nonzero(k.grad) == 0
+
+    @pytest.mark.parametrize("dtype", [FP32, BF16, FP16])
+    @pytest.mark.parametrize("hd", [96, 192, 256])
+    @pytest.mark.parametrize("causal", [False, True])
+    def test_unrounded_fp64_fwd_bwd(self, dtype, hd, causal):
+        torch.manual_seed(9000 + hd)
+        tensors = []
+        for seq in (129, 257, 257):
+            tensor = torch.randn(1, seq, 4, hd, device=DEVICE, dtype=dtype)
+            tensors.append(tensor.transpose(1, 2).detach().requires_grad_(True))
+        q, k, v = tensors
+        mask = _causal_mask(129, 257) if causal else None
+        out = _run_arb(q, k, v, mask=mask)
+        grad_out = torch.randn_like(out)
+        out.backward(grad_out)
+        refs = [tensor.detach().double().requires_grad_(True) for tensor in tensors]
+        with math_only():
+            ref_out = F.scaled_dot_product_attention(*refs, attn_mask=mask, dropout_p=0.0)
+        ref_out.backward(grad_out.double())
+        limits = {FP32: 2e-6, BF16: 1e-2, FP16: 2e-3}
+        actuals = (out, q.grad, v.grad, k.grad)
+        references = (ref_out, refs[0].grad, refs[2].grad, refs[1].grad)
+        for name, actual, reference in zip(("output", "dq", "dv", "dk"), actuals, references):
+            assert torch.isfinite(actual).all(), name
+            assert torch.isfinite(reference).all(), name
+            relative_l2 = (actual.double() - reference).norm() / reference.norm()
+            assert relative_l2.item() < limits[dtype], (name, relative_l2.item())
+
     def test_8k_fwd_bwd(self):
         q, k, v = _mk(1, 2, 2, 8192, 8192, 64)
         mask = _causal_mask(8192, 8192)

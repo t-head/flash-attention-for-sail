@@ -686,10 +686,43 @@ public:
                 load_V_block(n_block);
                 cute::cp_async_fence();
             };
-            flash::gemm_sm80</*A_in_regs=*/Q_in_regs, /*B_in_regs=*/false>(
-                tSrS, tSrQ, tSrK, tSsQ, tSsK(_, _, _, 0),
-                tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
-                smem_thr_copy_Q, smem_thr_copy_K, load_V_cur);
+#ifdef USE_PPU
+            if constexpr (kHeadDim == 256 && std::is_same_v<Element, float>) {
+                static constexpr int kQKSegment = 4;
+                static_assert(decltype(size<2>(tSrQ))::value == 32);
+                static_assert(decltype(size<2>(tSrQ))::value == decltype(size<2>(tSrK))::value);
+                static_assert(decltype(size<2>(tSrQ))::value % kQKSegment == 0);
+                Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+                Tensor tSrK_copy_view = smem_thr_copy_K.retile_D(tSrK);
+                Tensor tSsK_cur = tSsK(_, _, _, 0);
+                Tensor tSrS_segment = make_fragment_like(tSrS);
+                #pragma unroll
+                for (int begin = 0; begin < size<2>(tSrQ); begin += kQKSegment) {
+                    clear(tSrS_segment);
+                    #pragma hggc mmatiestrictly
+                    {
+                        #pragma unroll
+                        for (int offset = 0; offset < kQKSegment; ++offset) {
+                            int const i = begin + offset;
+                            if constexpr (!Q_in_regs) {
+                                cute::copy(smem_tiled_copy_Q, tSsQ(_, _, i), tSrQ_copy_view(_, _, i));
+                            }
+                            cute::copy(smem_tiled_copy_K, tSsK_cur(_, _, i), tSrK_copy_view(_, _, i));
+                            if (i == 0) { load_V_cur(); }
+                            cute::gemm(tiled_mma, tSrQ(_, _, i), tSrK(_, _, i), tSrS_segment);
+                        }
+                    }
+                    #pragma unroll
+                    for (int i = 0; i < size(tSrS); ++i) { tSrS(i) += tSrS_segment(i); }
+                }
+            } else
+#endif
+            {
+                flash::gemm_sm80</*A_in_regs=*/Q_in_regs, /*B_in_regs=*/false>(
+                    tSrS, tSrQ, tSrK, tSsQ, tSsK(_, _, _, 0),
+                    tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+                    smem_thr_copy_Q, smem_thr_copy_K, load_V_cur);
+            }
 
             // Look ahead the next K-block within this slice (same direction).
             int n_block_next = n_block;
@@ -750,7 +783,19 @@ public:
             // exp2/add/fma).  On the first iteration need_rescale=false, so
             // Is_first_iter is handled without any runtime branch here.
             auto scores_scale = softmax.template max_get_scale_skip<Is_first_iter_t, Check_inf>(tSrS);
-            softmax.template online_softmax<Is_first_iter_t, Check_inf>(tSrS);
+            Tensor scores = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol(tSrS.layout()));
+            flash::template scale_apply_exp2</*Scale_max=*/true, Check_inf, 0>(
+                scores, softmax.row_max, softmax.softmax_scale_log2);
+            Tensor row_sum_tile = make_fragment_like(softmax.row_sum);
+            flash::reduce_sum</*zero_init=*/true, /*warp_reduce=*/false>(scores, row_sum_tile);
+            if constexpr (Is_first_iter_t) {
+                cute::copy(row_sum_tile, softmax.row_sum);
+            } else {
+                #pragma unroll
+                for (int mi = 0; mi < size(softmax.row_sum); ++mi) {
+                    softmax.row_sum(mi) += row_sum_tile(mi);
+                }
+            }
             if constexpr (Is_first_iter_t) { is_first_iter = false; }
 
             // ── Dropout (coordinate-keyed Philox, FA2 semantics) ──
@@ -804,8 +849,12 @@ public:
                 flash::cp_async_wait<1>();
                 __syncthreads();
             }
-            flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, 0),
+            Tensor tOrO_tile = make_fragment_like(tOrO);
+            clear(tOrO_tile);
+            flash::gemm_rs_sm80(tOrO_tile, tOrP, tOrV, tOsVt(_, _, _, 0),
                                 tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+            #pragma unroll
+            for (int i = 0; i < size(tOrO); ++i) { tOrO(i) += tOrO_tile(i); }
 
             any_tile_processed = true;
             block_meta.advance_inner();

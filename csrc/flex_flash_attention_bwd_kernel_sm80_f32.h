@@ -181,6 +181,50 @@ public:
     static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
     static constexpr int NumProducerThreads = CollectiveMainloop::NumMmaThreads;
 
+    template <typename Tensor0, typename Tensor1, typename Tensor2,
+              typename Tensor3, typename Tensor4, typename TiledCopyQ,
+              typename TiledCopyK, typename ThrCopyQ, typename ThrCopyK>
+    CUTLASS_DEVICE static void gemm_qk_recompute(
+            Tensor0 &acc, Tensor1 &rQ, Tensor2 &rK, Tensor3 const& sQ,
+            Tensor4 const& sK, TiledMmaSdP tiled_mma,
+            TiledCopyQ copy_Q, TiledCopyK copy_K, ThrCopyQ thr_Q, ThrCopyK thr_K) {
+#ifdef USE_PPU
+        if constexpr (kHeadDim == 256 && std::is_same_v<Element, float>) {
+            static constexpr int kSegment = 4;
+            static_assert(decltype(size<2>(rQ))::value == 32);
+            static_assert(decltype(size<2>(rQ))::value == decltype(size<2>(rK))::value);
+            static_assert(decltype(size<2>(rQ))::value % kSegment == 0);
+            Tensor rQ_copy = thr_Q.retile_D(rQ);
+            Tensor rK_copy = thr_K.retile_D(rK);
+            Tensor segment = make_fragment_like(acc);
+            #pragma unroll
+            for (int begin = 0; begin < size<2>(rQ); begin += kSegment) {
+                clear(segment);
+                #pragma hggc mmatiestrictly
+                {
+                    #pragma unroll
+                    for (int offset = 0; offset < kSegment; ++offset) {
+                        int const i = begin + offset;
+                        cute::copy(copy_Q, sQ(_, _, i), rQ_copy(_, _, i));
+                        cute::copy(copy_K, sK(_, _, i), rK_copy(_, _, i));
+                        if constexpr (SdP_swapAB) {
+                            cute::gemm(tiled_mma, rK(_, _, i), rQ(_, _, i), segment);
+                        } else {
+                            cute::gemm(tiled_mma, rQ(_, _, i), rK(_, _, i), segment);
+                        }
+                    }
+                }
+                #pragma unroll
+                for (int i = 0; i < size(acc); ++i) { acc(i) += segment(i); }
+            }
+        } else
+#endif
+        {
+            flash::gemm_sm80<false, false, SdP_swapAB>(
+                acc, rQ, rK, sQ, sK, tiled_mma, copy_Q, copy_K, thr_Q, thr_K, nullptr);
+        }
+    }
+
     // ─── SHARED MEMORY STORAGE ────────────────────────────────────────────────
     struct SharedStorage {
         struct CUTE_ALIGNAS(128) TensorStorage {
@@ -1258,10 +1302,10 @@ public:
                 Tensor tSrQ = mma_partition_fragment_AB</*A=*/!SdP_swapAB>(thr_mma_SdP, sQ(_, _, _0{}));
                 Tensor tSrK = mma_partition_fragment_AB</*A=*/SdP_swapAB>(thr_mma_SdP, sK);
                 /** recompute s=Q*K^T */
-                flash::gemm_sm80<false /*A_in_regs*/, false /*B_in_regs*/, SdP_swapAB>(
+                gemm_qk_recompute(
                     tSrS, tSrQ, tSrK, tSsQ(_, _, _, kStages > 1 ? smem_pipe_read : 0), tSsK,
                     tiled_mma_SdP, smem_tiled_copy_QdO, smem_tiled_copy_KV,
-                    smem_thr_copy_QdO, smem_thr_copy_KV, nullptr /*hook*/);
+                    smem_thr_copy_QdO, smem_thr_copy_KV);
                 Tensor tLSErLSE = cute::conditional_return<!ShuffleLSE>(
                     make_fragment_like(tSsLSE(_, _0{})), make_tensor<ElementAccum>(Int<kStatsPerThread>{}));
                 if constexpr (!ShuffleLSE) {
@@ -1371,6 +1415,8 @@ public:
                 cute::copy(r2s_tiled_copy_PdS, tdSadS, tdSsdS);
 
                 /** dV = P^T*dO */
+                Tensor dV_mma = make_fragment_like(dV_acc);
+                clear(dV_mma);
                 Tensor tdVrdO = mma_partition_fragment_AB</*A=*/dKV_swapAB>(thr_mma_dKV, sdOt(_, _, _0{}));
                 Tensor tdVsdO_cur = tdVsdOt(_, _, _, kStages_dO > 1 ? smem_pipe_read_do_cur : 0);
                 if constexpr (Mma_dKV_is_RS) {
@@ -1392,15 +1438,17 @@ public:
 #else
                     Tensor tdVrP = make_tensor(rP.data(), convert_layout_acc_Aregs<TiledMmadKV>(tSrS.layout()));
 #endif
-                    flash::gemm_rs_sm80(dV_acc, tdVrP, tdVrdO, tdVsdO_cur,
+                    flash::gemm_rs_sm80(dV_mma, tdVrP, tdVrdO, tdVsdO_cur,
                                         tiled_mma_dKV, smem_tiled_copy_QdOt, smem_thr_copy_QdOt);
                 } else {
                     Tensor tdVrP = mma_partition_fragment_AB</*A=*/!dKV_swapAB>(thr_mma_dKV, sPt);
                     flash::gemm_sm80<false, false, /*SwapAB=*/dKV_swapAB>(
-                        dV_acc, tdVrP, tdVrdO, tdVsPt, tdVsdO_cur,
+                        dV_mma, tdVrP, tdVrdO, tdVsPt, tdVsdO_cur,
                         tiled_mma_dKV, smem_tiled_copy_PdSt, smem_tiled_copy_QdOt,
                         smem_thr_copy_PdSt, smem_thr_copy_QdOt, nullptr);
                 }
+                #pragma unroll
+                for (int i = 0; i < size(dV_acc); ++i) { dV_acc(i) += dV_mma(i); }
                 __syncthreads();  // make sure sdS is written
                 /** dQ = dS*K (atomic into fp32 dQaccum) */
                 auto do_mma_dQ = [&] (auto hook_dQ) {
@@ -1504,6 +1552,8 @@ public:
                 };
                 if constexpr (kStages > 1) { do_mma_dQ(load_dO_next); }
                 /** dK = dS^T * Q */
+                Tensor dK_mma = make_fragment_like(dK_acc);
+                clear(dK_mma);
                 Tensor tdKrQ = mma_partition_fragment_AB</*A=*/dKV_swapAB>(thr_mma_dKV, sQt(_, _, _0{}));
                 Tensor tdKsQ_cur = tdKsQt(_, _, _, kStages > 1 ? smem_pipe_read : 0);
                 if constexpr (Mma_dKV_is_RS) {
@@ -1525,16 +1575,18 @@ public:
 #else
                     Tensor tdKrdS = make_tensor(rdS.data(), convert_layout_acc_Aregs<TiledMmadKV>(tdPrdP.layout()));
 #endif
-                    flash::gemm_rs_sm80(dK_acc, tdKrdS, tdKrQ, tdKsQ_cur,
+                    flash::gemm_rs_sm80(dK_mma, tdKrdS, tdKrQ, tdKsQ_cur,
                                         tiled_mma_dKV, smem_tiled_copy_QdOt, smem_thr_copy_QdOt);
                 } else {
                     Tensor tdKrdS = mma_partition_fragment_AB</*A=*/!dKV_swapAB>(thr_mma_dKV, sdSt);
                     flash::gemm_sm80<false, false, /*SwapAB=*/dKV_swapAB>(
-                        dK_acc, tdKrdS, tdKrQ, tdKsdSt, tdKsQ_cur,
+                        dK_mma, tdKrdS, tdKrQ, tdKsdSt, tdKsQ_cur,
                         tiled_mma_dKV, smem_tiled_copy_PdSt, smem_tiled_copy_QdOt,
                         smem_thr_copy_PdSt, smem_thr_copy_QdOt,
                         cute::conditional_return<(kStages > 1)>(nullptr, load_dO_next));
                 }
+                #pragma unroll
+                for (int i = 0; i < size(dK_acc); ++i) { dK_acc(i) += dK_mma(i); }
                 if constexpr (kStages == 1) {
                     __syncthreads();
                     do_mma_dQ(load_Q_next);
@@ -2552,10 +2604,10 @@ public:
                 Tensor tSrQ = mma_partition_fragment_AB</*A=*/!SdP_swapAB>(thr_mma_SdP, sQ(_, _, _0{}));
                 Tensor tSrK = mma_partition_fragment_AB</*A=*/SdP_swapAB>(thr_mma_SdP, sK);
                 /** recompute s=Q*K^T (Q fixed in smem stage 0, K per-step) */
-                flash::gemm_sm80<false /*A_in_regs*/, false /*B_in_regs*/, SdP_swapAB>(
+                gemm_qk_recompute(
                     tSrS, tSrQ, tSrK, tSsQ(_, _, _, _0{}), tSsK,
                     tiled_mma_SdP, smem_tiled_copy_QdO, smem_tiled_copy_KV,
-                    smem_thr_copy_QdO, smem_thr_copy_KV, nullptr /*hook*/);
+                    smem_thr_copy_QdO, smem_thr_copy_KV);
                 Tensor tLSErLSE = cute::conditional_return<!ShuffleLSE>(
                     make_fragment_like(tSsLSE(_, _0{})), make_tensor<ElementAccum>(Int<kStatsPerThread>{}));
                 if constexpr (!ShuffleLSE) {
