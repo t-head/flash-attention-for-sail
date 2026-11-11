@@ -974,6 +974,33 @@ def test_flash_attn_kvcache(
                 assert (out - out_ref).abs().mean().item() <= mult_mean * (out_pt - out_ref).abs().mean().item()
 
 
+@pytest.mark.skipif(
+    cuda_cap != 89 or DISABLE_HDIM192 or DISABLE_HDIMV
+    or os.getenv("FLASH_ATTENTION_DISABLE_VARLEN", "FALSE") == "TRUE",
+    reason="requires SM89 varlen D192/V128 support",
+)
+def test_flash_attn_varlen_warp_interleave():
+    torch.random.manual_seed(0)
+    seqlen_q, seqlen_k, nheads = 4096, 8192, 6
+    options = dict(device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(seqlen_q, nheads, 192, **options)
+    k = torch.randn(seqlen_k, nheads, 192, **options)
+    v = torch.randn(seqlen_k, nheads, 128, **options)
+    cu_seqlens_q = torch.tensor([0, seqlen_q], device=q.device, dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0, seqlen_k], device=q.device, dtype=torch.int32)
+    out, lse = flash_attn_varlen_func(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
+        causal=True, num_splits=1, return_attn_probs=True,
+    )
+
+    ref_inputs = (q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0))
+    out_ref = attention_ref(*ref_inputs, causal=True)[0].squeeze(0)
+    out_pt = attention_ref(*ref_inputs, causal=True, upcast=False, reorder_ops=True)[0].squeeze(0)
+    atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max()
+    assert (out - out_ref).abs().max() <= 2 * (out_pt - out_ref).abs().max() + atol
+    assert torch.isfinite(lse).all()
+
+
 def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, dv, device, dtype, dtype_ref):
     num_blocks = math.ceil(seqlen_k / page_size) * batch_size * 3
     k_cache_paged = torch.randn(
