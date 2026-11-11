@@ -40,7 +40,7 @@ template <int kNWarps, int Stages, bool Q_in_regs, class TileShape_MNK_, int kHe
 #endif
         bool PackGQA_, bool Split_, class ElementSAux_, bool Is_QSA_=false
           , class QsaConfig = flash::QsaConfig,
-            bool PrefillInterleave = false
+            bool UseWarpInterleave = false
           >
 struct CollectiveMainloopFwdSm80 {
 
@@ -115,15 +115,16 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
 
 #if defined(USE_PPU) && USE_AIU && !defined(FA3_HLLM_BUILD)
-    static_assert(!PrefillInterleave || (ArchTag::kMinComputeCapability == 89
+    static_assert(!UseWarpInterleave || (ArchTag::kMinComputeCapability == 89
         && cute::is_same_v<Element, cutlass::bfloat16_t>
         && kHeadDim == 192 && kHeadDimV == 128 && kStages == 1 && Q_in_regs
         && Varlen && !Is_local && !AppendKV && !Has_softcap && !Is_QSA
-        && kBlockM == 64 && kBlockN == 64 && kNWarps == 4 && PagedKV && PagedKVAiu
-        && kBlockNPagedPerAiuLoad == 64 && PackGQA && Is_causal),
-        "SM89 prefill interleaving requires a supported BF16 one-stage AIU specialization");
+        && kBlockM == 128 && kBlockN == 128 && kNWarps == 8 && Is_causal
+        && (PagedKV ? PagedKVAiu && kBlockNPagedPerAiuLoad == 64
+                    : !PagedKVAiu && !PackGQA && !Split)),
+        "SM89 warp interleaving requires a supported BF16 one-stage AIU specialization");
 #else
-    static_assert(!PrefillInterleave, "SM89 prefill interleaving requires the PPU AIU backend");
+    static_assert(!UseWarpInterleave, "SM89 warp interleaving requires the PPU AIU backend");
 #endif
 #ifdef USE_PPU
     // Each warp executes QK. Give every warp the same valid score
@@ -246,15 +247,14 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr int NumMmaThreads = size(TiledMma{});
     static constexpr int NumProducerThreads = NumMmaThreads;  // For compatibility with TileScheduler
 
-#if defined(USE_PPU) && USE_AIU
-    // Warps 0/2 lead and warps 1/3 follow, each computing its own query rows.
-    // Warp 0 copies Value; warp 1 refills Key while softmax/PV consumes Value.
-    // Only copy ownership is remapped; MMA thread indices stay unchanged.
+    // Alternate physical warps between the two groups, reversing group
+    // order on odd CTAs. The first logical warp of each group owns its
+    // Value or Key copy. MMA thread indices stay unchanged.
     struct WarpInterleaveSchedule {
         static constexpr int kLeadingWarps = kNWarps / 2;
         // Tensor/scalar overlap tuning; KReadersDone separately protects Key reuse.
-        static constexpr int kQkHandoffFragments = 2;
-        static_assert(!PrefillInterleave || (kLeadingWarps > 0 && kLeadingWarps < kNWarps));
+        static constexpr int kQkHandoffFragments = PagedKV ? 4 : 6;
+        static_assert(!UseWarpInterleave || (kLeadingWarps > 0 && kLeadingWarps < kNWarps));
 
         struct Barrier {
             static constexpr int QkHandoff = 0;
@@ -267,7 +267,7 @@ struct CollectiveMainloopFwdSm80 {
         int const logical_warp_idx;
 
         CUTLASS_DEVICE explicit WarpInterleaveSchedule(int physical_warp_idx)
-            : logical_warp_idx(((physical_warp_idx & 1) << 1) | (physical_warp_idx >> 1)) {}
+            : logical_warp_idx((((physical_warp_idx ^ int(blockIdx.x & 1)) & 1) * kLeadingWarps + physical_warp_idx / 2)) {}
 
         CUTLASS_DEVICE bool is_leading() const { return logical_warp_idx < kLeadingWarps; }
 
@@ -335,10 +335,12 @@ struct CollectiveMainloopFwdSm80 {
             }
         }
 
-        // Called after the last shared-memory Value load, before its PV MMA.
+        // The remaining PV fragments use registers after this handoff.
         CUTLASS_DEVICE void release_next_tile(bool has_next_tile) const {
             if (!is_leading()) {
+#ifdef USE_PPU
                 __ppu_sched_bound();
+#endif
                 flash::cp_async_wait<0>();
                 // Publish next Key and retire Value reads. The final tile still
                 // drains its copy queue but leaves no unmatched barrier phase.
@@ -348,7 +350,6 @@ struct CollectiveMainloopFwdSm80 {
             }
         }
     };
-#endif
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static constexpr int kHeadDimGCD = cute::gcd(kHeadDim, kHeadDimV);
@@ -839,9 +840,24 @@ struct CollectiveMainloopFwdSm80 {
 #else
         GmemTiledCopyKV gmem_tiled_copy_V;
 #endif
+#if defined(USE_PPU) && USE_AIU
+        int const warp_idx = __ppu_read_firstlane(threadIdx.x / 32);
+#else
+        int const warp_idx = thread_idx / 32;
+#endif
+        auto const wi_schedule = [&] {
+            if constexpr (UseWarpInterleave) { return WarpInterleaveSchedule{warp_idx}; }
+            else { return nullptr; }
+        }();
+        int k_copy_thread_idx = thread_idx;
+        int v_copy_thread_idx = thread_idx;
+        if constexpr (UseWarpInterleave && !PagedKV) {
+            k_copy_thread_idx = wi_schedule.key_copy_thread_idx(thread_idx);
+            v_copy_thread_idx = wi_schedule.value_copy_thread_idx(thread_idx);
+        }
         auto gmem_thr_copy_Q = gmem_tiled_copy_Q.get_thread_slice(thread_idx);
-        auto gmem_thr_copy_K = gmem_tiled_copy_K.get_thread_slice(thread_idx);
-        auto gmem_thr_copy_V = gmem_tiled_copy_V.get_thread_slice(thread_idx);
+        auto gmem_thr_copy_K = gmem_tiled_copy_K.get_thread_slice(k_copy_thread_idx);
+        auto gmem_thr_copy_V = gmem_tiled_copy_V.get_thread_slice(v_copy_thread_idx);
         auto gmem_thr0_copy_Q = gmem_tiled_copy_Q.get_thread_slice(_0{});  // For index calculation
         auto gmem_thr0_copy_KV = gmem_tiled_copy_K.get_thread_slice(_0{});  // For index calculation
 
@@ -880,8 +896,6 @@ struct CollectiveMainloopFwdSm80 {
             gmem_tiled_copy_K.desc_ = AiuDesc{nullptr, seqlen_info.seqlen_k, get<0>(params.stride_K), kBlockN, kBlockKGmem, aiu_offset_k};
             gmem_tiled_copy_V.desc_ = AiuDesc{nullptr, seqlen_info.seqlen_k, get<0>(params.stride_V), kBlockN, kBlockKGmem, aiu_offset_v};
         }
-        const int warp_idx = __ppu_read_firstlane(threadIdx.x / 32);
-        WarpInterleaveSchedule const wi_schedule{warp_idx};
         [[maybe_unused]] const int lane = threadIdx.x % 32;  // P3 only
         const int tid_thread_slice = warp_idx * 32;
 #else
@@ -1045,22 +1059,20 @@ struct CollectiveMainloopFwdSm80 {
         // Native K/V share page lookup state. WI owns separate Key and Value
         // managers with different copy threads. Inactive declarations are null.
         auto paged_kv_manager = [&] {
-            if constexpr (!PrefillInterleave) {
+            if constexpr (!UseWarpInterleave) {
                 return make_paged_kv_manager(thread_idx);
             } else { return nullptr; }
         }();
-#if defined(USE_PPU) && USE_AIU
         auto paged_v_manager = [&] {
-            if constexpr (PrefillInterleave) {
+            if constexpr (UseWarpInterleave && PagedKV) {
                 return make_paged_kv_manager(wi_schedule.value_copy_thread_idx(thread_idx));
             } else { return nullptr; }
         }();
         auto paged_k_manager = [&] {
-            if constexpr (PrefillInterleave) {
+            if constexpr (UseWarpInterleave && PagedKV) {
                 return make_paged_kv_manager(wi_schedule.key_copy_thread_idx(thread_idx));
             } else { return nullptr; }
         }();
-#endif
 
         auto load_K = [&] (int const n_block, int const smem_pipe_write, auto need_seqlenk_masking_type) {
             static constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
@@ -1068,27 +1080,30 @@ struct CollectiveMainloopFwdSm80 {
                 // Do we need bound check to make sure the row doesn't go above kBlockN
                 static constexpr bool EvenN = kBlockN % CUTE_STATIC_V(shape<0>(GmemLayoutAtom{})) == 0;
                 Tensor tKsK_cur = tKsK(_, _, _, smem_pipe_write);
+                if constexpr (UseWarpInterleave) {
+                    // The ordinary AIU copy helper assigns copies to physical warp 0.
+                    if (k_copy_thread_idx < 32) {
+                        cute::copy(gmem_tiled_copy_K, tKgK(_, _, _, n_block), tKsK_cur);
+                    }
+                } else {
 #if defined(USE_PPU) && USE_AIU
-                flash::copy</*Is_even_MN=*/true>(
-                    gmem_tiled_copy_K, tKgK(_, _, _, n_block), tKsK_cur, t0KcK, tKpK);
+                    flash::copy</*Is_even_MN=*/true>(
+                        gmem_tiled_copy_K, tKgK(_, _, _, n_block), tKsK_cur, t0KcK, tKpK);
 #else
-                // Instead of passing in tKcK, we pass in t0KcK and subtract the offset from the limit
-                // (seqlen_k - n_block * kBlockN). This is because the entries of t0KcK are known at compile time.
-                int const seqlenk_row_limit = -int(get<0>(tKcK(_0{}, _0{}, _0{}))) + (EvenN
-                    ? seqlen_info.seqlen_k - n_block * kBlockN
-                    : (!Seqlenk_mask ? kBlockN : std::min(seqlen_info.seqlen_k - n_block * kBlockN, kBlockN)));
-                // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
-                flash::copy</*Is_even_MN=*/!Seqlenk_mask && EvenN, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/true>(
-                    gmem_tiled_copy_K, tKgK(_, _, _, n_block), tKsK_cur, t0KcK, tKpK, seqlenk_row_limit);
+                    // Use the compile-time coordinates in t0KcK and subtract the thread offset from the limit.
+                    int const seqlenk_row_limit = -int(get<0>(tKcK(_0{}, _0{}, _0{}))) + (EvenN
+                        ? seqlen_info.seqlen_k - n_block * kBlockN
+                        : (!Seqlenk_mask ? kBlockN : std::min(seqlen_info.seqlen_k - n_block * kBlockN, kBlockN)));
+                    // The score mask handles out-of-bounds K rows.
+                    flash::copy</*Is_even_MN=*/!Seqlenk_mask && EvenN, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/true>(
+                        gmem_tiled_copy_K, tKgK(_, _, _, n_block), tKsK_cur, t0KcK, tKpK, seqlenk_row_limit);
 #endif
+                }
             } else {
-#if defined(USE_PPU) && USE_AIU
-                if constexpr (PrefillInterleave) {
+                if constexpr (UseWarpInterleave) {
                     paged_k_manager.template load_page_table<Seqlenk_mask>(n_block);
                     paged_k_manager.template load_K<Seqlenk_mask>(n_block, sK(_, _, smem_pipe_write));
-                } else
-#endif
-                {
+                } else {
                     paged_kv_manager.template load_page_table<Seqlenk_mask>(n_block);
                     paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK(_, _, smem_pipe_write));
                 }
@@ -1109,30 +1124,33 @@ struct CollectiveMainloopFwdSm80 {
                 // We don't call flash::copy since it doesn't support bound checking
                 // to not overshot kBlockN when writing to smem.
                 Tensor tVgV_cur = tVgV(_, _, _, n_block);
+                if constexpr (UseWarpInterleave) {
+                    if (v_copy_thread_idx < 32) {
+                        cute::copy(gmem_tiled_copy_V, tVgV_cur, tVsV_cur);
+                    }
+                } else {
 #if defined(USE_PPU) && USE_AIU
-                flash::copy</*Is_even_MN=*/true>(
-                    gmem_tiled_copy_V, tVgV_cur, tVsV_cur, t0VcV, tVpV);
+                    flash::copy</*Is_even_MN=*/true>(
+                        gmem_tiled_copy_V, tVgV_cur, tVsV_cur, t0VcV, tVpV);
 #else
-                int const seqlenk_row_limit = seqlen_info.seqlen_k - n_block * kBlockN - get<0>(tVcV(_0{}, _0{}, _0{}));
-                #pragma unroll
-                for (int m = 0; m < size<1>(tVsV); ++m) {
-                    // If kBlockN doesn't evenly divide the tiled copy, only the last `m` needs to be checked
-                    if (EvenN || m < size<1>(tVsV) - 1 || get<0>(tVcV(_0{}, m, _0{})) < kBlockN) {
-                        bool const predicate_n = !Seqlenk_mask || get<0>(t0VcV(_0{}, m, _0{})) < seqlenk_row_limit;
-                        #pragma unroll
-                        for (int k = 0; k < size<2>(tVsV); ++k) {
-                            cute::copy(gmem_tiled_copy_V.with(tVpV(k) && predicate_n), tVgV_cur(_, m, k), tVsV_cur(_, m, k));
+                    int const seqlenk_row_limit = seqlen_info.seqlen_k - n_block * kBlockN - get<0>(tVcV(_0{}, _0{}, _0{}));
+                    #pragma unroll
+                    for (int m = 0; m < size<1>(tVsV); ++m) {
+                        // Only the final m can exceed a partial tile.
+                        if (EvenN || m < size<1>(tVsV) - 1 || get<0>(tVcV(_0{}, m, _0{})) < kBlockN) {
+                            bool const predicate_n = !Seqlenk_mask || get<0>(t0VcV(_0{}, m, _0{})) < seqlenk_row_limit;
+                            #pragma unroll
+                            for (int k = 0; k < size<2>(tVsV); ++k) {
+                                cute::copy(gmem_tiled_copy_V.with(tVpV(k) && predicate_n), tVgV_cur(_, m, k), tVsV_cur(_, m, k));
+                            }
                         }
                     }
+#endif
                 }
-#endif
             } else {
-#if defined(USE_PPU) && USE_AIU
-                if constexpr (PrefillInterleave) {
+                if constexpr (UseWarpInterleave) {
                     paged_v_manager.template load_V<Seqlenk_mask>(n_block, sV(_, _, smem_pipe_write));
-                } else
-#endif
-                {
+                } else {
                     paged_kv_manager.template load_V<Seqlenk_mask>(n_block, sV(_, _, smem_pipe_write));
                 }
             }
@@ -1223,13 +1241,11 @@ struct CollectiveMainloopFwdSm80 {
             }
         };
 
-#if defined(USE_PPU) && USE_AIU
-        if constexpr (PrefillInterleave) {
+        if constexpr (UseWarpInterleave && PagedKV) {
             // V uses the same page as K, but is copied by another warp. Keep
             // its page lookup outside the first QK fragment's critical path.
             paged_v_manager.template load_page_table<true>(n_block);
         }
-#endif
 
         // If Share_QV_Smem, we load Q, then load 1 stage of K, then (optionally) rotate Q and
         // read from smem_q to registers, then load V.
@@ -1265,6 +1281,14 @@ struct CollectiveMainloopFwdSm80 {
         });
 
         if constexpr (!Share_QV_Smem) { preprocess_Q(); }
+        if constexpr (UseWarpInterleave && PagedKV && kBlockN > kBlockNPagedPerAiuLoad) {
+            if (n_block * kBlockN + kBlockN > seqlen_k) {
+                auto *v_smem = shared_storage.tensors.mainloop.smem_v.data();
+                for (int i = thread_idx; i < kBlockN * kHeadDimV; i += NumMmaThreads) {
+                    v_smem[i] = Element(0.f);
+                }
+            }
+        }
 
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMmaQK, false, Is_QSA> mask(
             qk_thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
@@ -1340,24 +1364,19 @@ struct CollectiveMainloopFwdSm80 {
 #endif
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
             clear(tSrS);
-#if defined(USE_PPU) && USE_AIU
-            if constexpr (PrefillInterleave) {
+            if constexpr (UseWarpInterleave) {
                 wi_schedule.template begin_tile<Is_first_iter>(sync);
-            } else
-#endif
-            { sync(); }
+            } else {
+                sync();
+            }
             auto load_V_next = [&] {
-#if defined(USE_PPU) && USE_AIU
-                if constexpr (PrefillInterleave) {
-                    // NextTileReady protects V reuse. Each tile is one page,
-                    // and empty ranges returned before entering this loop.
-                    // AIU pads a partial page; no trailing page needs zero-fill.
+                if constexpr (UseWarpInterleave) {
+                    // NextTileReady protects V reuse. Prologue clears missing pages;
+                    // AIU pads the partial page on the first iteration.
                     wi_schedule.load_value([&] {
                         load_V(n_block, 0, cute::bool_constant<Is_first_iter>{});
                     });
-                } else
-#endif
-                {
+                } else {
                     if (n_block - kStages + 1 >= n_block_min) {
                         load_V(n_block - kStages + 1, kStages > 1 ? smem_pipe_write : 0, cute::bool_constant<Is_first_iter && kStages == 1>{} /*Seqlenk_mask*/);
                     }
@@ -1381,59 +1400,42 @@ struct CollectiveMainloopFwdSm80 {
             };
             Tensor tSrQ_cur = cute::conditional_return<Q_in_regs>(tSrQ, thr_mma_qk.partition_fragment_A(sQ));
             Tensor tSrK = thr_mma_qk.partition_fragment_B(sK(_, _, _0{}));
-#if defined(USE_PPU) && USE_AIU
-            auto release_trailing_qk = [&](int fragment) {
-                if constexpr (PrefillInterleave) {
+            auto release_trailing_qk = [&] {
+                if constexpr (UseWarpInterleave) {
                     static_assert(WarpInterleaveSchedule::kQkHandoffFragments <= decltype(size<2>(tSrQ_cur))::value);
-                    wi_schedule.after_qk_fragment(fragment);
-                }
-            };
-            if constexpr (PrefillInterleave) {
+                    return [&](int fragment) { wi_schedule.after_qk_fragment(fragment); };
+                } else { return nullptr; }
+            }();
+            if constexpr (UseWarpInterleave) {
                 wi_schedule.wait_for_qk_turn();
             }
-#endif
 #ifdef USE_PPU
-            if constexpr (PagedKVAiu && (kBlockN != kBlockNPagedPerAiuLoad)) {
+            if constexpr (PagedKVAiu && kBlockN != kBlockNPagedPerAiuLoad) {
                 flash::gemm_sm80_kv_paged_aiu<kBlockN, kBlockNPagedPerAiuLoad, kHeadDim, kBlockKGmem, Q_in_regs>(
                     tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
-                    tiled_mma_qk, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, qk_prefetch
-                );
-            } else {
-#if USE_AIU
-                if constexpr (PrefillInterleave) {
-                    flash::gemm_sm80<Q_in_regs>(
-                        tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
-                        tiled_mma_qk, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K,
-                        qk_prefetch, release_trailing_qk);
-                } else
+                    tiled_mma_qk, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K,
+                    qk_prefetch, release_trailing_qk);
+            } else
 #endif
-                {
+            {
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
-                    flash::gemm_sm80<Q_in_regs, false, false,
-                        Is_QSA && !QsaReplicateQK ? QsaConfig::PrefetchB : 1>(
+                flash::gemm_sm80<Q_in_regs, false, false,
+                    Is_QSA && !QsaReplicateQK ? QsaConfig::PrefetchB : 1>(
 #else
-                    flash::gemm_sm80<Q_in_regs>(
+                flash::gemm_sm80<Q_in_regs>(
 #endif
-                        tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
-                        tiled_mma_qk, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, qk_prefetch
-                    );
-                }
+                    tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
+                    tiled_mma_qk, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K,
+                    qk_prefetch, release_trailing_qk);
             }
-#else
-            flash::gemm_sm80<Q_in_regs>(
-                tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
-                tiled_mma_qk, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, qk_prefetch
-            );
-#endif
-#if defined(USE_PPU) && USE_AIU
-            if constexpr (PrefillInterleave) {
+            if constexpr (UseWarpInterleave) {
                 wi_schedule.finish_qk(n_block > n_block_min, load_K_next, [&] {
-                    // Current Value has been issued; look up its next page
-                    // outside the next tile's QK critical path.
-                    paged_v_manager.template load_page_table<false>(n_block - 1);
+                    if constexpr (PagedKV) {
+                        // Prepare the next Value address ahead of its copy.
+                        paged_v_manager.template load_page_table<false>(n_block - 1);
+                    }
                 });
             }
-#endif
             if constexpr (Is_QSA_FP8) {
                 sync_threads();
                 if constexpr (Share_KV_Smem) { load_V_next(); }
@@ -1462,7 +1464,7 @@ struct CollectiveMainloopFwdSm80 {
                     load_K_next_prefetched();
                 } else
 #endif
-                if constexpr (kStages == 1 && !PrefillInterleave) {
+                if constexpr (kStages == 1 && !UseWarpInterleave) {
                     // Adjust the loadV wait point according to the headdim.
                     // Smaller headdim coresponds to shorter QK gemm, and  PagedKV costs longer loading time,
                     // thus we need to move the wait point farther.
@@ -1594,11 +1596,9 @@ struct CollectiveMainloopFwdSm80 {
 #else
             if constexpr (!Is_first_iter) { softmax.rescale_o(tOrO, scores_scale); }
 #endif
-#if defined(USE_PPU) && USE_AIU
-            if constexpr (PrefillInterleave) {
+            if constexpr (UseWarpInterleave) {
                 wi_schedule.wait_for_value();
             }
-#endif
             if constexpr (Is_QSA_FP8) {
                 if constexpr (!Share_KV_Smem && kStages == 1) { flash::cp_async_wait<1>(); sync_threads(); }
                 if constexpr (Share_KV_Smem && TrimHighRows) { sync(); }
@@ -1609,6 +1609,11 @@ struct CollectiveMainloopFwdSm80 {
                 }
             }
             Tensor tOrV = thr_mma.partition_fragment_B(sVt(_, _, _0{}));
+            auto release_next_tile = [&] {
+                if constexpr (UseWarpInterleave) {
+                    return [&] { wi_schedule.release_next_tile(n_block > n_block_min); };
+                } else { return nullptr; }
+            }();
 #ifdef USE_PPU
             // Move the waiting of load_V_next to the point before PV gemm for better performance.
 #if defined(FLASHATTENTION_ENABLE_QSA)
@@ -1714,8 +1719,10 @@ struct CollectiveMainloopFwdSm80 {
                 __syncthreads();  // barrier C: all P reads done, safe for load_K_next to refill this K stage
             } else
 #endif
-            if constexpr (PagedKVAiu && (kBlockN != kBlockNPagedPerAiuLoad) && (!Is_FP8)) {
-                flash::gemm_rs_sm80_kv_paged_aiu<kBlockN, kBlockNPagedPerAiuLoad, kHeadDimV, kBlockKGmem>(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+            if constexpr (PagedKVAiu && kBlockN != kBlockNPagedPerAiuLoad && !Is_FP8) {
+                flash::gemm_rs_sm80_kv_paged_aiu<kBlockN, kBlockNPagedPerAiuLoad, kHeadDimV, kBlockKGmem>(
+                    tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0),
+                    tiled_mma, smem_tiled_copy_V, smem_thr_copy_V, release_next_tile);
             } else if constexpr (Fp8VDirect && !Fp8PvNsplit) {
                 // UseTsmLd = (!PagedKV || PagedKVAiu): TSM on the AIU
                 // cube-blocked tile; else plain LDSM_T on the raw swizzled
@@ -1726,23 +1733,12 @@ struct CollectiveMainloopFwdSm80 {
                                                    (!PagedKV || PagedKVAiu), SmemLayoutV>(
                     tOrO, tOrP, tOrV, shared_storage.tensors.mainloop.smem_v.data(),
                     kStages > 1 ? smem_pipe_read : 0, tiled_mma);
-            } else {
-#if USE_AIU
-                if constexpr (PrefillInterleave) {
-                    auto release_next_tile = [&] {
-                        wi_schedule.release_next_tile(n_block > n_block_min);
-                    };
-                    flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma,
-                                       smem_tiled_copy_V, smem_thr_copy_V, release_next_tile);
-                } else
+            } else
 #endif
-                {
-                    flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
-                }
+            {
+                flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0),
+                                   tiled_mma, smem_tiled_copy_V, smem_thr_copy_V, release_next_tile);
             }
-#else
-            flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
-#endif
             if constexpr (Is_QSA_FP8) {
                 sync_threads();
                 if constexpr (Share_KV_Smem && !TrimHighRows) { load_K_next(); } // The six-head path prefetched K after its final V read.
