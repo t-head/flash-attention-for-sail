@@ -170,6 +170,7 @@ struct Flash_fwd_params : public Qkv_params {
     bool use_kblockm_16;
     bool use_kblockm_128;
     bool use_kblockn_16;
+    bool use_warp_interleave;
     bool is_qsa;
     // QSA only: the caller certifies that every 16-column-aligned group of the (total_q, topk)
     // table consists of 16 pool-contiguous tokens, the layout the AIU paged-KV bulk load
