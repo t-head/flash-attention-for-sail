@@ -615,25 +615,53 @@ CUTLASS_DEVICE void gemm_rs_sm80_kv_paged_aiu(Tensor0 &acc, Tensor1 &tCrA, Tenso
     int MMA_K_PER_TILE = size<1>(tCrB) / (kHeadDim / kBlockKSmem);
     Tensor tCsB_rTile = make_tensor(tCsB.data(), tCsB.layout());
     Tensor tCsB_sTile = make_tensor(tCsB.data(), tCsB.layout());
+    // Fire each (kv-atom, n-atom) PV MMA immediately after the V TSM copy that
+    // fills it instead of filling the whole MMA_N*K V fragment first. The full
+    // fragment holds MMA_N*4 u32 (64 for hdim 256 = 16 atoms) on top of the O
+    // accumulator and the Q fragment, which does not fit the 256-reg budget;
+    // per-atom emission keeps ~4 u32 of V live past its own MMA and lets the
+    // compiler overlap the next TSM load with the in-flight MMA (same mechanism
+    // as the FP8 n-split PV path). Each accumulator register still accumulates
+    // over kv-atoms in the original order, so results are bitwise identical.
     #pragma hggc mmatiestrictly
     {
     #pragma unroll
     for (int i = 0; i < size<2>(tCrA) / (kBlockNPagedPerAiuLoad / 16); ++i) {
         tCsB_rTile.data() = tCsB_sTile.data();
+        // Software-pipeline the V fragments by one n-atom: fill the k=0
+        // fragments first, then issue the V TSM copy for (k+1) before the MMAs
+        // of k. Same copies, same destination slots, same per-accumulator
+        // reduction order -> bitwise identical; the only change is that the
+        // next fragment's smem latency overlaps the in-flight MMA instead of
+        // stalling in front of it.
+        #pragma unroll
+        for (int j = 0; j < kBlockNPagedPerAiuLoad / 16; ++j) {
+            const int iAtom = i * (kBlockNPagedPerAiuLoad / 16) + j;
+            cute::copy(smem_tiled_copy_B, tCsB_rTile(_, _0{}, j), tCrB_copy_view(_, _0{}, iAtom));
+        }
+        #pragma unroll
         for (int k = 0; k < size<1>(tCrB); k++) {
+            Tensor tCsB_pTile = tCsB_rTile;
+            if ((k + 1) % MMA_K_PER_TILE == 0) {
+                tCsB_pTile.data() = tCsB_pTile.data() + OFFSET_TILE;
+            }
+            if (k + 1 < size<1>(tCrB)) {
+                #pragma unroll
+                for (int j = 0; j < kBlockNPagedPerAiuLoad / 16; ++j) {
+                    const int iAtom = i * (kBlockNPagedPerAiuLoad / 16) + j;
+                    cute::copy(smem_tiled_copy_B, tCsB_pTile(_, (k + 1) % MMA_K_PER_TILE, j), tCrB_copy_view(_, k + 1, iAtom));
+                }
+            }
             #pragma unroll
             for (int j = 0; j < kBlockNPagedPerAiuLoad / 16; ++j) {
-                cute::copy(smem_tiled_copy_B, tCsB_rTile(_, k % MMA_K_PER_TILE, j), tCrB_copy_view(_, k, i * (kBlockNPagedPerAiuLoad / 16) + j));
+                const int iAtom = i * (kBlockNPagedPerAiuLoad / 16) + j;
+                cute::gemm(tiled_mma, tCrA(_, _0{}, iAtom), tCrB(_, k, iAtom), acc(_, _0{}, k));
             }
             if ((k + 1) % MMA_K_PER_TILE == 0) {
                 tCsB_rTile.data() = tCsB_rTile.data() + OFFSET_TILE;
             }
         }
         tCsB_sTile.data() = tCsB_sTile.data() + OFFSET_MMA_N;
-        #pragma unroll
-        for (int j = 0; j < kBlockNPagedPerAiuLoad / 16; ++j) {
-            cute::gemm(tiled_mma, tCrA(_, _, i * (kBlockNPagedPerAiuLoad / 16) + j), tCrB(_, _, i * (kBlockNPagedPerAiuLoad / 16) + j), acc);
-        }
     }
     }
 }

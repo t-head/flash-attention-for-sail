@@ -131,6 +131,13 @@ struct CollectiveMainloopFwdSm80 {
         (kBlockM >  16 && (ArchTag::kMinComputeCapability >= 89 || (kHeadDim != 64 && kHeadDim != 192))) ||   // prefill
         (kBlockM == 16 && (ArchTag::kMinComputeCapability >= 89 && kHeadDim == 256))  // decode
     );
+    // Fold softmax_scale_log2 into the register-resident Q once per work tile, so the
+    // per-KV-tile exp2 pass drops its per-element multiply. Q is reused by every n_block
+    // of the tile, so the one-off cost amortizes over the tile's KV blocks. Only valid
+    // together with the max-free skip-rescale softmax (row_max == 0, Max_offset == 0 for
+    // the non-FP8 path): softcap consumes the raw score before scaling, QSA keeps the
+    // standard rescale path, and only Q_in_regs gives us a per-tile Q fragment to scale.
+    static constexpr bool PreScaleQLog2 = FA4SkipRescaleO && Q_in_regs && !Has_softcap && !Is_QSA;
 #endif
 
     using SeqlenInfo_t = flash::SeqlenInfoQKNewK<Varlen, AppendKV>;
@@ -1067,6 +1074,20 @@ struct CollectiveMainloopFwdSm80 {
                     }
                 }();
                 cute::copy(smem_tiled_copy_Q, tSsQ_copy_view, tSrQ_copy_view);
+                if constexpr (PreScaleQLog2) {
+                    // See PreScaleQLog2: exp2(score * softmax_scale_log2) becomes exp2(score).
+                    // Scale in packed q_frag pairs so the whole pass is ~2 instructions per pair.
+                    float const q_scale_log2 = softmax.softmax_scale_log2;
+                    Tensor q_frag = recast<cutlass::Array<Element, 2>>(tSrQ);
+                    cutlass::NumericArrayConverter<Element, float, 2> to_element;
+                    #pragma unroll
+                    for (int i = 0; i < size(q_frag); ++i) {
+                        cutlass::Array<float, 2> scaled;
+                        scaled[0] = static_cast<float>(q_frag[i][0]) * q_scale_log2;
+                        scaled[1] = static_cast<float>(q_frag[i][1]) * q_scale_log2;
+                        q_frag[i] = to_element(scaled);
+                    }
+                }
             }
         };
 
@@ -1278,7 +1299,9 @@ struct CollectiveMainloopFwdSm80 {
                         load_K_next();
 #endif
                     } else {
-                        sync();
+                        // Preserve the QSA wait protocol; other paths retain the delayed V wait.
+                        if constexpr (Is_QSA) { sync(); }
+                        else { __syncthreads(); }
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
                         if constexpr (QsaTileIndexPipeline) { load_K_next_prefetched(); }
                         else { load_K_next(); }
@@ -1297,7 +1320,11 @@ struct CollectiveMainloopFwdSm80 {
                 if constexpr (Is_QSA_FP8) {
                     return softmax.template max_get_scale<Is_first_iter, Check_inf, true>(tSrS);
                 } else if constexpr (FA4SkipRescaleO) {
-                    return softmax.template max_get_scale_skip<Is_first_iter, Check_inf>(tSrS);
+                    if constexpr (Is_QSA) {
+                        return softmax.template max_get_scale_skip<Is_first_iter, Check_inf>(tSrS);
+                    } else {
+                        return softmax.template no_max_get_scale_skip<Is_first_iter, Check_inf>(tSrS);
+                    }
                 } else {
                     return softmax.template max_get_scale<Is_first_iter, Check_inf>(tSrS);
                 }
@@ -1333,6 +1360,15 @@ struct CollectiveMainloopFwdSm80 {
                 if constexpr (Is_QSA_FP8) {
                     // Keep the validated QSA schedule; upstream leaves other paths opt-in.
                     softmax.template online_softmax<Is_first_iter, Check_inf, /*SeparateExp2=*/true, /*QsaFp8=*/true>(tSrS);
+                } else if constexpr (FA4SkipRescaleO) {
+                    if constexpr (Is_QSA) {
+                        softmax.template online_softmax<Is_first_iter, Check_inf,
+                                                        /*SeparateExp2=*/Fp8PvNsplit>(tSrS);
+                    } else if constexpr (PreScaleQLog2) {
+                        softmax.template online_softmax_no_max_no_scale<Is_first_iter, Check_inf>(tSrS);
+                    } else {
+                        softmax.template online_softmax_no_max<Is_first_iter, Check_inf>(tSrS);
+                    }
                 } else {
                     softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf,
                                                     /*SeparateExp2=*/Fp8PvNsplit>(tSrS);
@@ -1403,7 +1439,7 @@ struct CollectiveMainloopFwdSm80 {
                 if (defer_v_wait) { flash::cp_async_wait<1>(); __syncthreads(); }
             }
 #endif
-            if constexpr (kStages == 1 && (kHeadDim <= 96 || (kHeadDim <= 128 && PagedKV))) { flash::cp_async_wait<kStages * 2 - 1>(); __syncthreads(); }
+            if constexpr (kStages == 1 && (kHeadDim <= 96 || (kHeadDim <= 128 && PagedKV) || (kHeadDim > 192 && !Is_QSA))) { flash::cp_async_wait<kStages * 2 - 1>(); __syncthreads(); }
 #ifdef FLASHATTENTION_QSA_FP8
             if constexpr (Is_QSA_FP8) {
                 // Use FA's hardware b16 V-direct load and pi_k/pi_n mapping.

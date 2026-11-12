@@ -308,6 +308,19 @@ public:
     CUTLASS_DEVICE
     WorkTileInfo
     get_next_work(Params const& params, WorkTileInfo const& current_work) const {
+        // When the launch owns at most one work tile per CTA the probe
+        // below can only ever return an out-of-range index, so skip the atomic
+        // entirely. The 32-word counter is then left at zero, which is exactly
+        // the state the self-resetting protocol requires between launches.
+        if constexpr (!Split && !PackGQA) {
+            long long const num_work_tiles_opt = (long long)params.m_block_divmod.divisor * params.num_head
+                                                 * params.num_batch * params.num_splits;
+            if ((long long)int(gridDim.x) >= num_work_tiles_opt
+                && (params.qhead_per_khead >= 4 || params.num_head == params.qhead_per_khead)) {
+                return {int(num_work_tiles_opt), current_work.tile_idx, current_work.block_idx,
+                        current_work.split_idx, current_work.bidh, current_work.bidb};
+            }
+        }
         int const warp_idx = cutlass::canonical_warp_idx_sync();
         unsigned int const slot = next_slot;
         if (warp_idx == 0) {
@@ -319,6 +332,20 @@ public:
         }
         __syncthreads();
         int tile_idx = __ppu_read_firstlane(tile_count_smem->tile_count[slot]) + int(gridDim.x);
+        // Each CTA issues exactly one probe after its last tile, and the first gridDim.x tiles
+        // need no probe, so a launch issues exactly num_work_tiles probes and the one that reads
+        // the final value is the last probe of the launch. That one puts the counter back to
+        // zero so the next call can reuse the same buffer without a separate zeroing memset.
+        if constexpr (!Split) {
+            long long const num_work_tiles = (long long)params.m_block_divmod.divisor * params.num_head
+                                             * params.num_batch * params.num_splits;
+            long long const probe_index = (long long)tile_idx - (long long)int(gridDim.x);
+            if (num_work_tiles > 0 && probe_index == num_work_tiles - 1) {
+                if (warp_idx == 0 && __ppu_read_laneid() == 0) {
+                    params.tile_count_semaphore[0] = 0;
+                }
+            }
+        }
         next_slot ^= 1;
         return {tile_idx, current_work.tile_idx, current_work.block_idx, current_work.split_idx, current_work.bidh, current_work.bidb};
     }
