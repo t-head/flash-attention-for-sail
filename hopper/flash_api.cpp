@@ -650,8 +650,10 @@ inline bool supports_dense_mha_warp_interleave(Flash_fwd_params const& params) {
         && useful_blocks >= kMinWaveUtilization * waves * params.num_sm;
 }
 
-inline bool get_warp_interleave(Flash_fwd_params const& params) {
-    constexpr int kMinKvCapacity = 1024;
+inline bool get_warp_interleave(Flash_fwd_params const& params,
+                                int64_t min_seqlen_q, int64_t min_seqlen_k) {
+    constexpr int kMinQueryLength = 4096;
+    constexpr int kMinKvLengthPerSplit = 2048;
     constexpr int kMinQueryTilesPerSm = 3;
     if (params.arch != 89 || !params.is_bf16 || params.is_local || params.is_qsa
         || params.num_sm <= 0
@@ -671,7 +673,9 @@ inline bool get_warp_interleave(Flash_fwd_params const& params) {
             || params.use_kblockm_16 || params.use_kblockm_128 || params.use_kblockn_16
             || params.h != 16 || params.h_k != 1 || params.page_size != 64
             || !params.seqused_k || params.cu_seqlens_k
-            || params.seqlen_k < kMinKvCapacity
+            || min_seqlen_q < kMinQueryLength || min_seqlen_q > params.seqlen_q
+            || min_seqlen_k < int64_t(kMinKvLengthPerSplit) * params.num_splits
+            || min_seqlen_k > params.seqlen_k
             || params.k_row_stride != 192 || params.k_batch_stride != 64 * 192
             || params.v_row_stride != 128 || params.v_batch_stride != 64 * 128) {
             return false;
@@ -1123,6 +1127,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 #endif // FA3_HLLM_BUILD
         , std::optional<at::Tensor> s_aux_ = {} // (h)
         , bool qsa_allow_aiu = false
+        , std::optional<int64_t> min_seqlen_q_ = std::nullopt
+        , std::optional<int64_t> min_seqlen_k_ = std::nullopt
         ) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm8x = dprops->major >= 8;
@@ -1892,7 +1898,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 
 #if defined(USE_PPU) && USE_AIU && !defined(FA3_HLLM_BUILD)
     // Select warp interleaving after layout and split parameters are finalized.
-    params.use_warp_interleave = get_warp_interleave(params);
+    params.use_warp_interleave = get_warp_interleave(
+        params, min_seqlen_q_.value_or(0), min_seqlen_k_.value_or(0));
 #endif
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
@@ -2738,7 +2745,9 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "bool? pack_gqa = None,"
         "int sm_margin = 0,"
         "Tensor? s_aux = None,"
-        "bool qsa_allow_aiu = False) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "bool qsa_allow_aiu = False,"
+        "int? min_seqlen_q = None,"
+        "int? min_seqlen_k = None) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"
