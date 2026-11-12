@@ -849,12 +849,43 @@ public:
                 flash::cp_async_wait<1>();
                 __syncthreads();
             }
-            Tensor tOrO_tile = make_fragment_like(tOrO);
-            clear(tOrO_tile);
-            flash::gemm_rs_sm80(tOrO_tile, tOrP, tOrV, tOsVt(_, _, _, 0),
-                                tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
-            #pragma unroll
-            for (int i = 0; i < size(tOrO); ++i) { tOrO(i) += tOrO_tile(i); }
+#ifdef USE_PPU
+            if constexpr (kHeadDim == 256 && std::is_same_v<Element, float>) {
+                constexpr int kPVGroupN = 2;
+                static_assert(decltype(size<2>(tOrO))::value % kPVGroupN == 0);
+                static_assert(decltype(size<1>(tOrV))::value == decltype(size<2>(tOrO))::value);
+                Tensor tOsVt_cur = tOsVt(_, _, _, 0);
+                #pragma unroll
+                for (int group = 0; group < size<2>(tOrO) / kPVGroupN; ++group) {
+                    Tensor tOrO_group = local_tile(tOrO,
+                        make_shape(shape<0>(tOrO), shape<1>(tOrO), Int<kPVGroupN>{}),
+                        make_coord(0, 0, group));
+                    Tensor tOrV_group = local_tile(tOrV,
+                        make_shape(shape<0>(tOrV), Int<kPVGroupN>{}, shape<2>(tOrV)),
+                        make_coord(0, group, 0));
+                    Tensor tOsVt_group = local_tile(tOsVt_cur,
+                        make_shape(shape<0>(tOsVt_cur), Int<kPVGroupN>{}, shape<2>(tOsVt_cur)),
+                        make_coord(0, group, 0));
+                    Tensor tOrO_tile = make_fragment_like(tOrO_group);
+                    Tensor tOrV_tile = make_fragment_like(tOrV_group);
+                    clear(tOrO_tile);
+                    flash::gemm_rs_sm80(tOrO_tile, tOrP, tOrV_tile, tOsVt_group,
+                        tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+                    #pragma unroll
+                    for (int i = 0; i < size(tOrO_group); ++i) {
+                        tOrO_group(i) += tOrO_tile(i);
+                    }
+                }
+            } else
+#endif
+            {
+                Tensor tOrO_tile = make_fragment_like(tOrO);
+                clear(tOrO_tile);
+                flash::gemm_rs_sm80(tOrO_tile, tOrP, tOrV, tOsVt(_, _, _, 0),
+                    tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+                #pragma unroll
+                for (int i = 0; i < size(tOrO); ++i) { tOrO(i) += tOrO_tile(i); }
+            }
 
             any_tile_processed = true;
             block_meta.advance_inner();

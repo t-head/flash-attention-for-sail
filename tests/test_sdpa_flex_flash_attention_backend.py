@@ -1353,6 +1353,45 @@ class TestLongSequence:
             relative_l2 = (actual.double() - reference).norm() / reference.norm()
             assert relative_l2.item() < limits[dtype], (name, relative_l2.item())
 
+    @pytest.mark.parametrize("layout", ["bhsd_contiguous", "bshd_view"])
+    @pytest.mark.parametrize("mask_kind", ["dense", "causal", "causal_doc"])
+    def test_fp32_d256_grouped_pv_multi_tile(self, layout, mask_kind):
+        # Multiple KV tiles and an odd tail exercise every PV output group.
+        torch.manual_seed(9256)
+        tensors = []
+        for seq in (129, 257, 257):
+            if layout == "bshd_view":
+                tensor = torch.randn(1, seq, 4, 256, device=DEVICE, dtype=FP32)
+                tensor = tensor.transpose(1, 2)
+            else:
+                tensor = torch.randn(1, 4, seq, 256, device=DEVICE, dtype=FP32)
+            tensors.append(tensor.detach().requires_grad_(True))
+        q, k, v = tensors
+        mask_cpu = None
+        if mask_kind != "dense":
+            query = torch.arange(129).unsqueeze(1)
+            key = torch.arange(257).unsqueeze(0)
+            mask_cpu = key <= query
+            if mask_kind == "causal_doc":
+                mask_cpu = mask_cpu & (query // 64 == key // 64)
+        mask = mask_cpu.to(DEVICE) if mask_cpu is not None else None
+        out = _run_arb(q, k, v, mask=mask)
+        grad_out = torch.randn_like(out)
+        actuals = (out, *torch.autograd.grad(out, tensors, grad_out))
+        refs = [tensor.detach().cpu().double().requires_grad_(True) for tensor in tensors]
+        with math_only():
+            ref_out = F.scaled_dot_product_attention(
+                *refs, attn_mask=mask_cpu, dropout_p=0.0)
+        references = (ref_out, *torch.autograd.grad(ref_out, refs, grad_out.cpu().double()))
+        for name, actual, reference in zip(("output", "dq", "dk", "dv"), actuals, references):
+            actual = actual.detach().cpu().double()
+            assert torch.isfinite(actual).all(), name
+            assert torch.isfinite(reference).all(), name
+            reference_norm = reference.norm()
+            assert reference_norm.item() > 0, name
+            relative_l2 = (actual - reference).norm() / reference_norm
+            assert relative_l2.item() < 2e-6, (name, relative_l2.item())
+
     def test_8k_fwd_bwd(self):
         q, k, v = _mk(1, 2, 2, 8192, 8192, 64)
         mask = _causal_mask(8192, 8192)
