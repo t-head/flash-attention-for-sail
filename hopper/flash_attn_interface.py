@@ -75,6 +75,8 @@ def _flash_attn_forward(
     sm_margin: int = 0,
     s_aux: Optional[torch.Tensor] = None,
     qsa_allow_aiu: bool = False,
+    min_seqlen_q: Optional[int] = None,
+    min_seqlen_k: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
@@ -124,6 +126,8 @@ def _flash_attn_forward(
         sm_margin,
         s_aux,
         qsa_allow_aiu,
+        min_seqlen_q,
+        min_seqlen_k,
     )
     # rest may contain out_accum, softmax_lse_accum
     out_accum = rest[0] if len(rest) > 0 and rest[0] is not None else torch.tensor([], device=out.device)
@@ -169,6 +173,8 @@ def _flash_attn_forward_fake(
     sm_margin: int = 0,
     s_aux: Optional[torch.Tensor] = None,
     qsa_allow_aiu: bool = False,
+    min_seqlen_q: Optional[int] = None,
+    min_seqlen_k: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Symbolic fake implementation of flash attention forward.
@@ -960,6 +966,8 @@ def flash_attn_with_kvcache(
     max_seqlen_k: Optional[int] = None,
     s_aux=None,
     qsa_allow_aiu: bool = False,
+    min_seqlen_q: Optional[int] = None,
+    min_seqlen_k: Optional[int] = None,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -1028,6 +1036,9 @@ def flash_attn_with_kvcache(
             Pass (total_q, 1, topk) instead to select query-sparse attention (QSA), where each row
             holds the token indices selected for one unpadded query token. Requires head dim 256,
             cu_seqlens_q, no cache_batch_idx, and a build with FLASH_ATTENTION_ENABLE_QSA.
+        min_seqlen_q, min_seqlen_k [optional]: CPU bounds on the shortest query and
+            KV lengths among requests with queries. Paged warp interleaving uses
+            both bounds to select the kernel. Omit them to use the native paged path.
         qsa_allow_aiu: bool. QSA only: certify that every 16-column-aligned group of the
             (total_q, 1, topk) table holds 16 pool-contiguous tokens, the layout the AIU
             paged-KV bulk load assumes (one table entry read per group, 16 contiguous
@@ -1098,6 +1109,8 @@ def flash_attn_with_kvcache(
         sm_margin,
         s_aux,
         qsa_allow_aiu,
+        min_seqlen_q,
+        min_seqlen_k,
     )
     # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out
