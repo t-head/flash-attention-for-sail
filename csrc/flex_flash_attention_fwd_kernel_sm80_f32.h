@@ -154,6 +154,13 @@ public:
     static constexpr uint32_t NumThreads                 = CUTE_STATIC_V(size(TiledMma{}));
     static constexpr uint32_t MaxThreadsPerBlock         = NumThreads;
     static constexpr uint32_t MinBlocksPerMultiprocessor = NumThreads == 128 ? 2 : 1;
+#ifdef USE_PPU
+    static constexpr bool O_in_smem = kHeadDim == 256 && kHeadDimV == 256 && kBlockM <= 64
+        && !Varlen && !PagedKV && !PackGQA && !Is_dropout && !Has_softcap
+        && std::is_same_v<Element, float>;
+#else
+    static constexpr bool O_in_smem = false;
+#endif
 
     // ─── SHARED MEMORY STORAGE ────────────────────────────────────────────────
     static constexpr int mainloop_smem_padding_ =
@@ -185,6 +192,7 @@ public:
             TensorStorage tensors;
             alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
         };
+        alignas(128) cute::array<float, O_in_smem ? kBlockM * kHeadDimV : 0> smem_o;
     };
     static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
@@ -270,8 +278,19 @@ public:
                  : scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info))
         {
             // O accumulator (register resident).
-            Tensor tOrO = partition_fragment_C(tiled_mma, select<0, 1>(TileShape_MNK_PV{}));
+            Tensor tOrO = [&]() {
+                Tensor fragment = partition_fragment_C(tiled_mma, select<0, 1>(TileShape_MNK_PV{}));
+                if constexpr (O_in_smem) {
+                    constexpr int count = decltype(size(fragment))::value;
+                    static_assert(count * NumThreads == kBlockM * kHeadDimV);
+                    return make_tensor(make_smem_ptr(shared_storage.smem_o.data() + thread_idx),
+                        composition(make_layout(Int<count>{}, Int<NumThreads>{}), fragment.layout()));
+                } else {
+                    return fragment;
+                }
+            }();
 
+            Tensor output = partition_fragment_C(tiled_mma, select<0, 1>(TileShape_MNK_PV{}));
             auto block_coord = work_tile_info.get_block_coord(params.scheduler);
             int const m_block = get<0>(block_coord);
             int const bidh    = get<1>(block_coord);
@@ -298,7 +317,7 @@ public:
 
             bool tile_valid = run_mainloop(
                 params, shared_storage, tiled_mma, softmax,
-                tOrO, thread_idx, m_block, bidh, bidb, seqlen_info);
+                tOrO, output, thread_idx, m_block, bidh, bidb, seqlen_info);
 
             scheduler.prefetch_next_work(params.scheduler, work_tile_info);
 
@@ -310,8 +329,17 @@ public:
                     #pragma unroll
                     for (int i = 0; i < size(tOrO); ++i) { tOrO(i) *= rp; }
                 }
-                epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage,
-                               tiled_mma, thread_idx, block_coord);
+                if constexpr (O_in_smem) {
+                    if constexpr (Is_dropout) {
+                        #pragma unroll
+                        for (int i = 0; i < size(output); ++i) { output(i) *= params.dropout.rp_dropout; }
+                    }
+                    epilogue.store(params.epilogue, output, softmax.row_sum, shared_storage,
+                                   tiled_mma, thread_idx, block_coord);
+                } else {
+                    epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage,
+                                   tiled_mma, thread_idx, block_coord);
+                }
             } else {
                 epilogue.store_zero(params.epilogue, thread_idx, block_coord);
             }
@@ -319,13 +347,14 @@ public:
     }
 
     // ─── SLICE-AWARE MAINLOOP ────────────────────────────────────────────────
-    template <typename Softmax, typename FrgTensorO>
+    template <typename Softmax, typename FrgTensorO, typename OutputTensor>
     CUTLASS_DEVICE bool run_mainloop(
         Params const& params,
         SharedStorage& shared_storage,
         TiledMma& tiled_mma,
         Softmax& softmax,
         FrgTensorO& tOrO,
+        OutputTensor& output,
         int thread_idx,
         int m_block, int bidh, int bidb,
         SeqlenInfo_t const& seqlen_info)
@@ -584,7 +613,22 @@ public:
 
         bool any_tile_processed = false;
         bool is_first_iter = true;
-        clear(tOrO);
+        if constexpr (!O_in_smem) { clear(tOrO); }
+        Tensor tOrO_segment = output;
+        int pv_segment_tiles = 0;
+        bool pv_has_checkpoint = false;
+        if constexpr (O_in_smem) { clear(tOrO_segment); }
+        auto flush_pv_segment = [&]() {
+            if constexpr (O_in_smem) {
+                #pragma unroll
+                for (int i = 0; i < size(tOrO); ++i) {
+                    tOrO(i) = pv_has_checkpoint ? tOrO(i) + tOrO_segment(i) : tOrO_segment(i);
+                }
+                clear(tOrO_segment);
+                pv_segment_tiles = 0;
+                pv_has_checkpoint = true;
+            }
+        };
 
         // Perf-debug counters (FLASH_ATTENTION_ARB_DBG=1): accumulated per
         // CTA, flushed with one atomicAdd at the end of the mainloop.
@@ -813,7 +857,14 @@ public:
             // Deferred rescale (FA4SkipRescaleO): placed right after the
             // softmax (native position) so the PV mma interleaves with the
             // exp2/add/fma below.
-            if (softmax.need_rescale) { softmax.rescale_o(tOrO, scores_scale); }
+            if (softmax.need_rescale) {
+                if constexpr (O_in_smem) {
+                    if (pv_has_checkpoint) { softmax.rescale_o(tOrO, scores_scale); }
+                    softmax.rescale_o(tOrO_segment, scores_scale);
+                } else {
+                    softmax.rescale_o(tOrO, scores_scale);
+                }
+            }
 
             // ── gemm PV: tOrO += P @ V (A in regs, B from smem) ──
             // Convert QK accumulator to Element type for P operand.
@@ -850,13 +901,16 @@ public:
                 __syncthreads();
             }
 #ifdef USE_PPU
-            if constexpr (kHeadDim == 256 && std::is_same_v<Element, float>) {
+            if constexpr (O_in_smem) {
+                flash::gemm_rs_sm80(tOrO_segment, tOrP, tOrV, tOsVt(_, _, _, 0),
+                    tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+                if (++pv_segment_tiles == 12) { flush_pv_segment(); }
+            } else if constexpr (kHeadDim == 256 && std::is_same_v<Element, float>) {
                 constexpr int kPVGroupN = 2;
                 static_assert(decltype(size<2>(tOrO))::value % kPVGroupN == 0);
                 static_assert(decltype(size<1>(tOrV))::value == decltype(size<2>(tOrO))::value);
                 Tensor tOsVt_cur = tOsVt(_, _, _, 0);
-                #pragma unroll
-                for (int group = 0; group < size<2>(tOrO) / kPVGroupN; ++group) {
+                cute::for_each(cute::make_seq<decltype(size<2>(tOrO))::value / kPVGroupN>{}, [&](auto group) {
                     Tensor tOrO_group = local_tile(tOrO,
                         make_shape(shape<0>(tOrO), shape<1>(tOrO), Int<kPVGroupN>{}),
                         make_coord(0, 0, group));
@@ -875,7 +929,7 @@ public:
                     for (int i = 0; i < size(tOrO_group); ++i) {
                         tOrO_group(i) += tOrO_tile(i);
                     }
-                }
+                });
             } else
 #endif
             {
@@ -1000,9 +1054,22 @@ public:
         }  // end vbatch loop (RangeMerge)
         }  // end generic slice dispatch
 
+        if constexpr (O_in_smem) {
+            if (pv_has_checkpoint) {
+                #pragma unroll
+                for (int i = 0; i < size(tOrO_segment); ++i) {
+                    tOrO_segment(i) += tOrO(i);
+                }
+            }
+        }
         // Finalize softmax (warp-reduce sum + compute LSE into row_sum).
         auto scores_scale = softmax.finalize();
-        softmax.rescale_o(tOrO, scores_scale);
+        if constexpr (O_in_smem) {
+            softmax.rescale_o(tOrO_segment, scores_scale);
+            cute::copy(tOrO_segment, output);
+        } else {
+            softmax.rescale_o(tOrO, scores_scale);
+        }
 
         if (dbg && thread_idx == 0) {
             atomicAdd(dbg + 0, (unsigned long long)dbg_steps);

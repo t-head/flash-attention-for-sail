@@ -698,8 +698,15 @@ public:
             // conversion below (the PPU mma then interleaves with the
             // exp2/add/fma).  On the first iteration need_rescale=false, so
             // Is_first_iter is handled without any runtime branch here.
-            auto scores_scale = softmax.template max_get_scale<Is_first_iter_t, Check_inf>(tSrS);
-            softmax.need_rescale = !Is_first_iter_t;
+            auto scores_scale = [&]() {
+                if constexpr (kHeadDim == 128) {
+                    return softmax.template max_get_scale_skip<Is_first_iter_t, Check_inf, true>(tSrS);
+                } else {
+                    auto scale = softmax.template max_get_scale<Is_first_iter_t, Check_inf>(tSrS);
+                    softmax.need_rescale = !Is_first_iter_t;
+                    return scale;
+                }
+            }();
             softmax.template online_softmax<Is_first_iter_t, Check_inf>(tSrS);
             if constexpr (Is_first_iter_t) { is_first_iter = false; }
 

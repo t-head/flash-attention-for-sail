@@ -190,7 +190,7 @@ struct Softmax {
 
     CUTLASS_DEVICE Softmax(float const softmax_scale_log2_) : softmax_scale_log2(softmax_scale_log2_) {};
 
-    template<bool Is_first, bool Check_inf=false, typename Tensor0>
+    template<bool Is_first, bool Check_inf=false, bool Exact=false, typename Tensor0>
     __forceinline__ __device__ TensorT max_get_scale_skip(Tensor0 &acc_s) {
         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
@@ -211,7 +211,7 @@ struct Softmax {
                     ? row_max(mi)
                     : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
                 scores_scale(mi) = (scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2;
-                need_rescale |= (scores_scale(mi) < -8.0);
+                need_rescale |= Exact ? (scores_scale(mi) != 0.0f) : (scores_scale(mi) < -8.0);
             }
             if (need_rescale) {
                #pragma unroll

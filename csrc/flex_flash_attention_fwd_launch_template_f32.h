@@ -64,11 +64,15 @@ void run_flex_flash_attention_fwd(FlexFlashAttentionFwdParams &params, hggcStrea
         false /*Has_softcap*/, false /*AppendKV*/, PackGQA,
         kBlockM128, false /*kBlockM16*/, false /*kBlockN16*/,
         false /*PagedKVAiu*/);
-    static constexpr int kBlockM  = std::get<0>(kBlockMN_kNWarps_Stages_RS);
+    static constexpr bool SchedulerM32 = Arch == 89 && std::is_same_v<Element, float>
+        && kHeadDim == 256 && kHeadDimV == 256 && PersistentScheduler
+        && !kBlockM128 && !kBlockN64 && !PackGQA && !V_colmajor
+        && !Is_dropout && !Has_softcap;
+    static constexpr int kBlockM  = SchedulerM32 ? 32 : std::get<0>(kBlockMN_kNWarps_Stages_RS);
     static constexpr int kBlockN  = kBlockN64 ? 64 : std::get<1>(kBlockMN_kNWarps_Stages_RS);
-    static constexpr int kNWarps  = std::get<2>(kBlockMN_kNWarps_Stages_RS);
+    static constexpr int kNWarps  = SchedulerM32 ? 2 : std::get<2>(kBlockMN_kNWarps_Stages_RS);
     static constexpr int kStages  = std::get<3>(kBlockMN_kNWarps_Stages_RS);
-    static constexpr bool Q_in_regs = std::get<4>(kBlockMN_kNWarps_Stages_RS);
+    static constexpr bool Q_in_regs = SchedulerM32 ? false : std::get<4>(kBlockMN_kNWarps_Stages_RS);
 
     static constexpr bool PagedKVAiu = false;
     static constexpr int kBlockNPagedPerAiuLoad = kBlockN;  // unused (PagedKV=false)
@@ -247,7 +251,7 @@ void run_flex_flash_attention_fwd(FlexFlashAttentionFwdParams &params, hggcStrea
         hggcMemcpy(c, dbg_counters, sizeof(c), hggcMemcpyDeviceToHost);
         fprintf(stderr, "[ARB_DBG] kbm=%d kbn=%d steps=%llu masked=%llu cycles=%llu "
                 "cycles/step=%.0f\n",
-                kBlockM128 ? 128 : 64, kBlockN,
+                kBlockM, kBlockN,
                 c[0], c[1], c[4],
                 c[0] ? double(c[4]) / double(c[0]) : 0.0);
     }

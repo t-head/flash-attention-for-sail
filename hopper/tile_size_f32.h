@@ -168,7 +168,7 @@ constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_ppu_f32(
             // pressure with 4-byte buffers) and kBlockM=64 (static_assert
             // reject at 8 warps / 2.2x worse at 4 warps) are both dead ends.
             // Keep 8 warps for the faster d256 transpose.
-            return {128, 32, 8, 1, true};
+            return {64, 32, 4, 1, false};
         }
     }
 }
