@@ -242,6 +242,10 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
 template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA, bool Is_QSA=false>
 void run_mha_fwd_(Flash_fwd_params &params, hggcStream_t stream);
+// Direct SIMT path for tiny causal tiles (defined in flash_tiny_simt.h). Returns
+// false when the tile is not tiny enough, in which case the caller dispatches
+// the tiled tensor-core kernel.
+bool run_mha_fwd_tiny_simt(Flash_fwd_params &params, hggcStream_t stream, int max_seqlen_k);
 void prepare_varlen_num_blocks(Flash_fwd_params &params, hggcStream_t stream, bool packgqa, int blockM, int blockN, bool enable_pdl);
 template <int Arch, typename T, int kHeadDim, bool Has_softcap>
 void run_mha_bwd_(Flash_bwd_params &params, hggcStream_t stream);

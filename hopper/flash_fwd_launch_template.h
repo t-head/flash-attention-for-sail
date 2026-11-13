@@ -34,6 +34,35 @@
 
 using namespace cute;
 
+#ifdef USE_PPU
+// Launch-time driver queries are host-side work that is repeated on every
+// forward call. For short sequences that host time is comparable to the kernel
+// itself, so cache the two queries whose answers depend only on the compiled
+// kernel and the launch configuration (never on tensor addresses or values).
+// A changed device / kernel / block / smem combination re-queries the driver.
+struct FwdLaunchCacheEntry {
+    int device = -1;
+    const void* function = nullptr;
+    int block = 0;
+    size_t smem = 0;
+    int blocks_per_sm = 0;
+    bool smem_attr_set = false;
+};
+
+static FwdLaunchCacheEntry* fwd_launch_cache(int device, const void* function, int block, size_t smem) {
+    static thread_local FwdLaunchCacheEntry entries[8];
+    static thread_local unsigned replacement = 0;
+    for (auto& e : entries) {
+        if (e.device == device && e.function == function && e.block == block && e.smem == smem) {
+            return &e;
+        }
+    }
+    FwdLaunchCacheEntry& e = entries[replacement++ % 8];
+    e = FwdLaunchCacheEntry{device, function, block, smem, 0, false};
+    return &e;
+}
+#endif
+
 template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
 #if defined(USE_PPU) && USE_AIU
           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool PagedKVAiu, int kBlockNPagedPerAiuLoad_, bool AppendKV, bool HasQv,   // PagedKVNonTMA means PagedKV for PPU
@@ -314,20 +343,48 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
 #endif
     } else {
         auto kernel = cutlass::device_kernel<AttnKernel>;
+        int const num_threads = block_dims.x * block_dims.y * block_dims.z;
+#ifdef USE_PPU
+        FwdLaunchCacheEntry* launch_cache = fwd_launch_cache(
+            device, reinterpret_cast<void const*>(kernel), num_threads, smem_size);
+#endif
         if (smem_size >= 48 * 1024) {
+#ifdef USE_PPU
+            if (!launch_cache->smem_attr_set) {
+                CHECK_CUDA(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+                launch_cache->smem_attr_set = true;
+            }
+#else
             CHECK_CUDA(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+#endif
         }
 #ifdef USE_PPU
-        int blocks_per_sm;
+        int blocks_per_sm = 0;
         if constexpr (QsaConfig::DirectIndex && (QsaConfig::KVStride == 512
                       || (Arch == 89 && QsaConfig::KVStride == 0))) {
             qsa::cached_occupancy(device, &blocks_per_sm, reinterpret_cast<const void*>(kernel),
-                                  block_dims.x * block_dims.y * block_dims.z, smem_size, 0);
+                                  num_threads, smem_size, 0);
+            launch_cache->blocks_per_sm = 0;
+        } else if (launch_cache->blocks_per_sm > 0) {
+            blocks_per_sm = launch_cache->blocks_per_sm;
         } else {
             hggcError_t status_ = hggcOccupancyMaxActiveBlocksPerMultiprocessor(
-                &blocks_per_sm, kernel, block_dims.x * block_dims.y * block_dims.z, smem_size);
+                &blocks_per_sm, kernel, num_threads, smem_size);
+            if (status_ == hggcSuccess && blocks_per_sm > 0) {
+                launch_cache->blocks_per_sm = blocks_per_sm;
+            } else {
+                blocks_per_sm = 1;
+            }
         }
         grid_dims = AttnKernel::get_grid_shape(kernel_params, blocks_per_sm);
+        // Short sequences own fewer work tiles than the persistent grid has CTAs.  The
+        // surplus CTAs only launch, fail is_valid and exit, but each still costs a CTA
+        // slot at launch.  Never start more CTAs than there are tiles to hand out.
+        int const num_work_tiles = scheduler_args.num_blocks * scheduler_args.num_head
+                                   * scheduler_args.num_batch * scheduler_args.num_splits;
+        if (num_work_tiles > 0 && int(grid_dims.x) > num_work_tiles) {
+            grid_dims = dim3(uint32_t(num_work_tiles), 1, 1);
+        }
 
         // hggcFuncAttributes attr;
         // hggcFuncGetAttributes(&attr, kernel);
