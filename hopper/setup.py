@@ -49,6 +49,8 @@ DISABLE_CLUSTER = os.getenv("FLASH_ATTENTION_DISABLE_CLUSTER", ("TRUE" if USE_PP
 # QSA (query-sparse attention) only adds head dim 256 paged-KV instantiations, so it is on by
 # default; set FLASH_ATTENTION_ENABLE_QSA=FALSE to leave them out.
 ENABLE_QSA = os.getenv("FLASH_ATTENTION_ENABLE_QSA", "TRUE") == "TRUE"
+# Opt in to the large-tile BF16 ready/free implementation.
+ENABLE_DECOUPLED = os.getenv("FLASH_ATTENTION_ENABLE_DECOUPLED", "FALSE") == "TRUE"
 DISABLE_HDIM64 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM64", "FALSE") == "TRUE"
 DISABLE_HDIM96 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM96", "FALSE") == "TRUE"
 DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE"
@@ -135,6 +137,7 @@ if not SKIP_CUDA_BUILD:
         + (["-DFLASHATTENTION_DISABLE_FP8"] if DISABLE_FP8 else [])
         + (["-DFLASHATTENTION_DISABLE_VARLEN"] if DISABLE_VARLEN else [])
         + (["-DFLASHATTENTION_ENABLE_QSA"] if ENABLE_QSA else [])
+        + (["-DFLASHATTENTION_ENABLE_DECOUPLED=1"] if ENABLE_DECOUPLED and not DISABLE_SM89 else [])
         + (["-DFLASHATTENTION_QSA_FP8"] if ENABLE_QSA_FP8 else [])
         + (["-DFLASHATTENTION_DISABLE_CLUSTER"] if DISABLE_CLUSTER else [])
         + (["-DFLASHATTENTION_DISABLE_HDIM64"] if DISABLE_HDIM64 else [])
