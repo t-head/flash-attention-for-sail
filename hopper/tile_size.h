@@ -7,6 +7,14 @@
 
 #include <tuple>
 
+#ifdef FLASHATTENTION_PPU_DENSE_HD64
+namespace flash {
+inline constexpr std::tuple<int, int, int, int, bool> ppu_dense_hd64_fwd_tile{64, 96, 2, 1, false};
+inline constexpr int ppu_dense_hd64_bwd_m = 64;
+inline constexpr int ppu_dense_hd64_bwd_n = 128;
+}
+#endif
+
 // Return {kBlockM, kBlockN, MmaPV_is_RS, IntraWGOverlap}
 constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
         int headdim, int headdim_v, bool is_causal, bool is_local, int element_size=2,

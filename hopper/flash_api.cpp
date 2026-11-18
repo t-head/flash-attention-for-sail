@@ -14,6 +14,9 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cutlass/numeric_types.h>
 #include "flash.h"
+#ifdef FLASHATTENTION_PPU_DENSE_HD64
+#include <ATen/Context.h>
+#endif
 #ifdef USE_PPU
 #include "qsa/dispatch.h"
 #endif
@@ -1857,6 +1860,24 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     ppu::fmha::ProfilingInterface::Instance().instrument(true, fmha_prof_params);
 #endif // FA3_HLLM_BUILD
 #endif
+#ifdef FLASHATTENTION_PPU_DENSE_HD64
+    auto const* fwd_device = at::cuda::getCurrentDeviceProperties();
+    // The 810E policy measures work in K/V tiles. On 890 keep the original
+    // large-query tile heuristic before selecting the tuned forward tile.
+    int const hd64_grid_tile = params.arch == 80 ? flash::ppu_dense_hd64_bwd_n
+        : std::get<0>(flash::ppu_dense_hd64_fwd_tile);
+    params.use_ppu_dense_hd64 = params.num_splits == 1 && !params.use_kblockm_16
+        && !params.page_table && !params.knew_ptr && !params.qv_ptr && !params.s_aux_ptr
+        && !params.leftpad_k && !params.rotary_dim && !params.is_qsa
+        && !params.pack_gqa && params.v_dim_stride == 1
+        && !params.cu_seqlens_q && !params.cu_seqlens_k && !params.seqused_q && !params.seqused_k
+        && !params.is_causal && !params.is_local && params.attention_chunk == 0 && params.softcap == 0.f
+        && (params.arch != 89 || params.use_kblockm_128)
+        && (params.arch != 80 || !at::globalContext().deterministicAlgorithms())
+        && flash::should_use_ppu_dense_hd64(params.arch, fwd_device->name, params.is_bf16,
+            params.d, params.dv, params.seqlen_q, params.seqlen_k, params.h, params.h_k, params.b,
+            fwd_device->multiProcessorCount - sm_margin, hd64_grid_tile);
+#endif
     if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA) && defined(FLASHATTENTION_DISABLE_SM90) && !defined(FLASHATTENTION_DISABLE_SPLIT) && !defined(FA3_HLLM_BUILD)
@@ -1995,10 +2016,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
         TORCH_CHECK(false, "This flash attention build does not support backward.");
     #endif
 
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    bool is_sm8x = dprops->major >= 8;
-    TORCH_CHECK(is_sm8x, "FlashAttention only supports Ampere GPUs or newer.");
-
     auto q_type = q.dtype();
     TORCH_CHECK(q_type == torch::kFloat16 || q_type == torch::kBFloat16,
                 "FlashAttention only support fp16 and bf16 data type");
@@ -2009,6 +2026,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
     CHECK_DEVICE(out); CHECK_DEVICE(dout); CHECK_DEVICE(softmax_lse);
+
+    auto dprops = at::cuda::getDeviceProperties(q.get_device());
+    bool is_sm8x = dprops->major >= 8;
+    TORCH_CHECK(is_sm8x, "FlashAttention only supports Ampere GPUs or newer.");
+
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
@@ -2066,12 +2088,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     // If we don't have is_causal here matching params.is_causal, we might get the wrong kBlockM (and cause IMA).
     is_causal = window_size_left < 0 && window_size_right == 0;
 
-    int const arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
+    int const arch = dprops->major * 10 + dprops->minor;
     int const head_size_rounded = round_up_headdim(std::max(head_size, head_size_v));
     int const head_size_v_rounded = head_size_rounded;
 #ifdef USE_PPU
     // Very important that these match the kernel configs.  run_mha_bwd_hdim* in
-    // flash_bwd_launch_template.h dispatches exactly one tile per (headdim, Arch) branch,
+    // flash_bwd_launch_template.h selects the configured tile for each (headdim, Arch) branch,
     // and the rounded seqlens below size dq_accum / dk_accum / dv_accum / softmax_d /
     // softmax_lse_log2.  If a value here is smaller than the tile the kernel actually uses,
     // the kernel writes past the end of one head's slice into the next one: dQ breaks when
@@ -2092,16 +2114,30 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     // at runtime to the Arch == 80 tile, so mirror that fallback here too.
     bool const is_arch80 = arch == 80;
     bool const use_cvt_tiles = !is_arch80 && head_size == head_size_rounded && head_size_v == head_size_rounded;
-    int const kBlockM = head_size_rounded <= 64 ? 128
+    int hd64_block_m = 128;
+    int hd64_block_n = 64;
+#ifdef FLASHATTENTION_PPU_DENSE_HD64
+    bool const tuned_hd64 = !deterministic && !at::globalContext().deterministicAlgorithms()
+        && !is_varlen && !seqused_q_.has_value() && !seqused_k_.has_value()
+        && window_size_left == -1 && window_size_right == -1 && !is_causal && !softcap
+        && flash::should_use_ppu_dense_hd64(arch, dprops->name, q_type == torch::kBFloat16,
+            head_size, head_size_v, seqlen_q, seqlen_k, num_heads, num_heads_k, batch_size,
+            dprops->multiProcessorCount - sm_margin, flash::ppu_dense_hd64_bwd_n);
+    if (tuned_hd64) {
+        hd64_block_m = flash::ppu_dense_hd64_bwd_m;
+        hd64_block_n = flash::ppu_dense_hd64_bwd_n;
+    }
+#endif
+    int const kBlockM = head_size_rounded <= 64 ? hd64_block_m
         : (head_size_rounded <= 96 ? 64
            : (head_size_rounded <= 128 ? (use_cvt_tiles ? 48 : 64)
               : (head_size_rounded <= 192 ? (is_arch80 ? 64 : 128) : 64)));
-    int const kBlockN = head_size_rounded <= 64 ? 64
+    int const kBlockN = head_size_rounded <= 64 ? hd64_block_n
         : (head_size_rounded <= 96 ? 128
            : (head_size_rounded <= 128 ? (use_cvt_tiles ? 128 : 96)
               : (head_size_rounded <= 192 ? (is_arch80 ? 64 : 128)
                  : (use_cvt_tiles ? 128 : 64))));
-    // One dispatch per (headdim, arch), so the semaphore block counts use the same tiles.
+    // The semaphore block counts follow the selected backward tile.
     int const kBlockM_min = kBlockM;
     int const kBlockN_min = kBlockN;
 #else
@@ -2127,7 +2163,15 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     int const kBlockN = arch >= 90 ? kBlockN_sm90 : (arch == 86 || arch == 89 ? kBlockN_sm86 : kBlockN_sm80);
 #endif
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
-    int const seqlen_q_rounded = round_multiple(seqlen_q, kBlockM);
+    int q_workspace_alignment = kBlockM;
+#ifdef FLASHATTENTION_PPU_DENSE_HD64
+    // Keep dense HD64 backward scratch shapes consistent with the Torch fake op.
+    if (tuned_hd64) {
+        static_assert(128 % flash::ppu_dense_hd64_bwd_m == 0);
+        q_workspace_alignment = 128;
+    }
+#endif
+    int const seqlen_q_rounded = round_multiple(seqlen_q, q_workspace_alignment);
     int const seqlen_k_rounded = round_multiple(seqlen_k, kBlockN);
     int const total_q_padded_rounded = round_multiple(total_q + batch_size * kBlockM, kBlockM);
     int const total_k_padded_rounded = round_multiple(total_k + batch_size * kBlockN, kBlockN);
@@ -2320,6 +2364,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     params.total_q = total_q;
     params.total_k = total_k;
     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
+#ifdef FLASHATTENTION_PPU_DENSE_HD64
+    params.use_ppu_dense_hd64 = tuned_hd64;
+#endif
     params.dv = head_size_v;
     params.dv_rounded = head_size_v_rounded;
 

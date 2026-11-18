@@ -483,7 +483,8 @@ CUTLASS_DEVICE void gemm_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor
                 }
             }
             if constexpr (!std::is_same_v<Hook, std::nullptr_t>) {
-                if (i == 0) { fn(); }
+                if constexpr (std::is_invocable_v<Hook, int, int>) { fn(i, int(size<2>(tCrA))); }
+                else if (i == 0) { fn(); }
             }
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
             if constexpr (PrefetchB == 2) { __ppu_sched_bound(); }
@@ -501,7 +502,8 @@ CUTLASS_DEVICE void gemm_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor
                 if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1)); }
             }
             if constexpr (!std::is_same_v<Hook, std::nullptr_t>) {
-                if (i == 0) { fn(); }
+                if constexpr (std::is_invocable_v<Hook, int, int>) { fn(i, int(size<2>(tCrA))); }
+                else if (i == 0) { fn(); }
             }
             cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
         }

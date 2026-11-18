@@ -37,7 +37,7 @@ template <int kNWarps, int Stages, bool Q_in_regs, class TileShape_MNK_, int kHe
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool AppendKV_,
 #endif
         bool PackGQA_, bool Split_, class ElementSAux_, bool Is_QSA_=false
-          , class QsaConfig = flash::QsaConfig
+          , class QsaConfig = flash::QsaConfig, bool TunedHD64 = false
           >
 struct CollectiveMainloopFwdSm80 {
 
@@ -128,7 +128,7 @@ struct CollectiveMainloopFwdSm80 {
 #ifdef USE_PPU
     // Keep SM80 QSA on the standard online-softmax rescale path.
     static constexpr bool FA4SkipRescaleO = !Is_FP8 && !(Is_QSA && ArchTag::kMinComputeCapability == 80) && (
-        (kBlockM >  16 && (ArchTag::kMinComputeCapability >= 89 || (kHeadDim != 64 && kHeadDim != 192))) ||   // prefill
+        (kBlockM >  16 && (TunedHD64 || ArchTag::kMinComputeCapability >= 89 || (kHeadDim != 64 && kHeadDim != 192))) ||   // prefill
         (kBlockM == 16 && (ArchTag::kMinComputeCapability >= 89 && kHeadDim == 256))  // decode
     );
 #endif
