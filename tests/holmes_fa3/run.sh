@@ -39,6 +39,7 @@ python setup.py bdist_wheel --dist-dir "$OUT/dist" --bdist-dir "$OUT/bdist" 2>&1
 cd "$ROOT"
 python - <<'PY'
 import hashlib,os,pathlib,zipfile
+from email.parser import BytesParser
 out=pathlib.Path(os.environ['OUT'])
 wheels=list((out/'dist').glob('*.whl'))
 if len(wheels)!=1: raise RuntimeError(wheels)
@@ -47,6 +48,14 @@ with zipfile.ZipFile(wheels[0]) as z:
     if any('flash_attn_interface' in n or 'bridge' in n for n in names): raise RuntimeError(names)
     sos=[n for n in names if n.endswith('.so')]
     if len(sos)!=1 or not sos[0].startswith('flash_attn_3_holmes/_C'): raise RuntimeError(sos)
+    metadata_path, = (name for name in names if name.endswith('.dist-info/METADATA'))
+    metadata = BytesParser().parsebytes(z.read(metadata_path), headersonly=True)
+    if metadata.get('License') != 'BSD-3-Clause':
+        raise RuntimeError('Holmes FA3 wheel must declare the BSD-3-Clause license')
+    license_dir = pathlib.PurePosixPath(metadata_path).parent / 'licenses'
+    for filename in ('LICENSE', 'AUTHORS'):
+        if z.read(str(license_dir / filename)) != pathlib.Path(filename).read_bytes():
+            raise RuntimeError(f'Incorrect {filename} in Holmes FA3 wheel')
     z.extractall(out/'wheel')
 lib=out/'wheel'/sos[0]
 (out/'library.path').write_text(str(lib))
