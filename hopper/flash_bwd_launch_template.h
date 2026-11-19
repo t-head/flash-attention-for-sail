@@ -15,6 +15,7 @@
 
 #include "static_switch.h"
 #include "flash.h"
+#include "tile_size.h"
 #include "flash_bwd_preprocess_kernel.h"
 #include "flash_bwd_postprocess_kernel.h"
 #include "tile_scheduler.hpp"
@@ -35,7 +36,7 @@ template <int Arch, int kHeadDim, int kBlockM, int kBlockN, typename Element,
           int Stages_dO=2, int Stages_dS_or_QSm80=2,
           bool SdP_swapAB=true, bool dKV_swapAB=false, bool dQ_swapAB=false,
           int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1,
-          bool V_in_regs=false>
+          bool V_in_regs=false, bool TunedHD64=false>
 void run_flash_bwd(Flash_bwd_params &params, hggcStream_t stream) {
     static_assert(!(Is_causal && Is_local), "Is_causal and Is_local cannot be true at the same time.");
     using ElementAccum = float;
@@ -98,13 +99,13 @@ void run_flash_bwd(Flash_bwd_params &params, hggcStream_t stream) {
             SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs>,
         flash::CollectiveMainloopBwdSm80<Stages, Stages_dO, TileShape_MNK, Element, ElementAccum, ArchTag,
             Is_causal, Is_local, Has_softcap, Varlen, Deterministic,
-            SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs>
+            SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs, TunedHD64>
     >;
 #else
     using CollectiveMainloop =
         flash::CollectiveMainloopBwdSm80<Stages, Stages_dO, TileShape_MNK, Element, ElementAccum, ArchTag,
             Is_causal, Is_local, Has_softcap, Varlen, Deterministic,
-            SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs>;
+            SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs, TunedHD64>;
 #endif
     using CollectiveEpilogue = std::conditional_t<
         !GQA,
@@ -353,6 +354,17 @@ void run_mha_bwd_dispatch(Flash_bwd_params &params, hggcStream_t stream) {
 
 template<int Arch, typename T, bool Has_softcap>
 void run_mha_bwd_hdim64(Flash_bwd_params &params, hggcStream_t stream) {
+#ifdef FLASHATTENTION_PPU_DENSE_HD64
+    if constexpr ((Arch == 80 || Arch == 89) && cute::is_same_v<T, cutlass::bfloat16_t> && !Has_softcap) {
+        if (params.use_ppu_dense_hd64) {
+            constexpr int Stages_dO = Arch == 89 ? 2 : 1;
+            run_flash_bwd<Arch, 64, flash::ppu_dense_hd64_bwd_m, flash::ppu_dense_hd64_bwd_n, T,
+                          false, false, false, false, false, false, Stages_dO, 2, false, false, false,
+                          2, 2, 4, 4, false, /*TunedHD64=*/true>(params, stream);
+            return;
+        }
+    }
+#endif
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
 #ifdef USE_PPU
         if constexpr (Arch == 80) {

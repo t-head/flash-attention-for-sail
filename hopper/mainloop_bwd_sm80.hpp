@@ -175,7 +175,7 @@ template <int Stages, int Stages_dO, class TileShape_MNK_, class Element_, class
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool Deterministic,
         bool SdP_swapAB_, bool dKV_swapAB_, bool dQ_swapAB_,
         int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=8, int AtomLayoutMdQ=1,
-        bool V_in_regs=false>
+        bool V_in_regs=false, bool TunedHD64=false>
 struct CollectiveMainloopBwdSm80 {
 
     static constexpr int kStages = Stages;
@@ -1551,6 +1551,29 @@ struct CollectiveMainloopBwdSm80 {
         clear(tdKrdK);
         clear(tdVrdV);
 
+        // Each CTA keeps one K/V tile across all query tiles of dense HD64 training.
+        static_assert(!TunedHD64 || ((ArchTag::kMinComputeCapability == 80 ||
+            ArchTag::kMinComputeCapability == 89) && kHeadDim == 64 && kBlockM == 64 && kBlockN == 128 && !SdP_swapAB && !V_in_regs && kStages > 1 &&
+            !Varlen && !Is_causal && !Is_local && !Has_softcap && !Deterministic &&
+            !Mma_dKV_is_RS && !Stagger_dQ_dV && std::is_same_v<Element, cutlass::bfloat16_t>));
+        auto retained_k = [&] {
+            if constexpr (TunedHD64) {
+                return mma_partition_fragment_AB<SdP_swapAB>(thr_mma_SdP, sK);
+            } else {
+                return nullptr;
+            }
+        }();
+        if constexpr (TunedHD64) {
+            flash::cp_async_wait<0>();
+            __syncthreads();
+            auto k_view = smem_thr_copy_KV.retile_D(retained_k);
+            auto v_view = smem_thr_copy_KV.retile_D(tdPrV);
+            #pragma unroll
+            for (int i = 0; i < size<2>(retained_k); ++i) {
+                cute::copy(smem_tiled_copy_KV, tSsK(_, _, i), k_view(_, _, i));
+                cute::copy(smem_tiled_copy_KV, tdPsV(_, _, i), v_view(_, _, i));
+            }
+        }
         auto bwd_step = [&](int m_block, auto mask_fn) {
             Tensor tSrS = partition_fragment_C(tiled_mma_SdP, select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
             clear(tSrS);
@@ -1560,10 +1583,16 @@ struct CollectiveMainloopBwdSm80 {
             flash::cp_async_wait<(kStages > 1) ? 1 : 0>();
             __syncthreads();
             Tensor tSrQ = mma_partition_fragment_AB</*A=*/!SdP_swapAB>(thr_mma_SdP, sQ(_, _, _0{}));
-            Tensor tSrK = mma_partition_fragment_AB</*A=*/SdP_swapAB>(thr_mma_SdP, sK);
+            decltype(auto) tSrK = [&]() -> decltype(auto) {
+                if constexpr (TunedHD64) {
+                    return (retained_k);
+                } else {
+                    return mma_partition_fragment_AB<SdP_swapAB>(thr_mma_SdP, sK);
+                }
+            }();
             // if (cute::thread0()) { print(tiled_mma_SdP); print(tSrS); printf("\n"); print(tSrQ); printf("\n"); print(tSrK); printf("\n"); print(tSsQ); printf("\n"); print(tSsK); printf("\n"); }
             /** recompute s=Q*K^T */
-            flash::gemm_sm80<false /*A_in_regs*/, false /*B_in_regs*/, SdP_swapAB>(
+            flash::gemm_sm80<false /*A_in_regs*/, TunedHD64 /*B_in_regs*/, SdP_swapAB>(
                 tSrS, tSrQ, tSrK, tSsQ(_, _, _, kStages > 1 ? smem_pipe_read : 0), tSsK,
                 tiled_mma_SdP, smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV, cute::conditional_return<Load_dO_in_S>(load_dO_cur, nullptr) /*hook*/);
             Tensor tLSErLSE = cute::conditional_return<!ShuffleLSE>(make_fragment_like(tSsLSE(_, _0{})), make_tensor<ElementAccum>(Int<kStatsPerThread>{}));
@@ -1606,8 +1635,8 @@ struct CollectiveMainloopBwdSm80 {
             __syncthreads();
             auto hook = cute::conditional_return<(kStages > 1)>(load_Q_next, nullptr);
             Tensor tdPrdO = mma_partition_fragment_AB</*A=*/!SdP_swapAB>(thr_mma_SdP, sdO(_, _, _0{}));
-            Tensor tdPrV_cur = cute::conditional_return<V_in_regs>(tdPrV, mma_partition_fragment_AB</*A=*/SdP_swapAB>(thr_mma_SdP, sV));
-            flash::gemm_sm80<false /*A_in_regs*/, V_in_regs, SdP_swapAB>(
+            Tensor tdPrV_cur = cute::conditional_return<V_in_regs || TunedHD64>(tdPrV, mma_partition_fragment_AB</*A=*/SdP_swapAB>(thr_mma_SdP, sV));
+            flash::gemm_sm80<false /*A_in_regs*/, V_in_regs || TunedHD64, SdP_swapAB>(
                 tdPrdP, tdPrdO, tdPrV_cur, tdPsdO(_, _, _, kStages_dO > 1 ? smem_pipe_read_do_cur : 0), tdPsV,
                 tiled_mma_SdP, smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV, hook);
             Tensor tLSErdPsum = cute::conditional_return<!ShuffledPsum>(make_fragment_like(tSsdPsum(_, _0{})), make_tensor<ElementAccum>(Int<kStatsPerThread>{}));
@@ -1687,6 +1716,7 @@ struct CollectiveMainloopBwdSm80 {
                 // if (cute::thread0()) { print_tensor(tdVrdV); }
             };
             /** dQ = dS*K */
+            Tensor tdQrdQ = partition_fragment_C(tiled_mma_dQ, select<!dQ_swapAB ? 0 : 2, !dQ_swapAB ? 2 : 0>(TileShape_MNK{}));
             auto do_mma_dQ = [&] (auto hook) {
                 if constexpr (Deterministic) {
                     // DqBarrier uses SyncwarpSync: only the lane-0 of each warp spins and the
@@ -1696,7 +1726,6 @@ struct CollectiveMainloopBwdSm80 {
                     DqBarrier::wait_eq(dq_lock_ptr, thread_idx % cutlass::NumThreadsPerWarp,
                                        m_block * dq_num_batch * dq_num_head, n_block);
                 }
-                Tensor tdQrdQ = partition_fragment_C(tiled_mma_dQ, select<!dQ_swapAB ? 0 : 2, !dQ_swapAB ? 2 : 0>(TileShape_MNK{}));
                 clear(tdQrdQ);
                 Tensor tdQrdS = mma_partition_fragment_AB</*A=*/!dQ_swapAB>(thr_mma_dQ, sdS);
                 Tensor tdQrK = mma_partition_fragment_AB</*A=*/dQ_swapAB>(thr_mma_dQ, sKt);
@@ -1746,7 +1775,7 @@ struct CollectiveMainloopBwdSm80 {
                             }
                         }
                     }
-                } else {
+                } else if constexpr (!TunedHD64) {
                     Tensor tdQgdQaccum_atomic = tdQgdQaccum(_, _, m_block);
                     #pragma unroll
                     for (int i = 0; i < size(tdQrdQ_atomic); ++i) {
@@ -1805,7 +1834,20 @@ struct CollectiveMainloopBwdSm80 {
                 __syncthreads();  // make sure sdS is written
                 // If kStages == 1, we want to do Mma_dK first so we can start loading Q for the next iteration
                 if constexpr (kStages > 1) { do_mma_dQ(load_dO_next); }
-                do_mma_dK(cute::conditional_return<(kStages > 1)>(nullptr, load_dO_next));
+                if constexpr (TunedHD64) {
+                    // Divide this CTA's dQ contribution across the dK MMA K-steps.
+                    auto scatter_dq = [&](int step, int steps) {
+                        auto src = r2s_thr_copy_dQaccum.retile_S(tdQrdQ);
+                        auto dst = tdQgdQaccum(_, _, m_block);
+                        #pragma unroll
+                        for (int i = step * size(src) / steps; i < (step + 1) * size(src) / steps; ++i) {
+                            atomicAdd(&dst(i), src(i));
+                        }
+                    };
+                    do_mma_dK(scatter_dq);
+                } else {
+                    do_mma_dK(cute::conditional_return<(kStages > 1)>(nullptr, load_dO_next));
+                }
                 if constexpr (kStages == 1) {
                     __syncthreads();
                     do_mma_dQ(load_Q_next);
