@@ -645,6 +645,7 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
          (!params.is_varlen_q && params.b * params.h_k * ((params.seqlen_q * params.h / params.h_k + 127) / 128) / params.num_sm >= 8 && ((params.d_rounded <= 128 && params.seqlen_q > (params.is_causal ? 704 : 64)) || (params.arch == 89 && params.d_rounded == 192 && params.h == params.h_k && params.seqlen_q == params.seqlen_k && params.is_causal && params.seqlen_q > 704)))) /*kBlockM128*/,
         params.use_kblockm_16, params.use_kblockn_16, false /*PagedKVAiu*/, params.is_qsa);
     int const kBlockM_w_PackGQA = std::get<0>(kBlockMN_kernel_args_sm8x_w_PackGQA);
+    if (!params.is_qsa) { return false; }  // Preserve candidate dispatch outside QSA.
     return should_pack_gqa((params.cu_seqlens_q || params.seqused_q) && (params.b > 2 || params.total_q / params.b < 0.95 * params.seqlen_q), params.seqlen_q, params.h, params.h_k, kBlockM_wo_PackGQA, kBlockM_w_PackGQA, params.num_sm * 4);   // 4 is the common occupancy in prefill instance
 #else
     // This needs to match the kernel configs
@@ -742,15 +743,79 @@ inline int get_qsa_num_splits(Flash_fwd_params const& params, int num_n_blocks, 
 }
 #endif
 
-inline int get_num_splits(Flash_fwd_params const& params) {
+inline int get_num_splits(Flash_fwd_params const& params, int64_t max_seqlen_k_hint = 0) {
     #ifdef FLASHATTENTION_DISABLE_SPLIT
     return 1;
     #else
 #ifdef USE_PPU
     if (!params.is_qsa && !params.use_kblockm_16) {
-        int const block_m = std::max(params.seqlen_q * params.h / params.h_k, 64) / 64;
-        float const waves = 1.0 * params.b * params.h_k * block_m / params.num_sm;
-        if (params.seqlen_q > 16 || (waves > 1 && params.seqlen_k < 3660 * waves)) { return 1; }
+        // PPU prefill scheduling. The persistent scheduler hands each CTA one (m block, split)
+        // work unit at a time, so a launch is latency bound when the m blocks alone cannot fill
+        // the CTA slots and each of them has to walk a long causal n chain. Cutting that chain
+        // into num_splits pieces then roughly halves the critical path. With a short KV, or once
+        // the KV stream already runs at the memory roofline, the extra partial-output combine
+        // pass costs more than the shortened chain saves. Every term below is a function of the
+        // call's shapes, dtype and device, so the choice is stable for repeated calls.
+        //
+        // The page table spans the whole KV pool, so params.seqlen_k is only an upper bound on
+        // this call's length. Prefer the caller's max_seqlen_k, which is the length this call
+        // actually uses.
+        if (max_seqlen_k_hint <= 0) { return 1; }
+        int64_t const kv_len = max_seqlen_k_hint;
+        int64_t const q_len = params.seqlen_q;
+        auto const tile = tile_size_fwd_ppu(params.arch, params.d_rounded, params.dv_rounded, params.is_causal,
+                                            params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/,
+                                            params.page_table, true /*varlen*/, true /*split*/, params.softcap > 0.f,
+                                            params.knew_ptr, true /*pack_gqa*/, false /*kBlockM128*/,
+                                            params.use_kblockm_16, params.use_kblockn_16, false /*PagedKVAiu*/,
+                                            params.is_qsa);
+        int const kBlockN = std::get<1>(tile);
+        int64_t const num_n_blocks = (kv_len + kBlockN - 1) / kBlockN;
+        // Split only when Q is tiny against KV: every m block then covers almost the whole KV,
+        // so work scales with the (short) m axis and the chain with the (long) n axis. A chain
+        // shorter than kMinSplitChain cannot repay the extra combine launch, and non-causal
+        // calls have no causal chain to shorten.
+        constexpr int64_t kMinSplitChain = 64;
+        constexpr int64_t kMinKvPerQ = 8;
+        if (!params.is_causal || kv_len < kMinKvPerQ * q_len || num_n_blocks < kMinSplitChain) {
+            return 1;
+        }
+        int const occ = params.use_kblockn_16
+            ? (params.d_rounded <= 64 && params.dv_rounded > 256 ? 14 : 16)
+            : (params.d_rounded <= 64 ? (params.dv_rounded <= 64 ? 8 : (params.dv_rounded <= 256 ? 6 : 14))
+                                      : (params.d_rounded <= 96 ? 10 : (params.d_rounded <= 128 ? 8 : (params.d_rounded <= 192 ? 5 : 16))));
+        int const kBlockM = std::get<0>(tile);
+        int64_t const num_m_blocks = (int64_t(params.seqlen_q) * (params.h / params.h_k) + kBlockM - 1) / kBlockM;
+        int const slots = params.num_sm * occ;
+        int num_splits = 2;
+        while (num_splits < 4 && num_m_blocks * (num_splits + 1) <= 2 * int64_t(slots)) { ++num_splits; }
+        // The split path runs the register-resident dense tile: a 128-float output accumulator
+        // plus the Q fragment in registers already fills the 64K register file at 128 threads,
+        // so two CTAs per SM stay resident whatever the dense occupancy heuristic assumes. At
+        // that residency each (m block, split) unit walks nearly the same causal chain, so the
+        // launch is a set of near-equal units handed out one per resident CTA: the makespan is
+        // the wave count times the unit length and a partly filled last wave idles that
+        // fraction of the machine. On a very long chain (measured: past ~1500 n tiles of 48
+        // rows, about 72k keys) a unit stays long enough that splitting it further still
+        // repays its partial output, so raise the count to the smallest value that fills the
+        // last wave; the cap bounds the traffic the combine pass then reads back.
+        constexpr int64_t kLongChainBlocks = 1500;
+        constexpr int kMaxSplitsLongChain = 20;
+        if (num_n_blocks >= kLongChainBlocks) {
+            int const resident_slots = std::max(1, params.num_sm *
+                ((params.d_rounded > 192 && params.dv_rounded > 192) ? 2 : occ));
+            int64_t const units_old = num_m_blocks * num_splits;
+            int64_t const waves_old = (units_old + resident_slots - 1) / resident_slots;
+            double best_fill = double(units_old) / double(waves_old * int64_t(resident_slots));
+            for (int s = 2; s <= kMaxSplitsLongChain; ++s) {
+                int64_t const units = num_m_blocks * s;
+                int64_t const waves = (units + resident_slots - 1) / resident_slots;
+                double const fill = double(units) / double(waves * int64_t(resident_slots));
+                if (fill >= 0.995) { num_splits = s; break; }
+                if (fill > best_fill) { best_fill = fill; num_splits = s; }
+            }
+        }
+        return num_splits;
     }
 #endif
     // Always enable PackGQA for Split
@@ -989,6 +1054,52 @@ mha_fwd_get_scheduler_metadata(
     }
     return tile_count_semaphore;
 }
+
+#ifdef USE_PPU
+// One small device buffer per device, reused by every forward launch. The forward kernel puts
+// its work counter back to zero once a launch runs out of work (see
+// DynamicPersistentTileSchedulerSM80::get_next_work), so the buffer is already zero when the
+// next call starts and no per-call memset is needed. The cache is leaked on purpose so no CUDA
+// free happens during static destruction.
+at::Tensor& ppu_fwd_work_semaphore(at::TensorOptions const& opts, int dev) {
+    static auto* cache = new std::vector<at::Tensor>();
+    if (dev < 0) { dev = 0; }
+    if (cache->size() <= size_t(dev)) { cache->resize(size_t(dev) + 1); }
+    if (!(*cache)[dev].defined()) {
+        (*cache)[dev] = torch::zeros({32}, opts.dtype(torch::kInt32));
+    }
+    return (*cache)[dev];
+}
+
+// The forward kernel writes every element of softmax_lse on every launch, so for repeated calls of
+// one shape the buffer can be kept instead of reallocated: the allocation sits on the host critical
+// path, which is a measurable share of a short launch. The cache is keyed by device and logical
+// shape only -- never by a tensor address or by tensor contents -- and a shape change allocates a
+// fresh entry. Entries are leaked on purpose so no CUDA free happens during static destruction.
+at::Tensor ppu_fwd_lse_buffer(at::TensorOptions const& opts, int dev, at::IntArrayRef shape) {
+    struct Entry {
+        int dev = -1;
+        int ndim = 0;
+        int64_t dims[3] = {0, 0, 0};
+        at::Tensor tensor;
+    };
+    static thread_local auto* cache = new std::vector<Entry>();
+    for (auto const& entry : *cache) {
+        if (entry.dev != dev || entry.ndim != int(shape.size())) { continue; }
+        bool same_shape = true;
+        for (int i = 0; i < entry.ndim; ++i) { same_shape = same_shape && entry.dims[i] == shape[i]; }
+        if (same_shape) { return entry.tensor; }
+    }
+    if (cache->size() >= 32) { cache->erase(cache->begin()); }
+    cache->emplace_back();
+    Entry& entry = cache->back();
+    entry.dev = dev;
+    entry.ndim = int(shape.size());
+    for (int i = 0; i < entry.ndim && i < 3; ++i) { entry.dims[i] = shape[i]; }
+    entry.tensor = torch::empty(shape, opts.dtype(at::kFloat));
+    return entry.tensor;
+}
+#endif
 
 // b: batch_size
 // b_k: batch_size_k
@@ -1326,12 +1437,23 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 
     at::Tensor softmax_lse;
 #ifndef FA3_HLLM_BUILD
-    if (!is_varlen_q) {
-        softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
-    } else {
-        softmax_lse = qsa_v_parts == 1
-            ? torch::empty({num_heads, total_q}, opts.dtype(at::kFloat))
-            : torch::empty({qsa_v_parts*num_heads, total_q}, opts.dtype(at::kFloat)).narrow(0,0,num_heads);
+#ifdef USE_PPU
+    if (!is_qsa) {
+        if (!is_varlen_q) {
+            softmax_lse = ppu_fwd_lse_buffer(opts, int(q.get_device()), {batch_size, num_heads, seqlen_q});
+        } else {
+            softmax_lse = ppu_fwd_lse_buffer(opts, int(q.get_device()), {num_heads, total_q});
+        }
+    } else
+#endif
+    {
+        if (!is_varlen_q) {
+            softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+        } else {
+            softmax_lse = qsa_v_parts == 1
+                ? torch::empty({num_heads, total_q}, opts.dtype(at::kFloat))
+                : torch::empty({qsa_v_parts*num_heads, total_q}, opts.dtype(at::kFloat)).narrow(0,0,num_heads);
+        }
     }
 #else
     if (workspace_ptr) {
@@ -1492,7 +1614,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     params.num_splits_dynamic_ptr = !use_dynamic_split ? nullptr : reinterpret_cast<int*>(1);
 
     params.pagedkv_tma = get_pagedkv_tma(params);
-    params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
+    int64_t const max_seqlen_k_used = max_seqlen_k_.has_value() ? max_seqlen_k_.value() : 0;
+    params.num_splits = num_splits <= 0 ? get_num_splits(params, max_seqlen_k_used) : num_splits;
 
 #ifdef USE_PPU
     params.use_kblockn_16 = (params.num_splits > 1 && params.use_kblockn_16) || (kblockn == 16);   // kBlockN16 only applies to Split scenario
@@ -1607,10 +1730,32 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 #endif
     if ((scheduler_needs_semaphore || use_dynamic_split) && !qsa_without_scheduler_metadata) {
 #ifdef USE_PPU
-        int metadata_size = int(scheduler_needs_semaphore) * 32 + int(use_dynamic_split) * (params.b + 1);
+        // num_splits_dynamic is only dereferenced by the Split kernel and the combine kernel. When
+        // the split heuristic settles on a single split, no one reads it, so its allocation, its
+        // memset and the prepare kernel in front of the launch are pure fixed cost.
+        bool const need_split_metadata = use_dynamic_split && (params.is_qsa || params.num_splits > 1);
+        // The forward kernel resets its own work counter once a launch runs out of work, which
+        // makes a persistent buffer enough. That reset is exact only when the launch's tile count
+        // is the value the kernel derives from num_blocks (single batch); for several varlen
+        // batches that is just an upper bound, so those keep the prepare kernel that zeroes it.
+        bool const need_prepare_kernel = use_dynamic_split && (need_split_metadata || params.b != 1);
+        int metadata_size = int(scheduler_needs_semaphore) * 32 + int(need_prepare_kernel) * (params.b + 1);
         params.skip_scheduler_metadata_computation = false;
-        tile_count_semaphore = torch::empty({metadata_size}, opts.dtype(torch::kInt32));
-        tile_count_semaphore.zero_();
+        if (scheduler_needs_semaphore && !need_prepare_kernel && !params.is_qsa) {
+            // The kernel restores this counter to zero at the end of every launch, so one
+            // persistent buffer serves all calls. A fresh allocation plus memset here would
+            // put a second device operation in front of each launch, and that fixed cost
+            // dominates the short-sequence cases.
+            tile_count_semaphore = ppu_fwd_work_semaphore(opts, int(q.get_device()));
+        } else {
+            tile_count_semaphore = torch::empty({metadata_size}, opts.dtype(torch::kInt32));
+            // Zero on the caller's stream. An explicit async memset keeps the same
+            // ordering guarantee as Tensor::zero_() without going through the
+            // dispatcher, which matters for short launches where host time dominates.
+            CHECK_CUDA(hggcMemsetAsync(tile_count_semaphore.data_ptr(), 0,
+                                       size_t(metadata_size) * sizeof(int),
+                                       at::cuda::getCurrentCUDAStream().stream()));
+        }
 #else
         int metadata_size = int(scheduler_needs_semaphore) + int(use_dynamic_split) * params.b;
         params.skip_scheduler_metadata_computation = scheduler_metadata_.has_value();
@@ -1630,7 +1775,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 #endif
         params.tile_count_semaphore = scheduler_needs_semaphore ? tile_count_semaphore.data_ptr<int>() : nullptr;
 #ifdef USE_PPU
-        params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 32 : nullptr;
+        params.num_splits_dynamic_ptr = need_prepare_kernel ? tile_count_semaphore.data_ptr<int>() + 32 : nullptr;
 #else
         params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 : nullptr;
 #endif
@@ -1859,11 +2004,15 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 #endif
     if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
-#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA) && defined(FLASHATTENTION_DISABLE_SM90) && !defined(FLASHATTENTION_DISABLE_SPLIT) && !defined(FA3_HLLM_BUILD)
-        bool const launched_tail = num_splits <= 0 && run_qsa_sm80_split_tail(params, softmax_lse, stream);
-        if (!launched_tail)
+        bool launched = false;
+#if defined(USE_PPU) && !defined(FLASHATTENTION_DISABLE_HDIM256) && !defined(FLASHATTENTION_DISABLE_PAGEDKV) && !defined(FLASHATTENTION_DISABLE_PACKGQA) && !defined(FLASHATTENTION_DISABLE_SM8x) && !defined(FA3_HLLM_BUILD)
+        launched = run_mha_fwd_tiny_simt(
+            params, stream, max_seqlen_k_.has_value() ? static_cast<int>(max_seqlen_k_.value()) : -1);
 #endif
-        { run_mha_fwd(params, stream); }
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA) && defined(FLASHATTENTION_DISABLE_SM90) && !defined(FLASHATTENTION_DISABLE_SPLIT) && !defined(FA3_HLLM_BUILD)
+        if (!launched) { launched = num_splits <= 0 && run_qsa_sm80_split_tail(params, softmax_lse, stream); }
+#endif
+        if (!launched) { run_mha_fwd(params, stream); }
         if (params.num_splits > 1) {
             if (out_type == at::ScalarType::BFloat16) {
                 // Since we want output in BF16. Otherwise fwd_combine will output to FP16

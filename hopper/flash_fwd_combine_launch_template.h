@@ -64,7 +64,15 @@ void run_mha_fwd_combine_(Flash_fwd_params &params, hggcStream_t stream, bool en
     // We want kBlockM to be as small as possible to maximize parallelism.
     // E.g., if hdim is 64, we want kBlockM to be 16 so that we can use 256 threads, each reading 4 elements (floats).
     static_assert(kBlockK % 32 == 0, "kBlockK must be a multiple of 32");
+#ifdef USE_PPU
+    // PPU prefill uses only a handful of splits, so an 8-row tile launches thousands of
+    // tiny CTAs and the fixed per-CTA cost, not bandwidth, sets the combine time. A wider
+    // tile halves the CTA count and gives each one twice the streaming work. Wider than
+    // that loses more occupancy than it saves in launch cost.
+    static constexpr int kBlockM = kBlockK % 64 == 0 ? 16 : 32;
+#else
     static constexpr int kBlockM = kBlockK % 128 == 0 ? 8 : (kBlockK % 64 == 0 ? 16 : 32);
+#endif
     ARCH_SWITCH(params.arch, Arch, [&] {
         BOOL_SWITCH(params.cu_seqlens_q || params.seqused_q, Varlen, [&] {
             if constexpr (kBlockM >= 16) {  // If kBlockM == 8 then the minimum number of splits is 32.
