@@ -585,7 +585,7 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("mha_type,nheads", [("mha", 6), ("mqa", 16), ("gqa", 6)])
 # @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("new_kv", [False] + ([True] if not DISABLE_APPENDKV else []))
 # @pytest.mark.parametrize("new_kv", [True])
@@ -629,7 +629,7 @@ def test_flash_attn_varlen_output(
         # (16, 128 * 1024),
         (128, 128),
         (256, 512),  # To test appending KV with more than 1 block
-        (2048, 3577),  # Enough tile to test persistent scheduler
+        (2048, 3584),  # Exercise persistent scheduling with paged KV.
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
@@ -649,6 +649,7 @@ def test_flash_attn_kvcache(
     local,
     new_kv,
     mha_type,
+    nheads,
     dtype,
 ):
     if page_size is not None and seqlen_k % page_size != 0:
@@ -670,8 +671,6 @@ def test_flash_attn_kvcache(
     batch_size = 5
     # batch_size = 1
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
-    nheads = 6
-    # nheads = 1
     # rotary_dim must be a multiple of 16, and must be <= d
     rotary_dim = math.floor(int(rotary_fraction * d) / 16) * 16
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
@@ -865,6 +864,8 @@ def test_flash_attn_kvcache(
         k_cache_saved = k_cache.clone() if page_size is None else k_cache_paged.clone()
         v_cache_saved = v_cache.clone() if page_size is None else v_cache_paged.clone()
         num_splits_vals = [1, 0] if not DISABLE_SPLIT else [1]
+        if not DISABLE_SPLIT and varlen_q and page_size == 64:
+            num_splits_vals.append(2)
         precompute_metadata_vals = [False, True]
         for num_splits, precompute_metadata in itertools.product(num_splits_vals, precompute_metadata_vals):
             if precompute_metadata:
@@ -971,6 +972,33 @@ def test_flash_attn_kvcache(
                 assert (out - out_ref).abs().max().item() <= mult * (out_pt - out_ref).abs().max().item() + 1e-5
                 mult_mean = 3 if dtype == torch.float8_e4m3fn else 1.5
                 assert (out - out_ref).abs().mean().item() <= mult_mean * (out_pt - out_ref).abs().mean().item()
+
+
+@pytest.mark.skipif(
+    cuda_cap != 89 or DISABLE_HDIM192 or DISABLE_HDIMV
+    or os.getenv("FLASH_ATTENTION_DISABLE_VARLEN", "FALSE") == "TRUE",
+    reason="requires SM89 varlen D192/V128 support",
+)
+def test_flash_attn_varlen_warp_interleave():
+    torch.random.manual_seed(0)
+    seqlen_q, seqlen_k, nheads = 4096, 8192, 6
+    options = dict(device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(seqlen_q, nheads, 192, **options)
+    k = torch.randn(seqlen_k, nheads, 192, **options)
+    v = torch.randn(seqlen_k, nheads, 128, **options)
+    cu_seqlens_q = torch.tensor([0, seqlen_q], device=q.device, dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0, seqlen_k], device=q.device, dtype=torch.int32)
+    out, lse = flash_attn_varlen_func(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
+        causal=True, num_splits=1, return_attn_probs=True,
+    )
+
+    ref_inputs = (q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0))
+    out_ref = attention_ref(*ref_inputs, causal=True)[0].squeeze(0)
+    out_pt = attention_ref(*ref_inputs, causal=True, upcast=False, reorder_ops=True)[0].squeeze(0)
+    atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max()
+    assert (out - out_ref).abs().max() <= 2 * (out_pt - out_ref).abs().max() + atol
+    assert torch.isfinite(lse).all()
 
 
 def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, dv, device, dtype, dtype_ref):

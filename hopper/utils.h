@@ -440,17 +440,17 @@ template<bool A_in_regs=false, bool B_in_regs=false, bool SwapAB=false,
          typename Tensor0, typename Tensor1,
          typename Tensor2, typename Tensor3, typename Tensor4,
          typename TiledMma, typename TiledCopyA, typename TiledCopyB,
-         typename ThrCopyA, typename ThrCopyB, typename Hook>
+         typename ThrCopyA, typename ThrCopyB, typename Hook, typename FragmentHook = std::nullptr_t>
 CUTLASS_DEVICE void gemm_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsA,
                               Tensor4 const& tCsB, TiledMma tiled_mma,
                               TiledCopyA smem_tiled_copy_A, TiledCopyB smem_tiled_copy_B,
-                              ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B, Hook fn) {
+                              ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B, Hook fn, FragmentHook after_fragment = nullptr) {
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
     static_assert(PrefetchB == 1 || PrefetchB == 2);
     static_assert(PrefetchB == 1 || (A_in_regs && !B_in_regs && !SwapAB));
 #endif
     if constexpr (SwapAB) {
-        gemm_sm80<B_in_regs, A_in_regs>(acc, tCrB, tCrA, tCsB, tCsA, tiled_mma, smem_tiled_copy_B, smem_tiled_copy_A, smem_thr_copy_B, smem_thr_copy_A, fn);
+        gemm_sm80<B_in_regs, A_in_regs>(acc, tCrB, tCrA, tCsB, tCsA, tiled_mma, smem_tiled_copy_B, smem_tiled_copy_A, smem_thr_copy_B, smem_thr_copy_A, fn, after_fragment);
     } else {
         CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
         CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
@@ -489,6 +489,8 @@ CUTLASS_DEVICE void gemm_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor
             if constexpr (PrefetchB == 2) { __ppu_sched_bound(); }
 #endif
             cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+            // Release dependent warp groups after this reduction fragment.
+            if constexpr (!std::is_same_v<FragmentHook, std::nullptr_t>) { after_fragment(i); }
         }
         }
 #else
@@ -504,6 +506,8 @@ CUTLASS_DEVICE void gemm_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor
                 if (i == 0) { fn(); }
             }
             cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+            // Release dependent warp groups after this reduction fragment.
+            if constexpr (!std::is_same_v<FragmentHook, std::nullptr_t>) { after_fragment(i); }
         }
 #endif
     }
@@ -517,13 +521,13 @@ template<int kBlockN, int kBlockNPagedPerAiuLoad, int kHeadDim, int kBlockKSmem,
          typename Tensor0, typename Tensor1,
          typename Tensor2, typename Tensor3, typename Tensor4,
          typename TiledMma, typename TiledCopyA, typename TiledCopyB,
-         typename ThrCopyA, typename ThrCopyB, typename Hook>
+         typename ThrCopyA, typename ThrCopyB, typename Hook, typename FragmentHook = std::nullptr_t>
 CUTLASS_DEVICE void gemm_sm80_kv_paged_aiu(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsA,
                                            Tensor4 const& tCsB, TiledMma tiled_mma,
                                            TiledCopyA smem_tiled_copy_A, TiledCopyB smem_tiled_copy_B,
-                                           ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B, Hook fn) {
+                                           ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B, Hook fn, FragmentHook after_fragment = nullptr) {
     if constexpr (SwapAB) {
-        gemm_sm80_kv_paged_aiu<kBlockN, kBlockNPagedPerAiuLoad, kHeadDim, kBlockKSmem, B_in_regs, A_in_regs>(acc, tCrB, tCrA, tCsB, tCsA, tiled_mma, smem_tiled_copy_B, smem_tiled_copy_A, smem_thr_copy_B, smem_thr_copy_A, fn);
+        gemm_sm80_kv_paged_aiu<kBlockN, kBlockNPagedPerAiuLoad, kHeadDim, kBlockKSmem, B_in_regs, A_in_regs>(acc, tCrB, tCrA, tCsB, tCsA, tiled_mma, smem_tiled_copy_B, smem_tiled_copy_A, smem_thr_copy_B, smem_thr_copy_A, fn, after_fragment);
     } else {
         CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
         CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
@@ -559,6 +563,7 @@ CUTLASS_DEVICE void gemm_sm80_kv_paged_aiu(Tensor0 &acc, Tensor1 &tCrA, Tensor2 
                 if (i == 0) { fn(); }
             }
             cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+            if constexpr (!std::is_same_v<FragmentHook, std::nullptr_t>) { after_fragment(i); }
         }
         }
     }
@@ -567,11 +572,13 @@ CUTLASS_DEVICE void gemm_sm80_kv_paged_aiu(Tensor0 &acc, Tensor1 &tCrA, Tensor2 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// The optional hook retires B after its final shared-memory load and first
+// output fragment. The remaining MMA consumes only register operands.
 template<typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
-         typename TiledMma, typename TiledCopy, typename ThrCopy>
+         typename TiledMma, typename TiledCopy, typename ThrCopy, typename ReadDoneHook = std::nullptr_t>
 CUTLASS_DEVICE void gemm_rs_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsB,
                                  TiledMma tiled_mma, TiledCopy smem_tiled_copy_B,
-                                 ThrCopy smem_thr_copy_B) {
+                                 ThrCopy smem_thr_copy_B, ReadDoneHook reads_done = nullptr) {
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
     CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
     CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
@@ -583,7 +590,23 @@ CUTLASS_DEVICE void gemm_rs_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Ten
     #pragma unroll
     for (int i = 0; i < size<2>(tCrA); ++i) {
         cute::copy(smem_tiled_copy_B, tCsB(_, _, i), tCrB_copy_view(_, _, i));
-        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+        if constexpr (!std::is_same_v<ReadDoneHook, std::nullptr_t>) {
+            if (i + 1 == size<2>(tCrA)) {
+                #pragma unroll
+                for (int n = 0; n < size<1>(tCrB); ++n) {
+                    #pragma unroll
+                    for (int m = 0; m < size<1>(tCrA); ++m) {
+                        auto output = acc(_, m, n);
+                        cute::gemm(tiled_mma, tCrA(_, m, i), tCrB(_, n, i), output);
+                    }
+                    if (n == 0) { reads_done(); }
+                }
+            } else {
+                cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+            }
+        } else {
+            cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+        }
     }
     }
 #else
@@ -592,6 +615,9 @@ CUTLASS_DEVICE void gemm_rs_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Ten
     for (int i = 0; i < size<2>(tCrA); ++i) {
         if (i < size<2>(tCrA) - 1) {
             cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
+        }
+        if constexpr (!std::is_same_v<ReadDoneHook, std::nullptr_t>) {
+            if (i + 1 == size<2>(tCrA)) { reads_done(); }
         }
         cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
     }
@@ -605,38 +631,78 @@ CUTLASS_DEVICE void gemm_rs_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Ten
 #ifdef USE_PPU
 template<int kBlockN, int kBlockNPagedPerAiuLoad, int kHeadDim, int kBlockKSmem,
          typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
-         typename TiledMma, typename TiledCopy, typename ThrCopy>
+         typename TiledMma, typename TiledCopy, typename ThrCopy, typename ReadDoneHook = std::nullptr_t>
 CUTLASS_DEVICE void gemm_rs_sm80_kv_paged_aiu(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsB,
                                        TiledMma tiled_mma, TiledCopy smem_tiled_copy_B,
-                                       ThrCopy smem_thr_copy_B) {
+                                       ThrCopy smem_thr_copy_B, ReadDoneHook reads_done = nullptr) {
     Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
     constexpr int OFFSET_MMA_N = kBlockNPagedPerAiuLoad * kBlockKSmem;
     constexpr int OFFSET_TILE = kBlockN * kBlockKSmem;
     int MMA_K_PER_TILE = size<1>(tCrB) / (kHeadDim / kBlockKSmem);
     Tensor tCsB_rTile = make_tensor(tCsB.data(), tCsB.layout());
     Tensor tCsB_sTile = make_tensor(tCsB.data(), tCsB.layout());
-    #pragma hggc mmatiestrictly
-    {
-    #pragma unroll
-    for (int i = 0; i < size<2>(tCrA) / (kBlockNPagedPerAiuLoad / 16); ++i) {
-        tCsB_rTile.data() = tCsB_sTile.data();
-        for (int k = 0; k < size<1>(tCrB); k++) {
-            #pragma unroll
-            for (int j = 0; j < kBlockNPagedPerAiuLoad / 16; ++j) {
-                cute::copy(smem_tiled_copy_B, tCsB_rTile(_, k % MMA_K_PER_TILE, j), tCrB_copy_view(_, k, i * (kBlockNPagedPerAiuLoad / 16) + j));
-            }
-            if ((k + 1) % MMA_K_PER_TILE == 0) {
-                tCsB_rTile.data() = tCsB_rTile.data() + OFFSET_TILE;
-            }
-        }
-        tCsB_sTile.data() = tCsB_sTile.data() + OFFSET_MMA_N;
+    constexpr int kFragmentsPerPage = kBlockNPagedPerAiuLoad / 16;
+    if constexpr (std::is_same_v<ReadDoneHook, std::nullptr_t>) {
+        // Preserve the native schedule: load a page's V fragments before its MMA.
+        #pragma hggc mmatiestrictly
+        {
         #pragma unroll
-        for (int j = 0; j < kBlockNPagedPerAiuLoad / 16; ++j) {
-            cute::gemm(tiled_mma, tCrA(_, _, i * (kBlockNPagedPerAiuLoad / 16) + j), tCrB(_, _, i * (kBlockNPagedPerAiuLoad / 16) + j), acc);
+        for (int page = 0; page < size<2>(tCrA) / kFragmentsPerPage; ++page) {
+            tCsB_rTile.data() = tCsB_sTile.data();
+            for (int k = 0; k < size<1>(tCrB); ++k) {
+                #pragma unroll
+                for (int j = 0; j < kFragmentsPerPage; ++j) {
+                    cute::copy(smem_tiled_copy_B, tCsB_rTile(_, k % MMA_K_PER_TILE, j),
+                        tCrB_copy_view(_, k, page * kFragmentsPerPage + j));
+                }
+                if ((k + 1) % MMA_K_PER_TILE == 0) {
+                    tCsB_rTile.data() = tCsB_rTile.data() + OFFSET_TILE;
+                }
+            }
+            tCsB_sTile.data() = tCsB_sTile.data() + OFFSET_MMA_N;
+            #pragma unroll
+            for (int j = 0; j < kFragmentsPerPage; ++j) {
+                int const fragment = page * kFragmentsPerPage + j;
+                cute::gemm(tiled_mma, tCrA(_, _, fragment), tCrB(_, _, fragment), acc);
+            }
         }
-    }
+        }
+    } else {
+        static_assert(decltype(size<1>(tCrA))::value == 1);
+        static_assert(decltype(size<1>(tCrB))::value == 8);
+        #pragma hggc mmatiestrictly
+        {
+        #pragma unroll
+        for (int page = 0; page < size<2>(tCrA) / kFragmentsPerPage; ++page) {
+            #pragma unroll
+            for (int j = 0; j < kFragmentsPerPage; ++j) {
+                int const fragment = page * kFragmentsPerPage + j;
+                tCsB_rTile.data() = tCsB_sTile.data();
+                #pragma unroll
+                for (int k = 0; k < size<1>(tCrB); ++k) {
+                    cute::copy(smem_tiled_copy_B, tCsB_rTile(_, k % MMA_K_PER_TILE, j),
+                        tCrB_copy_view(_, k, fragment));
+                    if ((k + 1) % MMA_K_PER_TILE == 0) {
+                        tCsB_rTile.data() = tCsB_rTile.data() + OFFSET_TILE;
+                    }
+                }
+                if (fragment + 1 == size<2>(tCrA)) {
+                    #pragma unroll
+                    for (int n = 0; n < size<1>(tCrB); ++n) {
+                        auto output = acc(_, 0, n);
+                        cute::gemm(tiled_mma, tCrA(_, 0, fragment), tCrB(_, n, fragment), output);
+                        if (n == 0) { reads_done(); }
+                    }
+                } else {
+                    cute::gemm(tiled_mma, tCrA(_, _, fragment), tCrB(_, _, fragment), acc);
+                }
+            }
+            tCsB_sTile.data() = tCsB_sTile.data() + OFFSET_MMA_N;
+        }
+        }
     }
 }
+
 #endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

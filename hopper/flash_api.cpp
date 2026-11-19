@@ -607,6 +607,89 @@ static bool run_qsa_sm80_split_tail(Flash_fwd_params const& p, at::Tensor const&
 }
 #endif
 
+#if defined(USE_PPU) && USE_AIU && !defined(FA3_HLLM_BUILD)
+// Use the BF16 MHA workload gate from PR #52 for contiguous packed varlen
+// inputs. This schedule uses the native persistent grid and a single KV split.
+inline bool supports_dense_mha_warp_interleave(Flash_fwd_params const& params) {
+    constexpr int kReferenceQueryRows = 256;
+    constexpr int kMinDenseKeyTokens = 24 * 128;
+    constexpr double kMinWaveUtilization = 0.70;
+    if (params.num_sm != 39 || params.b > 65535
+        || params.h <= 0 || params.h != params.h_k || params.pack_gqa
+        || params.num_splits != 1 || params.num_splits_dynamic_ptr
+        || !params.cu_seqlens_k || params.seqused_k
+        || !params.is_causal || params.window_size_left != params.seqlen_k - 1
+        || params.window_size_right != 0 || params.rotary_sin_ptr || params.s_aux_ptr
+        || params.p_dropout != 1.f || !params.o_ptr || !params.softmax_lse_ptr
+        || !(params.scale_softmax > 0.f) || !std::isfinite(params.scale_softmax)
+        || params.seqlen_q < kReferenceQueryRows || params.seqlen_k < params.seqlen_q
+        || int64_t(params.seqlen_q) + params.seqlen_k + kReferenceQueryRows
+            > std::numeric_limits<int>::max()
+        || params.k_head_stride != 192 || params.k_row_stride != int64_t(params.h) * 192
+        || params.v_head_stride != 128 || params.v_row_stride != int64_t(params.h) * 128) {
+        return false;
+    }
+    for (auto ptr : {params.q_ptr, params.k_ptr, params.v_ptr}) {
+        if (!ptr || (reinterpret_cast<uintptr_t>(ptr) & 127)) { return false; }
+    }
+
+    int64_t const max_query_tiles = (int64_t(params.seqlen_q) + kReferenceQueryRows - 1)
+        / kReferenceQueryRows;
+    int64_t const nonempty = std::min(params.b, params.total_q);
+    int64_t const packed_tiles = (int64_t(params.total_q) + nonempty * (kReferenceQueryRows - 1))
+        / kReferenceQueryRows;
+    int64_t const query_tiles = std::min(max_query_tiles * params.b, packed_tiles);
+    // M128 can launch up to twice as many tiles as the M256 reference.
+    if (query_tiles * params.h > std::numeric_limits<int>::max() / 2) { return false; }
+
+    double const waves = std::ceil(double(query_tiles * params.h) / params.num_sm);
+    double const useful_blocks = double(params.total_q) * params.h / kReferenceQueryRows;
+    double const average_q = double(params.total_q) / params.b;
+    double const useful_k = params.seqlen_k - (average_q - 1.) * 0.5;
+    return useful_k >= kMinDenseKeyTokens && useful_blocks >= params.num_sm
+        && useful_blocks >= kMinWaveUtilization * waves * params.num_sm;
+}
+
+inline bool get_warp_interleave(Flash_fwd_params const& params,
+                                int64_t min_seqlen_q, int64_t min_seqlen_k) {
+    constexpr int kMinQueryLength = 4096;
+    constexpr int kMinKvLengthPerSplit = 2048;
+    constexpr int kMinQueryTilesPerSm = 3;
+    if (params.arch != 89 || !params.is_bf16 || params.is_local || params.is_qsa
+        || params.num_sm <= 0
+        || params.num_splits < 1 || params.num_splits > 256
+        || params.b <= 0 || params.total_q <= 0 || params.seqlen_q <= 16
+        || params.d != 192 || params.dv != 128 || !params.cu_seqlens_q
+        || params.seqused_q || params.leftpad_k || params.kv_batch_idx
+        || params.knew_ptr || params.vnew_ptr || params.qv_ptr || params.rotary_cos_ptr
+        || params.softcap != 0.f || params.attention_chunk != 0
+        || params.q_head_stride != 192 || params.q_row_stride != int64_t(params.h) * 192
+        || params.o_head_stride != 128 || params.o_row_stride != int64_t(params.h) * 128
+        || params.v_dim_stride != 1) {
+        return false;
+    }
+    if (params.page_table) {
+        if (!params.is_causal
+            || params.use_kblockm_16 || params.use_kblockm_128 || params.use_kblockn_16
+            || params.h != 16 || params.h_k != 1 || params.page_size != 64
+            || !params.seqused_k || params.cu_seqlens_k
+            || min_seqlen_q < kMinQueryLength || min_seqlen_q > params.seqlen_q
+            || min_seqlen_k < int64_t(kMinKvLengthPerSplit) * params.num_splits
+            || min_seqlen_k > params.seqlen_k
+            || params.k_row_stride != 192 || params.k_batch_stride != 64 * 192
+            || params.v_row_stride != 128 || params.v_batch_stride != 64 * 128) {
+            return false;
+        }
+        int const qhead_per_khead = params.h / params.h_k;
+        int64_t const query_tiles = (int64_t(params.total_q) * qhead_per_khead + 63) / 64;
+        // Estimate query work per KV head in 64-row units across its Q heads.
+        // The persistent grid also depends on resident blocks per SM.
+        return query_tiles >= int64_t(kMinQueryTilesPerSm) * params.num_sm;
+    }
+    return supports_dense_mha_warp_interleave(params);
+}
+#endif
+
 inline bool get_pagedkv_tma(Flash_fwd_params const& params) {
     if (params.arch < 90 || !params.page_table || params.leftpad_k || params.knew_ptr) { return false; }
     // This needs to match the kernel configs
@@ -1044,6 +1127,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 #endif // FA3_HLLM_BUILD
         , std::optional<at::Tensor> s_aux_ = {} // (h)
         , bool qsa_allow_aiu = false
+        , std::optional<int64_t> min_seqlen_q_ = std::nullopt
+        , std::optional<int64_t> min_seqlen_k_ = std::nullopt
         ) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm8x = dprops->major >= 8;
@@ -1810,6 +1895,12 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     } else {
         params.s_aux_ptr = nullptr;
     }
+
+#if defined(USE_PPU) && USE_AIU && !defined(FA3_HLLM_BUILD)
+    // Select warp interleaving after layout and split parameters are finalized.
+    params.use_warp_interleave = get_warp_interleave(
+        params, min_seqlen_q_.value_or(0), min_seqlen_k_.value_or(0));
+#endif
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
     TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
@@ -2654,7 +2745,9 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "bool? pack_gqa = None,"
         "int sm_margin = 0,"
         "Tensor? s_aux = None,"
-        "bool qsa_allow_aiu = False) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "bool qsa_allow_aiu = False,"
+        "int? min_seqlen_q = None,"
+        "int? min_seqlen_k = None) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"
