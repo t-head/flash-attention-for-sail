@@ -259,8 +259,14 @@ def get_package_version():
 
 
 class CachedWheelsCommand(_bdist_wheel):
-    def run(self):
-        return super().run()
+    def egg2dist(self, egginfo_path, distinfo_path):
+        super().egg2dist(egginfo_path, distinfo_path)
+        if FA3_HOLMES_WHEEL:
+            # The license notices live at the repository root, above the wheel build directory.
+            license_dir = Path(distinfo_path) / "licenses"
+            license_dir.mkdir(exist_ok=True)
+            for filename in ("LICENSE", "AUTHORS"):
+                self.copy_file(str(Path(this_dir).parent / filename), str(license_dir / filename))
 
 
 class PerSourceBuildExtension(BuildExtension):
@@ -323,6 +329,7 @@ setup(
     py_modules=[] if FA3_HOLMES_WHEEL else ["flash_attn_interface"],
     author="Tri Dao",
     author_email="tri@tridao.me",
+    license="BSD-3-Clause" if FA3_HOLMES_WHEEL else None,
     description="Flash Attention 3: Fast and Memory-Efficient Exact Attention",
     long_description=open("../README.md", "r", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
