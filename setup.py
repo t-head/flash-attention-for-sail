@@ -34,7 +34,7 @@ def get_package_version():
     with open(Path(this_dir) / "flash_attn" / "__init__.py", "r") as f:
         version_match = re.search(r"^__version__\s*=\s*(.*)$", f.read(), re.MULTILINE)
     public_version = ast.literal_eval(version_match.group(1))
-    local_version = os.environ.get("FLASH_ATTN_LOCAL_VERSION")
+    local_version = os.environ.get("FLASH_ATTN_LOCAL_VERSION", "v1.0.0")
     if local_version:
         return f"{public_version}+{local_version}"
     else:

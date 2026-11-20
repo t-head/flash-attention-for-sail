@@ -4,7 +4,7 @@ name: flash-attention checkin     # Workflow name (shown on the Actions page)
 on:
   workflow_dispatch:                                       # manual trigger (UI / API)
   pull_request:
-    branches: ['main', 'v2.7.2', 'v2.7.4', 'v2.8.2']         # target branch selects the FA version to test
+    branches: ['main', 'v2.7.2', 'v2.7.4', 'v2.8.2', 'release/*']         # target branch selects the FA version to test
     types: [opened, synchronize, reopened]
   # push:
   #   branches: ['feature/add-ci-workflow']                                       # uncomment for debugging
@@ -44,7 +44,7 @@ jobs:
   fa-ut-tests-ppu:
     name: flash-attention UT Tests PPU (${{ github.base_ref }})
     needs: human-review
-    if: github.event_name == 'pull_request' && contains(fromJSON('["v2.7.2", "v2.7.4", "v2.8.2"]'), github.base_ref)
+    if: github.event_name == 'pull_request' && (startsWith(github.base_ref, 'release/') || contains(fromJSON('["v2.7.2", "v2.7.4", "v2.8.2"]'), github.base_ref))
     uses: ./.github/workflows/pr-fa-test-ppu.yaml
     with:
       version: ${{ github.base_ref }}
