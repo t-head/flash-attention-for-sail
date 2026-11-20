@@ -34,6 +34,42 @@
 
 using namespace cute;
 
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+namespace flash {
+
+inline bool should_use_decoupled_pipeline(Flash_fwd_params const& p) {
+    bool const paged = p.page_table != nullptr;
+    bool const fixed = !paged && !p.cu_seqlens_q && !p.cu_seqlens_k && !p.seqused_q && !p.seqused_k;
+    bool const packed = !paged && p.cu_seqlens_q && p.cu_seqlens_k && !p.seqused_q && !p.seqused_k;
+    // FIXME: Support AIU16 in the decoupled pipeline.
+    bool const paged_layout = paged && p.page_size == 64 && p.cu_seqlens_q
+        && !p.cu_seqlens_k && p.seqused_k && !p.seqused_q;
+    // FIXME: D256/V256 paged GQA is faster on General.
+    bool const paged_gqa = paged_layout && p.d != 256 && p.h == 16 * p.h_k;
+    bool const fixed_8k_regression = p.d == 192 && p.dv == 128 && p.b == 1
+        && p.seqlen_q == 8192 && p.seqlen_k == 8192
+        && (p.h == 16 || p.h == 32 || p.h == 64 || p.h == 128);
+    int const tile_m = std::get<0>(tile_size_fwd_ppu_decoupled(p.d, p.dv));
+    return p.arch == 89 && p.is_bf16
+        && tile_m != 0
+        && p.b > 0 && p.h > 0 && p.h_k > 0 && (p.h == p.h_k || paged_gqa)
+        && (fixed || packed || paged_layout)
+        && p.seqlen_q >= 4096 && p.seqlen_k >= 8192
+        // FIXME: Revisit these fixed-length fallbacks once the performance regressions are fixed.
+        && (!fixed || (!fixed_8k_regression
+            && static_cast<int64_t>(p.b) * p.h * cutlass::ceil_div(p.seqlen_q, tile_m) >= p.num_sm))
+        && !p.use_kblockm_16 && !p.leftpad_k && !p.kv_batch_idx
+        && !p.is_qsa && !p.knew_ptr && !p.vnew_ptr && !p.qv_ptr
+        && !p.rotary_cos_ptr && !p.rotary_sin_ptr && !p.s_aux_ptr
+        && p.num_splits == 1 && !p.pack_gqa && p.is_causal && !p.is_local
+        && !p.attention_chunk && p.window_size_left == p.seqlen_k - 1
+        && p.window_size_right == 0 && p.softcap == 0.f && p.p_dropout == 1.f
+        && p.v_dim_stride == 1;
+}
+
+} // namespace flash
+#endif
+
 template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
 #if defined(USE_PPU) && USE_AIU
           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool PagedKVAiu, int kBlockNPagedPerAiuLoad_, bool AppendKV, bool HasQv,   // PagedKVNonTMA means PagedKV for PPU
@@ -43,6 +79,7 @@ template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element,
 #ifdef USE_PPU
           bool PackGQA, bool Split, bool V_colmajor, bool kBlockM128, bool kBlockM16, bool kBlockN16, bool Is_QSA=false
           , class QsaConfig = flash::QsaConfig
+          , bool UseDecoupled = false
           >
 #else
           bool PackGQA, bool Split, bool V_colmajor>
@@ -71,6 +108,10 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
         if constexpr (QsaConfig::M) {
             return std::tuple<int, int, int, int, bool>{QsaConfig::M, QsaConfig::N,
                 QsaConfig::Warps, QsaConfig::Stages, QsaConfig::QRegs};
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+        } else if constexpr (UseDecoupled) {
+            return tile_size_fwd_ppu_decoupled(kHeadDim, kHeadDimV);
+#endif
         } else {
             return tile_size_fwd_ppu(Arch, kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element),
                 PagedKVNonTMA, Varlen, Split, Has_softcap, AppendKV, PackGQA,
@@ -108,11 +149,11 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
 #if defined(USE_PPU) && USE_AIU
     static constexpr int kBlockNPagedPerAiuLoad = kBlockN % kBlockNPagedPerAiuLoad_ == 0 ? kBlockNPagedPerAiuLoad_ : 16;   // kBlockNPagedPerAiuLoad_ = 64 or 16
     using CollectiveMainloop = flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, ArchTag, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, PagedKVAiu, kBlockNPagedPerAiuLoad, AppendKV, PackGQA, Split, ElementS, Is_QSA
-            , QsaConfig
+            , QsaConfig, UseDecoupled
             >;
 #else
     using CollectiveMainloop = flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, ArchTag, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split, ElementS, Is_QSA
-            , QsaConfig
+            , QsaConfig, UseDecoupled
             >;
 #endif
 #endif
@@ -129,7 +170,11 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
 #else
     static constexpr int NumProducerThreads = CollectiveMainloop::NumMmaThreads;
 #endif
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+    using SchedulerPersistent = std::conditional_t<Varlen || UseDecoupled,
+#else
     using SchedulerPersistent = std::conditional_t<Varlen,
+#endif
 #ifdef USE_PPU
         // on PPU, we implement DynamicPersistentTileSchedulerSM80 for Varlen situation, with much simpler logic and less vreg usage,
         // which solved the vreg spill problem caused by FA3 original VarlenDynamicPersistentTileScheduler.
@@ -345,6 +390,29 @@ void run_mha_fwd_(Flash_fwd_params &params, hggcStream_t stream) {
     static_assert(sizeof(T) == 2 || sizeof(T) == 1, "Only 16bit and 8bit are supported");
     static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
     using T_out = std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>;
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+    if constexpr (Arch == 89 && cute::is_same_v<T, cutlass::bfloat16_t>
+                  && !Is_QSA && !Split && !Has_softcap && !PackGQA
+                  && std::get<0>(tile_size_fwd_ppu_decoupled(kHeadDim, kHeadDimV)) != 0) {
+        if (flash::should_use_decoupled_pipeline(params)) {
+            if constexpr (PagedKVNonTMA) {
+                run_flash_fwd<Arch, kHeadDim, kHeadDimV, 1, T, T_out,
+                    true, false, false, true /*Varlen: seqused_k*/,
+                    true /*PagedKV*/, true /*PagedKVAiu*/, 64,
+                    false, false, false /*PackGQA*/, false /*Split*/,
+                    false, false, false, false, false, flash::QsaConfig, true>(params, stream);
+            } else {
+                BOOL_SWITCH(params.cu_seqlens_q != nullptr, DecoupledVarlen, [&] {
+                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, 1, T, T_out,
+                        true, false, false, DecoupledVarlen,
+                        false, false, 1, false, false, false, false,
+                        false, false, false, false, false, flash::QsaConfig, true>(params, stream);
+                });
+            }
+            return;
+        }
+    }
+#endif
 #if defined(USE_PPU)
     if constexpr (Is_QSA && PagedKVNonTMA) {
         // QSA always has unpadded queries, per-token pages, and no KV append.

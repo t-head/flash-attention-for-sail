@@ -38,6 +38,7 @@ template <int kNWarps, int Stages, bool Q_in_regs, class TileShape_MNK_, int kHe
 #endif
         bool PackGQA_, bool Split_, class ElementSAux_, bool Is_QSA_=false
           , class QsaConfig = flash::QsaConfig
+          , bool UseDecoupled = false
           >
 struct CollectiveMainloopFwdSm80 {
 
@@ -110,6 +111,13 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+    static constexpr bool DecoupledD256Tuning = UseDecoupled && !Is_FP8
+        && kHeadDim == 256 && kHeadDimV == 256;
+    static_assert(!DecoupledD256Tuning ||
+                  (kBlockM == 256 && kBlockN == 64 && kNWarps == 16 && kStages == 3),
+                  "D256 tuning requires the M256/N64/W16/S3 decoupled tile");
+#endif
 
 #ifdef USE_PPU
     // Each warp executes QK. Give every warp the same valid score
@@ -1083,6 +1091,34 @@ struct CollectiveMainloopFwdSm80 {
 
         // For persistent, make sure all threads have finished reading smem_o
         if constexpr (!Share_QV_Smem) { __syncthreads(); }
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+        int const c_ready_group = UseDecoupled ? __ppu_read_firstlane(thread_idx) / 128 : 0;
+        auto publish_ready = [&](int const slot) {
+            if constexpr (UseDecoupled) {
+                // Epilogue keeps ID1; ready 2..10/free11..13/local14 for S3.
+                __ppu_sched_bound();
+                #pragma unroll
+                for (int consumer = 1; consumer < 4; ++consumer) {
+                    __ppu_barrier_arrive(2 + (consumer - 1) * kStages + slot, 256, 15u);
+                }
+            }
+        };
+        if constexpr (UseDecoupled) {
+            // The paged V tail clear is partitioned across the full CTA.
+            bool const clear_v_tail = PagedKVAiu && kBlockN > kBlockNPagedPerAiuLoad
+                && seqlen_k - n_block * kBlockN <= kBlockN - kBlockNPagedPerAiuLoad;
+            if (c_ready_group == 0 || clear_v_tail) {
+                load_V(n_block, 0, cute::true_type{} /*Seqlenk_mask*/);
+                cute::cp_async_fence();
+            }
+            if (clear_v_tail) { __syncthreads(); }
+            if (c_ready_group == 0) {
+                flash::cp_async_wait<0>();
+                __ppu_barrier_sync(14, 128, 15u);
+                publish_ready(0);
+            }
+        } else
+#endif
         // Note, using the for_each() function here to ensure `stage` is of type Int<x>.
         for_each(make_int_sequence<kStages>{}, [&] (auto stage) {
             static constexpr bool Is_first_stage = CUTE_STATIC_V(stage) == 0;
@@ -1156,6 +1192,9 @@ struct CollectiveMainloopFwdSm80 {
 
         auto fwd_step = [&](int const n_block, auto mask_fn, auto is_first_iter_type, auto check_inf_type) {
             static constexpr bool Is_first_iter = decltype(is_first_iter_type)::value;
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+            static constexpr bool UseScheduledPv = DecoupledD256Tuning && !Is_first_iter;
+#endif
             static constexpr bool TrimHighRows = Is_QSA_FP8 && QsaConfig::FixedGroup && QsaConfig::Group == 6;
             static constexpr bool Check_inf = decltype(check_inf_type)::value || TrimHighRows;
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
@@ -1179,8 +1218,29 @@ struct CollectiveMainloopFwdSm80 {
 #endif
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
             clear(tSrS);
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+            if constexpr (UseDecoupled) {
+                if (c_ready_group == 0) {
+                    if (n_block > n_block_min) {
+                        int const local_step = n_block_max - 1 - n_block;
+                        int const next_slot = (smem_pipe_read + 1) % kStages;
+                        if (local_step + 1 >= kStages) {
+                            __ppu_barrier_sync(11 + next_slot, 512, 15u);
+                        }
+                        load_K(n_block - 1, next_slot, cute::false_type{} /*Seqlenk_mask*/);
+                        load_V(n_block - 1, next_slot, cute::false_type{} /*Seqlenk_mask*/);
+                        cute::cp_async_fence();
+                    }
+                } else {
+                    __ppu_barrier_sync(2 + (c_ready_group - 1) * kStages + smem_pipe_read, 256, 15u);
+                }
+            } else
+#endif
             sync();
             auto load_V_next = [&] {
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+                if constexpr (!UseDecoupled) {
+#endif
                 if (n_block - kStages + 1 >= n_block_min) {
                     load_V(n_block - kStages + 1, kStages > 1 ? smem_pipe_write : 0, cute::bool_constant<Is_first_iter && kStages == 1>{} /*Seqlenk_mask*/);
                 }
@@ -1194,6 +1254,9 @@ struct CollectiveMainloopFwdSm80 {
                         __ppu_sched_bound();
 #endif
                     }
+                }
+#endif
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
                 }
 #endif
             };
@@ -1210,6 +1273,13 @@ struct CollectiveMainloopFwdSm80 {
                     tiled_mma_qk, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, qk_prefetch
                 );
             } else {
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+                if constexpr (DecoupledD256Tuning) {
+                    flash::gemm_sm80_d256_qk_prefetch4(
+                        tSrS, tSrQ_cur, tSrK, tSsK(_, _, _, smem_pipe_read),
+                        tiled_mma_qk, smem_tiled_copy_K, smem_thr_copy_K, qk_prefetch);
+                } else
+#endif
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
                 flash::gemm_sm80<Q_in_regs, false, false,
                     Is_QSA && !QsaReplicateQK ? QsaConfig::PrefetchB : 1>(
@@ -1230,6 +1300,9 @@ struct CollectiveMainloopFwdSm80 {
                 sync_threads();
                 if constexpr (Share_KV_Smem) { load_V_next(); }
             }
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+            if constexpr (!UseDecoupled)
+#endif
             smem_pipe_write = smem_pipe_write < kStages - 1 ? smem_pipe_write + 1 : 0;
             scoremod_premask_fn(tSrS);
             if constexpr (Is_QSA_FP8) {
@@ -1329,6 +1402,9 @@ struct CollectiveMainloopFwdSm80 {
                 softmax.template online_softmax_rescale_o_nsplit<Check_inf>(tSrS, tOrO, scale_ptr);
             } else
 #endif
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+            if constexpr (!UseScheduledPv)
+#endif
             {
                 if constexpr (Is_QSA_FP8) {
                     // Keep the validated QSA schedule; upstream leaves other paths opt-in.
@@ -1370,7 +1446,13 @@ struct CollectiveMainloopFwdSm80 {
                     return make_tensor(tOrP_acc.data(), make_layout(get<0>(tSrQ.layout()), get<1>(tSrS.layout()), get<2>(tSrS.layout())));
                 }
             }();
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+            if constexpr (ArchTag::kMinComputeCapability >= 89 && !UseScheduledPv) { convert_type_out(tOrP_acc, tOrP); }
+            // FIXME: Revisit the first-iteration rowsum dependency for D192/V192.
+            // It reduced stack from 160 B to 16 B and latency by about 1% on fixed and packed inputs.
+#else
             if constexpr (ArchTag::kMinComputeCapability >= 89) { convert_type_out(tOrP_acc, tOrP); }
+#endif
 #else
             Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMma>(tSrS.layout()));
             Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
@@ -1392,7 +1474,11 @@ struct CollectiveMainloopFwdSm80 {
             } else {
                 // Fp8PvNsplit defer this sync
                 if constexpr (!Fp8PvNsplit) {
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+                    if constexpr (kStages > 1 && !UseDecoupled) { sync(); }
+#else
                     if constexpr (kStages > 1) { sync(); }
+#endif
                 }
             }
             Tensor tOrV = thr_mma.partition_fragment_B(sVt(_, _, _0{}));
@@ -1404,6 +1490,17 @@ struct CollectiveMainloopFwdSm80 {
             }
 #endif
             if constexpr (kStages == 1 && (kHeadDim <= 96 || (kHeadDim <= 128 && PagedKV))) { flash::cp_async_wait<kStages * 2 - 1>(); __syncthreads(); }
+#if USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+            if constexpr (UseDecoupled) {
+                constexpr int VSourceN = PagedKVAiu ? kBlockNPagedPerAiuLoad : kBlockN;
+                constexpr int VWindow = UseScheduledPv ? 4
+                    : (PagedKVAiu && kHeadDim == 192 && kHeadDimV == 192 ? 2 : 0);
+                flash::gemm_rs_sm80_decoupled<kBlockN, VSourceN, kBlockKGmem, kHeadDimV,
+                        VWindow, UseScheduledPv, Check_inf>(
+                    tSrS, softmax, tOrP, tOrV, tOsVt(_, _, _, smem_pipe_read),
+                    tOrO, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+            } else
+#endif
 #ifdef FLASHATTENTION_QSA_FP8
             if constexpr (Is_QSA_FP8) {
                 // Use FA's hardware b16 V-direct load and pi_k/pi_n mapping.
@@ -1476,14 +1573,14 @@ struct CollectiveMainloopFwdSm80 {
                 // === N-split PV path (fp8_pv_nsplit_design.md) ===
                 // The dead read-stage K buffer serves as the P/scale
                 // broadcast region; K safety was established by the barrier
-                // right after max_get_scale. 
+                // right after max_get_scale.
                 static_assert(kBlockM * kBlockN + kBlockM * int(sizeof(float)) <= kBlockN * kHeadDim * int(sizeof(Element)),
                               "P + scale broadcast region must fit in one K stage");
                 char* bcast_base = reinterpret_cast<char*>(shared_storage.tensors.mainloop.smem_k.data())
                                  + (kStages > 1 ? smem_pipe_read : 0) * (kBlockN * kHeadDim * sizeof(Element));
                 // All-gather P into the K stage.
                 flash::write_P_to_smem<kBlockM, kBlockN>(bcast_base, tOrP, warp_idx);
-                // One merged barrier for P visibility and V readiness. 
+                // One merged barrier for P visibility and V readiness.
                 flash::cp_async_wait<kStages * 2 - 2>();
                 __syncthreads();  // P visible to all warps + read-stage V g2s complete
                 // N-split PV: warp w accumulates its own contiguous column
@@ -1502,6 +1599,7 @@ struct CollectiveMainloopFwdSm80 {
             } else
 #endif
             if constexpr (PagedKVAiu && (kBlockN != kBlockNPagedPerAiuLoad) && (!Is_FP8)) {
+                // FIXME: Prefetching four V fragments reduced BF16 D192/V128 page16 latency by about 1%.
                 flash::gemm_rs_sm80_kv_paged_aiu<kBlockN, kBlockNPagedPerAiuLoad, kHeadDimV, kBlockKGmem>(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
             } else if constexpr (Fp8VDirect && !Fp8PvNsplit) {
                 // UseTsmLd = (!PagedKV || PagedKVAiu): TSM on the AIU
@@ -1518,6 +1616,19 @@ struct CollectiveMainloopFwdSm80 {
             }
 #else
             flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+#endif
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+            if constexpr (UseDecoupled) {
+                if (c_ready_group > 0) {
+                    __syncwarp();
+                    __ppu_sched_bound();
+                    __ppu_barrier_arrive(11 + smem_pipe_read, 512, 15u);
+                } else if (n_block > n_block_min) {
+                    flash::cp_async_wait<0>();
+                    __ppu_barrier_sync(14, 128, 15u);
+                    publish_ready((smem_pipe_read + 1) % kStages);
+                }
+            } else
 #endif
             if constexpr (Is_QSA_FP8) {
                 sync_threads();
@@ -1565,12 +1676,22 @@ struct CollectiveMainloopFwdSm80 {
                 fwd_step(n_block, local_mask_fn, cute::false_type{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
             }
         }
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+        if constexpr (UseDecoupled) {
+            if (c_ready_group == 0) {
+                int const total_tiles = n_block_max - n_block_min;
+                for (int step = std::max(0, total_tiles - kStages); step < total_tiles; ++step) {
+                    __ppu_barrier_sync(11 + step % kStages, 512, 15u);
+                }
+            }
+        }
+#endif
         float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
         Tensor scores_scale = softmax_finalize_dispatch(v_descale);
 #if defined(USE_PPU) && USE_AIU
         if constexpr (Fp8PvNsplit) {
             // all-gather the final per-row scales through the K buffer,
-            // then rescale the N-split O accumulator. 
+            // then rescale the N-split O accumulator.
             char* bcast_base = reinterpret_cast<char*>(shared_storage.tensors.mainloop.smem_k.data());
             float* scale_ptr = reinterpret_cast<float*>(bcast_base + kBlockM * kBlockN);
             softmax.write_scales_to_smem(scale_ptr, warp_idx, scores_scale);

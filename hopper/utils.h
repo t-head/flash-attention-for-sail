@@ -602,6 +602,422 @@ CUTLASS_DEVICE void gemm_rs_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Ten
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+// Overlap K loads with D256 QK MMAs using a four-fragment window while Q stays in registers.
+template <typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
+          typename TiledMma, typename TiledCopyB, typename ThrCopyB, typename Hook>
+CUTLASS_DEVICE void gemm_sm80_d256_qk_prefetch4(
+        Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const &tCsB,
+        TiledMma tiled_mma, TiledCopyB smem_tiled_copy_B, ThrCopyB smem_thr_copy_B,
+        Hook fn) {
+    CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));
+    CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));
+    CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));
+    Tensor b_copy = smem_thr_copy_B.retile_D(tCrB);
+    CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(b_copy));
+    CUTE_STATIC_ASSERT_V(size<2>(tCsB) == size<2>(b_copy));
+    constexpr int NM = decltype(size<1>(tCrA))::value;
+    constexpr int NN = decltype(size<1>(tCrB))::value;
+    constexpr int NK = decltype(size<2>(tCrA))::value;
+    constexpr int Window = 4;
+    constexpr int Total = NN * NK;
+    static_assert(NM == 1 && NN == 4 && NK == 16);
+    auto load = [&](auto ij) {
+        constexpr int j = decltype(ij)::value;
+        constexpr int ik = j / NN;
+        constexpr int in = j % NN;
+        cute::copy(smem_tiled_copy_B, tCsB(_, Int<in>{}, Int<ik>{}),
+                   b_copy(_, Int<in>{}, Int<ik>{}));
+    };
+    #pragma hggc mmatiestrictly
+    {
+        for_each(make_int_sequence<Window>{}, [&](auto ij) { load(ij); });
+        __ppu_sched_bound();
+        for_each(make_int_sequence<Total>{}, [&](auto ij) {
+            constexpr int j = decltype(ij)::value;
+            constexpr int ik = j / NN;
+            constexpr int in = j % NN;
+            if constexpr (j == 0 && !std::is_same_v<Hook, std::nullptr_t>) { fn(); }
+            for_each(make_int_sequence<NM>{}, [&](auto im) {
+                cute::gemm(tiled_mma, tCrA(_, im, Int<ik>{}),
+                           tCrB(_, Int<in>{}, Int<ik>{}), acc(_, im, Int<in>{}));
+            });
+            constexpr int next = j + Window;
+            if constexpr (next < Total) {
+                load(Int<next>{});
+                __ppu_sched_bound();
+            }
+        });
+    }
+}
+
+namespace decoupled_d256_detail {
+
+enum class PvOp { Scale, Exp, Sum, Pack, Load, Mma };
+struct PvEvent { PvOp op; int a, b, c; };
+
+// Preserve the existing D256/V256 steady-step softmax/PV order. Indices are
+// compile-time constants: Scale/Exp/Sum use (row, column, reversed_add),
+// Pack uses (packed_word, row, column), and Load/Mma use (N, K, unused).
+template <bool CheckInf> struct PvSchedule;
+
+template <> struct PvSchedule<true> {
+    static constexpr PvEvent events[] = {
+        {PvOp::Scale, 0, 13, 0}, {PvOp::Scale, 0, 14, 0}, {PvOp::Scale, 0, 12, 0},
+        {PvOp::Scale, 1, 0, 0}, {PvOp::Scale, 1, 1, 0}, {PvOp::Scale, 0, 0, 0},
+        {PvOp::Scale, 0, 1, 0}, {PvOp::Scale, 0, 2, 0}, {PvOp::Exp, 1, 0, 0},
+        {PvOp::Scale, 0, 3, 0}, {PvOp::Scale, 1, 13, 0}, {PvOp::Scale, 1, 2, 0},
+        {PvOp::Exp, 1, 1, 0}, {PvOp::Scale, 1, 3, 0}, {PvOp::Scale, 0, 4, 0},
+        {PvOp::Scale, 0, 5, 0}, {PvOp::Scale, 0, 6, 0}, {PvOp::Sum, 1, 0, 0},
+        {PvOp::Scale, 0, 7, 0}, {PvOp::Scale, 1, 6, 0}, {PvOp::Scale, 1, 7, 0},
+        {PvOp::Scale, 0, 8, 0}, {PvOp::Scale, 0, 9, 0}, {PvOp::Scale, 1, 8, 0},
+        {PvOp::Scale, 1, 9, 0}, {PvOp::Scale, 1, 12, 0}, {PvOp::Scale, 1, 4, 0},
+        {PvOp::Scale, 0, 10, 0}, {PvOp::Scale, 0, 11, 0}, {PvOp::Scale, 0, 15, 0},
+        {PvOp::Scale, 1, 5, 0}, {PvOp::Scale, 1, 10, 0}, {PvOp::Scale, 1, 11, 0},
+        {PvOp::Scale, 1, 14, 0}, {PvOp::Scale, 1, 15, 0}, {PvOp::Sum, 1, 1, 1},
+        {PvOp::Pack, 1, 1, 0}, {PvOp::Load, 0, 0, 0}, {PvOp::Exp, 0, 0, 0},
+        {PvOp::Exp, 0, 1, 0}, {PvOp::Exp, 1, 2, 0}, {PvOp::Sum, 0, 0, 0},
+        {PvOp::Exp, 0, 2, 0}, {PvOp::Sum, 0, 1, 1}, {PvOp::Pack, 0, 0, 0},
+        {PvOp::Exp, 0, 3, 0}, {PvOp::Sum, 1, 2, 1}, {PvOp::Exp, 1, 3, 0},
+        {PvOp::Sum, 0, 2, 1}, {PvOp::Exp, 1, 4, 0}, {PvOp::Sum, 0, 3, 1},
+        {PvOp::Pack, 2, 0, 2}, {PvOp::Exp, 0, 4, 0}, {PvOp::Sum, 1, 3, 1},
+        {PvOp::Pack, 3, 1, 2}, {PvOp::Exp, 0, 5, 0}, {PvOp::Sum, 1, 4, 1},
+        {PvOp::Mma, 0, 0, 0}, {PvOp::Exp, 1, 5, 0}, {PvOp::Sum, 0, 4, 1},
+        {PvOp::Exp, 1, 6, 0}, {PvOp::Sum, 0, 5, 1}, {PvOp::Pack, 4, 0, 4},
+        {PvOp::Exp, 0, 7, 0}, {PvOp::Sum, 1, 5, 1}, {PvOp::Pack, 5, 1, 4},
+        {PvOp::Load, 1, 0, 0}, {PvOp::Exp, 0, 6, 0}, {PvOp::Load, 2, 0, 0},
+        {PvOp::Sum, 1, 6, 1}, {PvOp::Exp, 1, 7, 0}, {PvOp::Exp, 0, 10, 0},
+        {PvOp::Sum, 0, 6, 1}, {PvOp::Sum, 0, 7, 1}, {PvOp::Exp, 0, 11, 0},
+        {PvOp::Sum, 1, 7, 1}, {PvOp::Exp, 1, 8, 0}, {PvOp::Mma, 1, 0, 0},
+        {PvOp::Exp, 1, 9, 0}, {PvOp::Mma, 2, 0, 0}, {PvOp::Exp, 1, 10, 0},
+        {PvOp::Sum, 1, 8, 1}, {PvOp::Load, 3, 0, 0}, {PvOp::Exp, 1, 11, 0},
+        {PvOp::Sum, 1, 9, 1}, {PvOp::Load, 4, 0, 0}, {PvOp::Exp, 0, 12, 0},
+        {PvOp::Sum, 1, 10, 1}, {PvOp::Exp, 0, 13, 0}, {PvOp::Sum, 1, 11, 1},
+        {PvOp::Exp, 0, 14, 0}, {PvOp::Exp, 0, 15, 0}, {PvOp::Mma, 3, 0, 0},
+        {PvOp::Exp, 1, 13, 0}, {PvOp::Mma, 4, 0, 0}, {PvOp::Exp, 1, 15, 0},
+        {PvOp::Load, 5, 0, 0}, {PvOp::Load, 6, 0, 0}, {PvOp::Mma, 5, 0, 0},
+        {PvOp::Mma, 6, 0, 0}, {PvOp::Load, 7, 0, 0}, {PvOp::Load, 8, 0, 0},
+        {PvOp::Mma, 7, 0, 0}, {PvOp::Mma, 8, 0, 0}, {PvOp::Load, 9, 0, 0},
+        {PvOp::Load, 10, 0, 0}, {PvOp::Mma, 9, 0, 0}, {PvOp::Mma, 10, 0, 0},
+        {PvOp::Load, 11, 0, 0}, {PvOp::Load, 12, 0, 0}, {PvOp::Mma, 11, 0, 0},
+        {PvOp::Mma, 12, 0, 0}, {PvOp::Load, 13, 0, 0}, {PvOp::Load, 14, 0, 0},
+        {PvOp::Mma, 13, 0, 0}, {PvOp::Mma, 14, 0, 0}, {PvOp::Load, 15, 0, 0},
+        {PvOp::Load, 0, 1, 0}, {PvOp::Mma, 15, 0, 0}, {PvOp::Load, 1, 1, 0},
+        {PvOp::Pack, 6, 0, 6}, {PvOp::Load, 2, 1, 0}, {PvOp::Pack, 7, 1, 6},
+        {PvOp::Load, 3, 1, 0}, {PvOp::Exp, 0, 8, 0}, {PvOp::Mma, 0, 1, 0},
+        {PvOp::Exp, 0, 9, 0}, {PvOp::Exp, 1, 12, 0}, {PvOp::Sum, 0, 8, 1},
+        {PvOp::Load, 4, 1, 0}, {PvOp::Exp, 1, 14, 0}, {PvOp::Sum, 0, 9, 1},
+        {PvOp::Mma, 1, 1, 0}, {PvOp::Sum, 0, 10, 1}, {PvOp::Sum, 1, 12, 1},
+        {PvOp::Mma, 2, 1, 0}, {PvOp::Sum, 0, 11, 1}, {PvOp::Sum, 1, 13, 1},
+        {PvOp::Mma, 3, 1, 0}, {PvOp::Sum, 0, 12, 1}, {PvOp::Load, 5, 1, 0},
+        {PvOp::Sum, 0, 13, 1}, {PvOp::Sum, 1, 14, 1}, {PvOp::Load, 6, 1, 0},
+        {PvOp::Sum, 0, 14, 1}, {PvOp::Load, 7, 1, 0}, {PvOp::Sum, 0, 15, 1},
+        {PvOp::Mma, 4, 1, 0}, {PvOp::Load, 8, 1, 0}, {PvOp::Mma, 5, 1, 0},
+        {PvOp::Mma, 6, 1, 0}, {PvOp::Mma, 7, 1, 0}, {PvOp::Load, 9, 1, 0},
+        {PvOp::Load, 10, 1, 0}, {PvOp::Load, 11, 1, 0}, {PvOp::Mma, 8, 1, 0},
+        {PvOp::Load, 12, 1, 0}, {PvOp::Mma, 9, 1, 0}, {PvOp::Mma, 10, 1, 0},
+        {PvOp::Mma, 11, 1, 0}, {PvOp::Load, 13, 1, 0}, {PvOp::Load, 14, 1, 0},
+        {PvOp::Load, 15, 1, 0}, {PvOp::Mma, 12, 1, 0}, {PvOp::Load, 0, 2, 0},
+        {PvOp::Mma, 13, 1, 0}, {PvOp::Mma, 14, 1, 0}, {PvOp::Mma, 15, 1, 0},
+        {PvOp::Load, 1, 2, 0}, {PvOp::Pack, 8, 0, 8}, {PvOp::Pack, 9, 1, 8},
+        {PvOp::Pack, 10, 0, 10}, {PvOp::Load, 2, 2, 0}, {PvOp::Pack, 11, 1, 10},
+        {PvOp::Load, 3, 2, 0}, {PvOp::Sum, 1, 15, 1}, {PvOp::Mma, 0, 2, 0},
+        {PvOp::Mma, 1, 2, 0}, {PvOp::Load, 4, 2, 0}, {PvOp::Mma, 2, 2, 0},
+        {PvOp::Load, 5, 2, 0}, {PvOp::Mma, 3, 2, 0}, {PvOp::Load, 6, 2, 0},
+        {PvOp::Load, 7, 2, 0}, {PvOp::Mma, 4, 2, 0}, {PvOp::Mma, 5, 2, 0},
+        {PvOp::Load, 8, 2, 0}, {PvOp::Mma, 6, 2, 0}, {PvOp::Load, 9, 2, 0},
+        {PvOp::Mma, 7, 2, 0}, {PvOp::Load, 10, 2, 0}, {PvOp::Load, 11, 2, 0},
+        {PvOp::Mma, 8, 2, 0}, {PvOp::Mma, 9, 2, 0}, {PvOp::Load, 12, 2, 0},
+        {PvOp::Mma, 10, 2, 0}, {PvOp::Load, 13, 2, 0}, {PvOp::Mma, 11, 2, 0},
+        {PvOp::Load, 14, 2, 0}, {PvOp::Load, 15, 2, 0}, {PvOp::Mma, 12, 2, 0},
+        {PvOp::Mma, 13, 2, 0}, {PvOp::Load, 0, 3, 0}, {PvOp::Mma, 14, 2, 0},
+        {PvOp::Load, 1, 3, 0}, {PvOp::Mma, 15, 2, 0}, {PvOp::Pack, 12, 0, 12},
+        {PvOp::Pack, 13, 1, 12}, {PvOp::Pack, 14, 0, 14}, {PvOp::Load, 2, 3, 0},
+        {PvOp::Pack, 15, 1, 14}, {PvOp::Load, 3, 3, 0}, {PvOp::Load, 4, 3, 0},
+        {PvOp::Mma, 0, 3, 0}, {PvOp::Mma, 1, 3, 0}, {PvOp::Load, 5, 3, 0},
+        {PvOp::Load, 6, 3, 0}, {PvOp::Mma, 2, 3, 0}, {PvOp::Mma, 3, 3, 0},
+        {PvOp::Mma, 4, 3, 0}, {PvOp::Load, 7, 3, 0}, {PvOp::Load, 8, 3, 0},
+        {PvOp::Load, 9, 3, 0}, {PvOp::Mma, 5, 3, 0}, {PvOp::Mma, 6, 3, 0},
+        {PvOp::Load, 10, 3, 0}, {PvOp::Load, 11, 3, 0}, {PvOp::Mma, 7, 3, 0},
+        {PvOp::Mma, 8, 3, 0}, {PvOp::Mma, 9, 3, 0}, {PvOp::Load, 12, 3, 0},
+        {PvOp::Load, 13, 3, 0}, {PvOp::Load, 14, 3, 0}, {PvOp::Mma, 10, 3, 0},
+        {PvOp::Mma, 11, 3, 0}, {PvOp::Load, 15, 3, 0}, {PvOp::Mma, 12, 3, 0},
+        {PvOp::Mma, 13, 3, 0}, {PvOp::Mma, 14, 3, 0}, {PvOp::Mma, 15, 3, 0},
+    };
+};
+
+template <> struct PvSchedule<false> {
+    static constexpr PvEvent events[] = {
+        {PvOp::Scale, 0, 0, 0}, {PvOp::Scale, 0, 2, 0}, {PvOp::Scale, 0, 1, 0},
+        {PvOp::Scale, 0, 3, 0}, {PvOp::Scale, 1, 2, 0}, {PvOp::Scale, 1, 3, 0},
+        {PvOp::Scale, 0, 4, 0}, {PvOp::Scale, 0, 5, 0}, {PvOp::Scale, 0, 6, 0},
+        {PvOp::Scale, 0, 7, 0}, {PvOp::Scale, 1, 6, 0}, {PvOp::Scale, 1, 7, 0},
+        {PvOp::Scale, 0, 8, 0}, {PvOp::Scale, 0, 12, 0}, {PvOp::Scale, 0, 13, 0},
+        {PvOp::Scale, 0, 9, 0}, {PvOp::Scale, 0, 10, 0}, {PvOp::Scale, 0, 11, 0},
+        {PvOp::Scale, 0, 14, 0}, {PvOp::Scale, 0, 15, 0}, {PvOp::Scale, 1, 12, 0},
+        {PvOp::Scale, 1, 13, 0}, {PvOp::Load, 0, 0, 0}, {PvOp::Exp, 0, 0, 0},
+        {PvOp::Scale, 1, 0, 0}, {PvOp::Exp, 0, 1, 0}, {PvOp::Scale, 1, 1, 0},
+        {PvOp::Exp, 1, 0, 0}, {PvOp::Sum, 0, 0, 0}, {PvOp::Scale, 1, 4, 0},
+        {PvOp::Scale, 1, 5, 0}, {PvOp::Scale, 1, 8, 0}, {PvOp::Scale, 1, 14, 0},
+        {PvOp::Exp, 1, 1, 0}, {PvOp::Scale, 1, 9, 0}, {PvOp::Scale, 1, 10, 0},
+        {PvOp::Scale, 1, 11, 0}, {PvOp::Scale, 1, 15, 0}, {PvOp::Sum, 0, 1, 1},
+        {PvOp::Pack, 0, 0, 0}, {PvOp::Exp, 1, 2, 0}, {PvOp::Sum, 1, 0, 0},
+        {PvOp::Pack, 1, 1, 0}, {PvOp::Sum, 1, 1, 1}, {PvOp::Exp, 0, 2, 0},
+        {PvOp::Exp, 0, 3, 0}, {PvOp::Sum, 1, 2, 1}, {PvOp::Exp, 1, 3, 0},
+        {PvOp::Sum, 0, 2, 1}, {PvOp::Exp, 0, 6, 0}, {PvOp::Sum, 0, 3, 1},
+        {PvOp::Pack, 2, 0, 2}, {PvOp::Exp, 0, 7, 0}, {PvOp::Pack, 3, 1, 2},
+        {PvOp::Load, 1, 0, 0}, {PvOp::Sum, 1, 3, 1}, {PvOp::Exp, 1, 4, 0},
+        {PvOp::Mma, 0, 0, 0}, {PvOp::Exp, 0, 4, 0}, {PvOp::Exp, 0, 5, 0},
+        {PvOp::Sum, 1, 4, 1}, {PvOp::Load, 2, 0, 0}, {PvOp::Exp, 1, 5, 0},
+        {PvOp::Exp, 1, 6, 0}, {PvOp::Mma, 1, 0, 0}, {PvOp::Exp, 1, 7, 0},
+        {PvOp::Exp, 0, 9, 0}, {PvOp::Load, 3, 0, 0}, {PvOp::Exp, 0, 10, 0},
+        {PvOp::Mma, 2, 0, 0}, {PvOp::Exp, 0, 11, 0}, {PvOp::Exp, 1, 10, 0},
+        {PvOp::Load, 4, 0, 0}, {PvOp::Exp, 1, 8, 0}, {PvOp::Sum, 1, 5, 1},
+        {PvOp::Exp, 1, 9, 0}, {PvOp::Mma, 3, 0, 0}, {PvOp::Exp, 1, 11, 0},
+        {PvOp::Exp, 0, 12, 0}, {PvOp::Load, 5, 0, 0}, {PvOp::Exp, 0, 14, 0},
+        {PvOp::Mma, 4, 0, 0}, {PvOp::Exp, 0, 15, 0}, {PvOp::Exp, 1, 12, 0},
+        {PvOp::Load, 6, 0, 0}, {PvOp::Exp, 1, 13, 0}, {PvOp::Exp, 1, 14, 0},
+        {PvOp::Mma, 5, 0, 0}, {PvOp::Exp, 1, 15, 0}, {PvOp::Load, 7, 0, 0},
+        {PvOp::Mma, 6, 0, 0}, {PvOp::Load, 8, 0, 0}, {PvOp::Mma, 7, 0, 0},
+        {PvOp::Load, 9, 0, 0}, {PvOp::Mma, 8, 0, 0}, {PvOp::Load, 10, 0, 0},
+        {PvOp::Mma, 9, 0, 0}, {PvOp::Load, 11, 0, 0}, {PvOp::Mma, 10, 0, 0},
+        {PvOp::Load, 12, 0, 0}, {PvOp::Mma, 11, 0, 0}, {PvOp::Load, 13, 0, 0},
+        {PvOp::Mma, 12, 0, 0}, {PvOp::Load, 14, 0, 0}, {PvOp::Mma, 13, 0, 0},
+        {PvOp::Load, 15, 0, 0}, {PvOp::Mma, 14, 0, 0}, {PvOp::Load, 0, 1, 0},
+        {PvOp::Mma, 15, 0, 0}, {PvOp::Load, 1, 1, 0}, {PvOp::Pack, 4, 0, 4},
+        {PvOp::Pack, 5, 1, 4}, {PvOp::Pack, 6, 0, 6}, {PvOp::Pack, 7, 1, 6},
+        {PvOp::Sum, 0, 4, 1}, {PvOp::Load, 2, 1, 0}, {PvOp::Sum, 0, 5, 1},
+        {PvOp::Sum, 1, 6, 1}, {PvOp::Mma, 0, 1, 0}, {PvOp::Exp, 0, 8, 0},
+        {PvOp::Sum, 0, 6, 1}, {PvOp::Sum, 1, 7, 1}, {PvOp::Sum, 0, 7, 1},
+        {PvOp::Exp, 0, 13, 0}, {PvOp::Load, 3, 1, 0}, {PvOp::Sum, 0, 8, 1},
+        {PvOp::Mma, 1, 1, 0}, {PvOp::Sum, 0, 9, 1}, {PvOp::Sum, 0, 10, 1},
+        {PvOp::Sum, 0, 11, 1}, {PvOp::Mma, 2, 1, 0}, {PvOp::Sum, 0, 12, 1},
+        {PvOp::Load, 4, 1, 0}, {PvOp::Sum, 0, 13, 1}, {PvOp::Sum, 0, 14, 1},
+        {PvOp::Load, 5, 1, 0}, {PvOp::Mma, 3, 1, 0}, {PvOp::Load, 6, 1, 0},
+        {PvOp::Mma, 4, 1, 0}, {PvOp::Mma, 5, 1, 0}, {PvOp::Load, 7, 1, 0},
+        {PvOp::Load, 8, 1, 0}, {PvOp::Mma, 6, 1, 0}, {PvOp::Load, 9, 1, 0},
+        {PvOp::Mma, 7, 1, 0}, {PvOp::Mma, 8, 1, 0}, {PvOp::Load, 10, 1, 0},
+        {PvOp::Load, 11, 1, 0}, {PvOp::Mma, 9, 1, 0}, {PvOp::Load, 12, 1, 0},
+        {PvOp::Mma, 10, 1, 0}, {PvOp::Mma, 11, 1, 0}, {PvOp::Load, 13, 1, 0},
+        {PvOp::Load, 14, 1, 0}, {PvOp::Mma, 12, 1, 0}, {PvOp::Load, 15, 1, 0},
+        {PvOp::Mma, 13, 1, 0}, {PvOp::Mma, 14, 1, 0}, {PvOp::Load, 0, 2, 0},
+        {PvOp::Mma, 15, 1, 0}, {PvOp::Load, 1, 2, 0}, {PvOp::Pack, 8, 0, 8},
+        {PvOp::Load, 2, 2, 0}, {PvOp::Pack, 9, 1, 8}, {PvOp::Pack, 10, 0, 10},
+        {PvOp::Pack, 11, 1, 10}, {PvOp::Sum, 1, 8, 1}, {PvOp::Sum, 1, 9, 1},
+        {PvOp::Mma, 0, 2, 0}, {PvOp::Sum, 1, 10, 1}, {PvOp::Sum, 1, 11, 1},
+        {PvOp::Sum, 1, 12, 1}, {PvOp::Sum, 1, 13, 1}, {PvOp::Load, 3, 2, 0},
+        {PvOp::Sum, 1, 14, 1}, {PvOp::Mma, 1, 2, 0}, {PvOp::Mma, 2, 2, 0},
+        {PvOp::Load, 4, 2, 0}, {PvOp::Load, 5, 2, 0}, {PvOp::Mma, 3, 2, 0},
+        {PvOp::Load, 6, 2, 0}, {PvOp::Mma, 4, 2, 0}, {PvOp::Mma, 5, 2, 0},
+        {PvOp::Load, 7, 2, 0}, {PvOp::Load, 8, 2, 0}, {PvOp::Mma, 6, 2, 0},
+        {PvOp::Load, 9, 2, 0}, {PvOp::Mma, 7, 2, 0}, {PvOp::Mma, 8, 2, 0},
+        {PvOp::Load, 10, 2, 0}, {PvOp::Load, 11, 2, 0}, {PvOp::Mma, 9, 2, 0},
+        {PvOp::Load, 12, 2, 0}, {PvOp::Mma, 10, 2, 0}, {PvOp::Mma, 11, 2, 0},
+        {PvOp::Load, 13, 2, 0}, {PvOp::Load, 14, 2, 0}, {PvOp::Mma, 12, 2, 0},
+        {PvOp::Load, 15, 2, 0}, {PvOp::Mma, 13, 2, 0}, {PvOp::Mma, 14, 2, 0},
+        {PvOp::Load, 0, 3, 0}, {PvOp::Load, 1, 3, 0}, {PvOp::Mma, 15, 2, 0},
+        {PvOp::Load, 2, 3, 0}, {PvOp::Pack, 12, 0, 12}, {PvOp::Load, 3, 3, 0},
+        {PvOp::Pack, 13, 1, 12}, {PvOp::Pack, 14, 0, 14}, {PvOp::Pack, 15, 1, 14},
+        {PvOp::Mma, 0, 3, 0}, {PvOp::Mma, 1, 3, 0}, {PvOp::Mma, 2, 3, 0},
+        {PvOp::Load, 4, 3, 0}, {PvOp::Mma, 3, 3, 0}, {PvOp::Load, 5, 3, 0},
+        {PvOp::Load, 6, 3, 0}, {PvOp::Load, 7, 3, 0}, {PvOp::Mma, 4, 3, 0},
+        {PvOp::Mma, 5, 3, 0}, {PvOp::Mma, 6, 3, 0}, {PvOp::Load, 8, 3, 0},
+        {PvOp::Mma, 7, 3, 0}, {PvOp::Load, 9, 3, 0}, {PvOp::Load, 10, 3, 0},
+        {PvOp::Load, 11, 3, 0}, {PvOp::Load, 12, 3, 0}, {PvOp::Mma, 8, 3, 0},
+        {PvOp::Mma, 9, 3, 0}, {PvOp::Mma, 10, 3, 0}, {PvOp::Load, 13, 3, 0},
+        {PvOp::Mma, 11, 3, 0}, {PvOp::Load, 14, 3, 0}, {PvOp::Mma, 12, 3, 0},
+        {PvOp::Load, 15, 3, 0}, {PvOp::Sum, 0, 15, 1}, {PvOp::Sum, 1, 15, 1},
+        {PvOp::Mma, 13, 3, 0}, {PvOp::Mma, 14, 3, 0}, {PvOp::Mma, 15, 3, 0},
+    };
+};
+
+// Verify the PV MMA order required to safely reuse slots in the V register window.
+template <bool Check_inf>
+constexpr bool pv_mmas_are_linear() {
+    int ordinal = 0;
+    for (auto const& event : PvSchedule<Check_inf>::events) {
+        if (event.op == PvOp::Mma && event.b * 16 + event.a != ordinal++) {
+            return false;
+        }
+    }
+    return ordinal == 64;
+}
+static_assert(pv_mmas_are_linear<true>() && pv_mmas_are_linear<false>(),
+              "D256 V ring requires PV MMA ordinals 0..63 in order");
+
+// Preserve the tuned D256/V256 steady-state softmax and PV order with the shared V prefetch loop.
+template <bool Check_inf, typename TensorS, typename SoftmaxT, typename TensorP,
+          typename PrefillV, typename MmaStep>
+CUTLASS_DEVICE void run_pv_schedule(
+        TensorS &acc_s, SoftmaxT &softmax, TensorP &P,
+        PrefillV const& prefill_v, MmaStep const& mma_step) {
+    auto rc = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+    static_assert(decltype(size(acc_s))::value == 32);
+    static_assert(decltype(size<0>(rc))::value == 2 && decltype(size<1>(rc))::value == 16);
+    static_assert(decltype(size<1>(P))::value == 1 && decltype(size<2>(P))::value == 4);
+    auto packed_p = recast<cutlass::Array<cutlass::bfloat16_t, 2>>(P);
+    static_assert(decltype(size(packed_p))::value == 16);
+    cutlass::NumericArrayConverter<cutlass::bfloat16_t, float, 2> convert_pair;
+    float const max_scaled[2] = {
+        Check_inf && softmax.row_max(0) == -INFINITY ? 0.f : softmax.row_max(0) * softmax.softmax_scale_log2,
+        Check_inf && softmax.row_max(1) == -INFINITY ? 0.f : softmax.row_max(1) * softmax.softmax_scale_log2};
+    float sum0 = softmax.row_sum(0), sum1 = softmax.row_sum(1);
+    constexpr int Count = sizeof(PvSchedule<Check_inf>::events) / sizeof(PvEvent);
+    static_assert(Count == 240, "D256/V256 PV schedule must be complete");
+    #pragma hggc mmatiestrictly
+    {
+        for_each(make_int_sequence<Count>{}, [&](auto index) {
+            constexpr PvEvent e = PvSchedule<Check_inf>::events[decltype(index)::value];
+            if constexpr (e.op == PvOp::Scale) {
+                rc(Int<e.a>{}, Int<e.b>{}) = fmaf(rc(Int<e.a>{}, Int<e.b>{}),
+                    softmax.softmax_scale_log2, -max_scaled[e.a]);
+            } else if constexpr (e.op == PvOp::Exp) {
+                rc(Int<e.a>{}, Int<e.b>{}) = exp2f(rc(Int<e.a>{}, Int<e.b>{}));
+            } else if constexpr (e.op == PvOp::Sum) {
+                float &sum = e.a == 0 ? sum0 : sum1;
+                if constexpr (e.c == 0) {
+                    asm volatile("ppu.add.f32 %0, %1, %2;\n" : "=f"(sum)
+                        : "f"(sum), "f"(rc(Int<e.a>{}, Int<e.b>{})));
+                } else {
+                    asm volatile("ppu.add.f32 %0, %1, %2;\n" : "=f"(sum)
+                        : "f"(rc(Int<e.a>{}, Int<e.b>{})), "f"(sum));
+                }
+            } else if constexpr (e.op == PvOp::Pack) {
+                cutlass::Array<float, 2> pair;
+                pair[0] = rc(Int<e.b>{}, Int<e.c>{});
+                pair[1] = rc(Int<e.b>{}, Int<e.c + 1>{});
+                packed_p.data()[e.a] = convert_pair(pair);
+            } else if constexpr (e.op == PvOp::Load) {
+                // The first original load marks V-read readiness. Preload the
+                // window there; later refills follow each MMA.
+                if constexpr (e.a == 0 && e.b == 0) { prefill_v(); }
+            } else if constexpr (e.op == PvOp::Mma) {
+                if constexpr (e.a == 0 && (e.b == 0 || e.b == 2)) {
+                    // Keep both running sums as explicit machine inputs
+                    // before this PV slice, preserving their reduction order.
+                    auto p_bits = cute::recast<uint32_t>(P);
+                    static_assert(decltype(size<0>(p_bits))::value == 4);
+                    // PPU LUT 0xf0 selects P bit for bit; both sum inputs
+                    // retain the dependency without changing P.
+                    asm volatile("ppu.lop3.b32 %0, %1, %2, %3, %4;\n"
+                        : "=r"(p_bits(_0{}, _0{}, Int<e.b>{}))
+                        : "r"(p_bits(_0{}, _0{}, Int<e.b>{})),
+                          "r"(__float_as_uint(sum0)), "r"(__float_as_uint(sum1)), "n"(0xf0));
+                }
+                mma_step(Int<e.b * 16 + e.a>{});
+            }
+            __ppu_sched_bound();
+        });
+    }
+    softmax.row_sum(0) = sum0;
+    softmax.row_sum(1) = sum1;
+}
+
+} // namespace decoupled_d256_detail
+
+// Stream V fragments as PV consumes them to limit register pressure.
+// VSourceN is the AIU page height for paged V and the tile height otherwise.
+// A zero window uses one K16 slice at a time. A positive window reuses V atoms.
+template <int BlockN, int VSourceN, int BlockKSmem, int HeadDimV, int VWindow,
+          bool Scheduled, bool Check_inf, typename TensorS, typename SoftmaxT,
+          typename TensorP, typename TensorV, typename TensorCsV, typename TensorO,
+          typename TiledMma, typename TiledCopy, typename ThrCopy>
+CUTLASS_DEVICE void gemm_rs_sm80_decoupled(
+        TensorS &acc_s, SoftmaxT &softmax, TensorP &P, TensorV &V,
+        TensorCsV const &CsV, TensorO &acc, TiledMma tiled_mma,
+        TiledCopy smem_tiled_copy, ThrCopy smem_thr_copy) {
+    constexpr int NN = decltype(size<1>(V))::value;
+    constexpr int NK = decltype(size<2>(P))::value;
+    constexpr bool CrossPage = VSourceN != BlockN;
+    constexpr int KAtomsPerPage = VSourceN / 16;
+    constexpr int NAtomsPerCube = BlockKSmem / 16;
+    static_assert(BlockN % VSourceN == 0 && VSourceN % 16 == 0 && NK == BlockN / 16);
+    static_assert(BlockKSmem % 16 == 0 && HeadDimV % BlockKSmem == 0 && NN == HeadDimV / 16);
+    static_assert(!Scheduled || (!CrossPage && NN == 16 && NK == 4 && VWindow == 4));
+    CUTE_STATIC_ASSERT_V(size<1>(P) == size<1>(acc));
+    CUTE_STATIC_ASSERT_V(size<1>(V) == size<2>(acc));
+    CUTE_STATIC_ASSERT_V(size<2>(P) == size<2>(V));
+
+    auto v_source = [&](auto nn, auto kk, auto page, auto cube) {
+        if constexpr (CrossPage) {
+            auto view = make_tensor(CsV.data() + page * (VSourceN * BlockKSmem)
+                + cube * (BlockN * BlockKSmem), CsV.layout());
+            return view(_, nn, kk);
+        } else {
+            return CsV(_, nn, kk);
+        }
+    };
+
+    if constexpr (VWindow == 0) {
+        auto v_copy = smem_thr_copy.retile_D(V);
+        #pragma hggc mmatiestrictly
+        {
+            #pragma unroll
+            for (int page = 0; page < BlockN / VSourceN; ++page) {
+                #pragma unroll
+                for (int k = 0; k < KAtomsPerPage; ++k) {
+                    int const kk = page * KAtomsPerPage + k;
+                    if constexpr (CrossPage) {
+                        #pragma unroll
+                        for (int nn = 0; nn < NN; ++nn) {
+                            cute::copy(smem_tiled_copy,
+                                v_source(nn % NAtomsPerCube, k, page, nn / NAtomsPerCube),
+                                v_copy(_, nn, kk));
+                        }
+                    } else {
+                        CUTE_STATIC_ASSERT_V(size<1>(CsV) == size<1>(v_copy));
+                        cute::copy(smem_tiled_copy, v_source(_, k, page, 0), v_copy(_, _, kk));
+                    }
+                    cute::gemm(tiled_mma, P(_, _, kk), V(_, _, kk), acc);
+                }
+            }
+        }
+    } else {
+        static_assert(VWindow > 0 && VWindow <= NN * NK);
+        CUTE_STATIC_ASSERT_V(size<1>(P) == _1{});
+        using ElementV = typename TensorV::value_type;
+        Tensor v_storage = make_tensor<ElementV>(make_shape(shape<0>(V), Int<VWindow>{}, _1{}));
+        auto v_copy = smem_thr_copy.retile_D(v_storage);
+        auto v_copy_reference = smem_thr_copy.retile_D(V);
+        CUTE_STATIC_ASSERT_V(size(v_storage) == Int<8 * VWindow>{});
+        CUTE_STATIC_ASSERT_V(size<1>(v_copy) == Int<VWindow>{});
+        CUTE_STATIC_ASSERT_V(size<2>(v_copy) == _1{});
+        CUTE_STATIC_ASSERT_V(v_copy(_, _0{}, _0{}).layout() == v_copy_reference(_, _0{}, _0{}).layout());
+        auto load_v = [&](auto ordinal) {
+            constexpr int ord = decltype(ordinal)::value;
+            constexpr int kk = ord / NN;
+            constexpr int nn = ord % NN;
+            auto src = [&] {
+                if constexpr (CrossPage) {
+                    return v_source(Int<nn % NAtomsPerCube>{}, Int<kk % KAtomsPerPage>{},
+                                    Int<kk / KAtomsPerPage>{}, Int<nn / NAtomsPerCube>{});
+                } else {
+                    return v_source(Int<nn>{}, Int<kk>{}, _0{}, _0{});
+                }
+            }();
+            cute::copy(smem_tiled_copy, src, v_copy(_, Int<ord % VWindow>{}, _0{}));
+        };
+        auto prefill_v = [&] { for_each(make_int_sequence<VWindow>{}, load_v); };
+        #pragma hggc mmatiestrictly
+        {
+            auto mma_step = [&](auto ordinal) {
+                constexpr int ord = decltype(ordinal)::value;
+                cute::gemm(tiled_mma, P(_, _0{}, Int<ord / NN>{}),
+                    v_storage(_, Int<ord % VWindow>{}, _0{}), acc(_, _0{}, Int<ord % NN>{}));
+                if constexpr (ord + VWindow < NN * NK) { load_v(Int<ord + VWindow>{}); }
+            };
+            if constexpr (Scheduled) {
+                decoupled_d256_detail::run_pv_schedule<Check_inf>(acc_s, softmax, P, prefill_v, mma_step);
+            } else {
+                prefill_v();
+                for_each(make_int_sequence<NN * NK>{}, mma_step);
+            }
+        }
+    }
+}
+
+#endif
+
 #ifdef USE_PPU
 template<int kBlockN, int kBlockNPagedPerAiuLoad, int kHeadDim, int kBlockKSmem,
          typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
