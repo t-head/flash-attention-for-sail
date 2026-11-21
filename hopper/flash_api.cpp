@@ -1047,6 +1047,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 #endif // FA3_HLLM_BUILD
         , std::optional<at::Tensor> s_aux_ = {} // (h)
         , bool qsa_allow_aiu = false
+        , bool deterministic = false
         ) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm8x = dprops->major >= 8;
@@ -1102,6 +1103,10 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     // contract); it is meaningless for a dense per-page table and must not be passed there.
     TORCH_CHECK(!qsa_allow_aiu || qsa_page_table,
                 "qsa_allow_aiu is only meaningful for a QSA page_table (total_q, 1, topk)");
+    TORCH_CHECK(!deterministic || qsa_page_table,
+                "deterministic KV-cache attention requires a QSA page_table");
+    bool const deterministic_qsa = qsa_page_table && (deterministic || at::globalContext().deterministicAlgorithms());
+    if (deterministic_qsa && num_splits <= 0) { num_splits = 1; }
 
     at::Tensor cu_seqlens_q;
     bool const is_varlen_q = cu_seqlens_q_.has_value();
@@ -1347,6 +1352,13 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         TORCH_CHECK(workspace_ptr != nullptr, "workspace_ptr can't be nullptr in fa3 hllm build");
     }
 #endif // FA3_HLLM_BUILD
+
+    if (deterministic_qsa && seqused_q_.has_value()) {
+        // The kernel skips padded query rows. Preserve a caller-provided output;
+        // define those rows when we allocated the result ourselves.
+        if (!out_.has_value()) { out.zero_(); }
+        softmax_lse.fill_(-std::numeric_limits<float>::infinity());
+    }
 
     Flash_fwd_params params;
     set_params_fprop(params,
@@ -1759,6 +1771,12 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         }
 #endif // FA3_HLLM_BUILD
 
+        // An empty split writes only its LSE. The partials are exposed to callers,
+        // so give every slot a defined value before the split kernels run.
+        if (deterministic_qsa) {
+            out_accum.zero_();
+            softmax_lse_accum.fill_(-std::numeric_limits<float>::infinity());
+        }
         params.is_fp32 = false;
         params.oaccum_ptr = out_accum.data_ptr();
         params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
@@ -2374,8 +2392,6 @@ mha_qsa_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at::Tensor v,
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA) && !defined(FLASHATTENTION_DISABLE_BACKWARD) && !defined(FLASHATTENTION_DISABLE_HDIM256) && !defined(FLASHATTENTION_DISABLE_SM8x) && !defined(FA3_HLLM_BUILD)
     CHECK_DEVICE(q);
     const at::cuda::CUDAGuard device_guard(q.device());
-    TORCH_CHECK(!deterministic && !at::globalContext().deterministicAlgorithms(),
-                "QSA backward uses nondeterministic FP32 atomic accumulation");
     auto dprops = at::cuda::getCurrentDeviceProperties();
     const int arch = dprops->major * 10 + dprops->minor;
     TORCH_CHECK(arch == 80 || arch == 89, "QSA backward requires PPU0010 or PPU0015");
@@ -2478,15 +2494,58 @@ mha_qsa_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at::Tensor v,
     params.scale_softmax = scale;
     params.is_bf16 = dtype == at::kBFloat16;
     params.is_qsa = true;
+    params.deterministic = deterministic || at::globalContext().deterministicAlgorithms();
     params.arch = arch;
+    params.num_sm = dprops->multiProcessorCount;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     auto error = at::zeros({}, q.options().dtype(at::kInt));
-    validate_qsa_bwd(params, error.data_ptr<int>(), stream);
+    // Snapshot the launch policy before validation so its result applies to exactly this call.
+    int const candidate_planes = params.deterministic ? qsa_deterministic_kv_planes(params) : 0;
+    validate_qsa_bwd(params, error.data_ptr<int>(), candidate_planes > 0, stream);
     const int invalid = error.item<int>();
     TORCH_CHECK(!(invalid & 1), "QSA backward indices must be nonnegative and within the physical KV pool");
     TORCH_CHECK(!(invalid & 2), "QSA backward cu_seqlens_q offsets or max_seqlen_q are invalid");
     TORCH_CHECK(!(invalid & 4), "QSA backward cache lengths must be nonnegative");
-    run_qsa_bwd(params, stream);
+    // A zero validation word doubles as the persistent scheduler counter. A
+    // nonfinite operand (bit 3) selects the single-query grid-stride fallback.
+    params.tile_count_semaphore = invalid == 0 ? error.data_ptr<int>() : nullptr;
+    int const planes = invalid == 0 ? candidate_planes : 0;
+    if (planes > 0) {
+        auto dk_planes = at::zeros({planes, k.numel()}, q.options().dtype(at::kFloat));
+        auto dv_planes = at::zeros_like(dk_planes);
+        run_qsa_bwd_planes(params, planes, dk_planes.data_ptr<float>(), dv_planes.data_ptr<float>(), stream);
+    } else if (params.deterministic) {
+        // Bound temporary FP32 gradients independently of sequence length and KV pool size.
+        constexpr int cols = QsaBackwardTileBatch::kCols;
+        constexpr int max_tiles = 512;
+        int64_t const tiles_per_row = (indices.size(2) + cols - 1) / cols;
+        int64_t const kv_rows = q.size(0) * k.size(2);
+        TORCH_CHECK(tiles_per_row == 0 || kv_rows <= INT64_MAX / tiles_per_row,
+                    "QSA backward tile count exceeds int64 range");
+        int64_t const total_tiles = kv_rows * tiles_per_row;
+        int const capacity = std::min<int64_t>(max_tiles, total_tiles);
+        if (capacity) {
+            int const group = params.h / params.h_k;
+            auto q_partials = at::empty({capacity, group, 256}, q.options().dtype(at::kFloat));
+            auto k_partials = at::empty({capacity, cols, 256}, q.options().dtype(at::kFloat));
+            auto v_partials = at::empty_like(k_partials);
+            auto keys = at::empty({capacity * cols}, q.options().dtype(at::kLong));
+            for (int64_t first = 0; first < total_tiles; ) {
+                int const count = std::min<int64_t>(capacity, total_tiles - first);
+                QsaBackwardTileBatch batch{first, count, keys.data_ptr<int64_t>(), q_partials.data_ptr<float>(),
+                                           k_partials.data_ptr<float>(), v_partials.data_ptr<float>()};
+                compute_qsa_bwd_tiles(params, batch, stream);
+                // Equal physical destinations retain their original (query, slot) order,
+                // including repeated page-table entries within a single query.
+                auto [sorted, order] = at::sort(keys.narrow(0, 0, count * cols), std::optional<bool>(true), 0);
+                reduce_qsa_bwd_tiles(params, batch, sorted.data_ptr<int64_t>(), order.data_ptr<int64_t>(), stream);
+                first += count;
+            }
+        }
+    } else {
+        run_qsa_bwd(params, stream);
+    }
+    convert_qsa_bwd(params, stream);
     return {dq, dk, dv};
 #else
     TORCH_CHECK(false, "This build does not support PPU QSA backward");
@@ -2785,7 +2844,8 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "bool? pack_gqa = None,"
         "int sm_margin = 0,"
         "Tensor? s_aux = None,"
-        "bool qsa_allow_aiu = False) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "bool qsa_allow_aiu = False,"
+        "bool deterministic = False) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"

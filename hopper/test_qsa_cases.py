@@ -301,7 +301,7 @@ def main():
 # ---------------------------------------------------------------------------
 
 def _fwd_direct(q, k, v, page_table_3d, cu_seqlens_q, seqused_k, max_seqlen_q,
-                causal=True, num_splits=1, pack_gqa=True, out=None):
+                causal=True, num_splits=1, pack_gqa=True, out=None, deterministic=False):
     """Call the C++ fwd op directly, bypassing flash_attn_with_kvcache."""
     import flash_attn_3._C
     scale = q.shape[-1] ** -0.5
@@ -318,7 +318,7 @@ def _fwd_direct(q, k, v, page_table_3d, cu_seqlens_q, seqused_k, max_seqlen_q,
         scale,                                     # softmax_scale
         causal, -1, -1, 0, 0.0, True,             # causal, window, chunk, softcap, rot_interl
         None, num_splits, pack_gqa, 0,             # scheduler, splits, pack_gqa, sm_margin
-        None, False,                               # s_aux, qsa_allow_aiu
+        None, False, deterministic,                # s_aux, qsa_allow_aiu, deterministic
     )
 
 
@@ -1123,37 +1123,145 @@ def test_qsa_backward_rejects_unsupported_training(dtype, variant):
         torch.autograd.grad(out, (q, k, v), dout)
 
 
+@contextmanager
+def _qsa_deterministic_algorithms(enabled):
+    previous = torch.get_deterministic_debug_mode()
+    try:
+        torch.use_deterministic_algorithms(enabled)
+        yield
+    finally:
+        torch.set_deterministic_debug_mode(previous)
+
+
+def _assert_bitwise_equal(actual, expected):
+    # Preserve signed zeros and the bit patterns of FP16, BF16 and FP32 alike.
+    assert torch.equal(actual.detach().contiguous().view(torch.uint8),
+                       expected.detach().contiguous().view(torch.uint8))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="QSA requires a CUDA-compatible device")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-def test_qsa_backward_rejects_native_deterministic(dtype):
-    case = QsaBackwardCase("deterministic", 3, 2, 129)
+@pytest.mark.parametrize("case,dtype", [
+    (QsaBackwardCase("det-causal", 3, 2, 129, causal=True, cache=(1, 0, 128),
+                     splits=2, layout="kv", strided_qdo=True), torch.bfloat16),
+    (QsaBackwardCase("det-noncausal", 17, 1, 257, cache=(0, 0, 1),
+                     splits=0, layout="v"), torch.float16),
+], ids=["bf16-causal-split2", "fp16-noncausal-auto"])
+def test_qsa_backward_deterministic(case, dtype):
+    """Fixed inputs, repeated physical indices within/across rows, and strided operands."""
+    interface = _qsa_training_interface()
     q, k, v, dout, indices, cu, cache = _qsa_backward_inputs(case, dtype)
-    out, lse = torch.zeros_like(q), torch.zeros(q.shape[1], q.shape[0], device=q.device)
-    with pytest.raises(RuntimeError, match=r"(?i)deterministic"):
-        _qsa_native_backward(dout, q, k, v, out, lse, indices, cu, cache=cache, deterministic=True)
+    oracle, _, valid, ref_grads = _qsa_reference_gradients(q, k, v, dout, indices, cu, cache, case, torch.float32)
+    lowp, _, _, lowp_grads = _qsa_reference_gradients(q, k, v, dout, indices, cu, cache, case, dtype)
+    kwargs = dict(page_table=indices, cu_seqlens_q=cu, max_seqlen_q=3, cache_seqlens=cache,
+                  softmax_scale=case.scale, causal=case.causal, num_splits=case.splits,
+                  pack_gqa=True, return_softmax_lse=True)
+    first = None
+    for global_mode in (False, True, False):
+        explicit = {} if global_mode else {"deterministic": True}
+        with _qsa_deterministic_algorithms(global_mode):
+            with torch.no_grad():
+                inference = interface.flash_attn_with_kvcache(q, k, v, **kwargs, **explicit)
+                direct = _fwd_direct(q, k, v, indices, cu, cache, 3, causal=case.causal,
+                                     num_splits=case.splits, deterministic=not global_mode)
+            outputs = interface.flash_attn_with_kvcache(q, k, v, **kwargs, **explicit)
+            out, lse = outputs[:2]
+            native = _qsa_native_backward(dout, q, k, v, out, lse, indices, cu, cache=cache,
+                                          scale=case.scale, causal=case.causal, deterministic=not global_mode)
+        # A global request active during forward must survive a later mode change.
+        with _qsa_deterministic_algorithms(False):
+            grads = torch.autograd.grad(out, (q, k, v), dout)
+        assert (outputs[2].numel() > 0) == (case.splits > 1)
+        for actual, expected in zip((*outputs, *grads), (*inference, *native)):
+            _assert_bitwise_equal(actual, expected)
+        for actual, expected in zip(outputs, direct):
+            if expected is None:
+                assert actual.numel() == 0
+            else:
+                _assert_bitwise_equal(actual, expected)
+        if first is None:
+            _qsa_check_error(out, oracle, lowp, dtype, case.name)
+            _qsa_check_gradients(grads, ref_grads, lowp_grads, (q, k, v), indices, valid, dtype, case.name)
+            first = (*[x.detach() for x in outputs], *grads)
+        else:
+            for actual, expected in zip((*outputs, *grads), first):
+                _assert_bitwise_equal(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="QSA requires a CUDA-compatible device")
+def test_qsa_backward_deterministic_high_contention():
+    """All query rows target one dV address; cancellation exposes FP32 summation order."""
+    rows = 1023
+    device, dtype = "cuda", torch.float16
+    q = torch.zeros(rows, 1, 256, device=device, dtype=dtype)
+    k = torch.zeros(1, 16, 1, 256, device=device, dtype=dtype)
+    v, out = torch.zeros_like(k), torch.zeros_like(q)
+    lse = torch.zeros(1, rows, device=device)
+    indices = torch.zeros(rows, 1, 1, device=device, dtype=torch.int32)
+    cu = torch.arange(rows + 1, device=device, dtype=torch.int32)
+    dout = torch.ones_like(q)
+    for offset, value in enumerate((16384.0, 2.0 ** -12, -16384.0)):
+        dout[offset::3, :, 0] = value
+    first = None
+    for invocation in range(5):
+        with _qsa_deterministic_algorithms(invocation % 2 == 1):
+            dq, dk, dv = _qsa_native_backward(dout, q, k, v, out, lse, indices, cu, 1,
+                                              deterministic=invocation % 2 == 0)
+        assert torch.count_nonzero(dq).item() == 0 and torch.count_nonzero(dk).item() == 0
+        assert (dv[0, 0, 0, 1:] == rows).all() and torch.count_nonzero(dv[0, 1:]).item() == 0
+        assert torch.isfinite(dv[0, 0, 0, 0])
+        if first is None:
+            first = dv
+        else:
+            _assert_bitwise_equal(dv, first)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="QSA requires a CUDA-compatible device")
+def test_qsa_backward_deterministic_workspace_boundary():
+    # 90 queries x 2 KV heads x 3 sparse tiles cross the 512-tile scratch
+    # boundary inside one dQ row. Shared physical pages also span both batches.
+    dtype = torch.bfloat16
+    case = QsaBackwardCase("workspace-boundary", 3, 2, 191, scale=0.13)
+    q, k, v, dout, indices, _, _ = _qsa_backward_inputs(case, dtype)
+    q = q.detach().repeat(18, 1, 1).requires_grad_()
+    dout = dout.repeat(18, 1, 1)
+    indices = indices.repeat(18, 1, 1)
+    cu = torch.arange(q.shape[0] + 1, device=q.device, dtype=torch.int32)
+    out, lse, _, ref = _qsa_reference_gradients(q, k, v, dout, indices, cu, None, case, torch.float32)
+    first = None
+    for _ in range(2):
+        grads = _qsa_native_backward(dout, q, k, v, out.to(dtype), lse, indices, cu, 1,
+                                     scale=case.scale, deterministic=True)
+        for actual, expected in zip(grads, ref):
+            assert (actual.float() - expected).norm() < 0.02 * expected.norm()
+        if first is not None:
+            for actual, expected in zip(grads, first):
+                _assert_bitwise_equal(actual, expected)
+        first = grads
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="QSA requires a CUDA-compatible device")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-def test_qsa_backward_python_fake_opcheck_and_arity(dtype):
+@pytest.mark.parametrize("deterministic", [False, True], ids=["fast", "deterministic"])
+def test_qsa_backward_python_fake_opcheck_and_arity(dtype, deterministic):
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     interface = _qsa_training_interface()
     case = QsaBackwardCase("fake-arity", 3, 2, 129, causal=True, cache=(1, 0, 2), layout="kv")
     q, k, v, dout, indices, cu, cache = _qsa_backward_inputs(case, dtype)
+    splits = 0 if deterministic else 1
     schema = torch.ops.flash_attn_3.qsa_bwd.default._schema
     assert len(schema.arguments) == 13 and len(schema.returns) == 3
     torch.library.opcheck(
         interface._flash_attn_forward, (q, k, v),
         dict(page_table=indices, cu_seqlens_q=cu, max_seqlen_q=3, seqused_k=cache,
-             causal=True, num_splits=1, pack_gqa=True),
+             causal=True, num_splits=splits, pack_gqa=True, deterministic=deterministic),
         test_utils=("test_schema", "test_faketensor"))
     mode = FakeTensorMode()
     with mode:
         fq, fk, fv, fdout, findices, fcu, fcache = [
             mode.from_tensor(x) for x in (q, k, v, dout, indices, cu, cache)]
         kwargs = dict(page_table=findices, cu_seqlens_q=fcu, max_seqlen_q=3,
-                      cache_seqlens=fcache, causal=True, num_splits=1, pack_gqa=True)
+                      cache_seqlens=fcache, causal=True, num_splits=splits, pack_gqa=True, deterministic=deterministic)
         result = interface.flash_attn_with_kvcache(fq, fk, fv, return_softmax_lse=True, **kwargs)
         assert isinstance(result, tuple) and len(result) == 4
         fout, flse = result[:2]
@@ -1321,7 +1429,8 @@ def test_qsa_backward_mma_synthetic_saved_state(dtype, singleton, topk):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="QSA requires a CUDA-compatible device")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize("empty", ["topk0", "total_q0"])
-def test_qsa_backward_mma_empty_native(dtype, empty):
+@pytest.mark.parametrize("deterministic", [False, True], ids=["fast", "deterministic"])
+def test_qsa_backward_mma_empty_native(dtype, empty, deterministic):
     case = QsaBackwardCase("mma-empty", 17, 2, 33, causal=True, cache=(33, 0, 33), layout="kv")
     q, k, v, dout, indices, cu, cache = _qsa_coordinate_backward_inputs(case, dtype)
     max_q = 3
@@ -1336,7 +1445,7 @@ def test_qsa_backward_mma_empty_native(dtype, empty):
     rounded = _qsa_mma_rounded_backward(q, k, v, dout, out, lse, indices, cu, cache,
                                          causal=case.causal)
     grads = _qsa_native_backward(dout, q, k, v, out, lse, indices, cu, max_q,
-                                 cache=cache, causal=case.causal)
+                                 cache=cache, causal=case.causal, deterministic=deterministic)
     for grad, ref, original in zip(grads, rounded, (q, k, v)):
         assert grad.shape == original.shape and grad.dtype == original.dtype and grad.device == original.device
         assert torch.count_nonzero(grad).item() == 0 and torch.equal(grad, ref)
@@ -1346,7 +1455,8 @@ def test_qsa_backward_mma_empty_native(dtype, empty):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize("singleton,topk", [(False, 33), (True, 1), (False, 1537)],
                          ids=["mixed-heads-33", "singletons", "mixed-heads-1537"])
-def test_qsa_backward_mma_nonfinite_inactive_operands(dtype, singleton, topk):
+@pytest.mark.parametrize("deterministic", [False, True], ids=["fast", "deterministic"])
+def test_qsa_backward_mma_nonfinite_inactive_operands(dtype, singleton, topk, deterministic):
     case = QsaBackwardCase("mma-inactive-nan", 17, 2, topk,
                            scale=0.13, layout="kv", strided_qdo=True)
     q, k, v, dout, indices, cu, cache = _qsa_coordinate_backward_inputs(case, dtype)
@@ -1374,7 +1484,8 @@ def test_qsa_backward_mma_nonfinite_inactive_operands(dtype, singleton, topk):
             k.fill_(float("nan"))
             v.fill_(float("nan"))
     rounded = _qsa_mma_rounded_backward(q, k, v, dout, out, lse, indices, cu, cache, scale=case.scale)
-    grads = _qsa_native_backward(dout, q, k, v, out, lse, indices, cu, 3 * repeats, scale=case.scale)
+    grads = _qsa_native_backward(dout, q, k, v, out, lse, indices, cu, 3 * repeats, scale=case.scale,
+                                 deterministic=deterministic)
     valid = _qsa_backward_valid(indices, cu, cache, False)
     _qsa_check_gradients(grads, rounded, rounded, (q, k, v), indices, valid, dtype,
                          case.name, mma_rounding=True)
@@ -1486,6 +1597,184 @@ def test_qsa_backward_mma_group_grid_stride(dtype):
     expected_dv = torch.zeros_like(v)
     expected_dv[0, 0] = heads
     assert torch.equal(grads[2], expected_dv)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="QSA requires a CUDA-compatible device")
+@pytest.mark.parametrize("padded_kv", [False, True])
+def test_qsa_backward_prefetch_partial_tiles(padded_kv):
+    # Keep the FP32 reference small. Empty queries bring the native launch to
+    # its long-prefill threshold without contributing to any KV gradient.
+    lengths = [0, 1, 63, 64, 65, 129, 257, 1025]
+    active_rows, total_q, heads, topk = len(lengths), 2048, 12, max(lengths)
+    dtype, device = torch.bfloat16, "cuda"
+    gen = torch.Generator(device=device).manual_seed(215)
+    q = torch.randn(total_q, heads, 256, generator=gen, device=device, dtype=dtype)
+    dout = torch.randn(q.shape, generator=gen, device=device, dtype=dtype)
+    width = 264 if padded_kv else 256
+    k, v = [torch.randn(16, 16, 1, width, generator=gen, device=device, dtype=dtype)[..., :256] for _ in range(2)]
+    indices = torch.randint(256, (total_q, 1, topk), generator=gen, device=device, dtype=torch.int32)
+    cu = torch.arange(total_q + 1, device=device, dtype=torch.int32)
+    cache = torch.zeros_like(cu[:-1])
+    cache[:active_rows] = torch.tensor(lengths, device=device, dtype=torch.int32)
+    with _qsa_full_precision_matmul():
+        refs = [x.float().requires_grad_() for x in (q[:active_rows], k, v)]
+        ref_out, ref_lse, _ = _qsa_differentiable_sparse_ref(
+            *refs, indices[:active_rows], cu[:active_rows + 1], cache[:active_rows], causal=True)
+        expected = torch.autograd.grad(ref_out, refs, dout[:active_rows].float())
+    out = torch.zeros_like(q)
+    out[:active_rows] = ref_out.detach().to(dtype)
+    lse = torch.full((heads, total_q), -torch.inf, device=device)
+    lse[:, :active_rows] = ref_lse.detach()
+    dq, dk, dv = _qsa_native_backward(dout, q, k, v, out, lse, indices, cu, 1, cache=cache, causal=True)
+    assert torch.count_nonzero(dq[active_rows:]).item() == 0
+    for actual, ref in zip((dq[:active_rows], dk, dv), expected):
+        assert (actual.float() - ref).norm() < 0.02 * ref.norm()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="QSA requires a CUDA-compatible device")
+def test_qsa_backward_prefetch_between_tasks():
+    # Interleave empty and active tasks across several waves of worker claims.
+    stride = 4 * torch.cuda.get_device_properties(0).multi_processor_count
+    lengths = [1, 63, 0, 129, 1025, 64, 7]
+    total_q, heads, topk = max(2048, 1 + stride * (len(lengths) - 1)), 12, max(lengths)
+    rows = torch.arange(len(lengths), device="cuda") * stride
+    active_rows = len(lengths)
+    dtype, device = torch.bfloat16, "cuda"
+    gen = torch.Generator(device=device).manual_seed(215)
+    q = torch.randn(total_q, heads, 256, generator=gen, device=device, dtype=dtype)
+    dout = torch.randn(q.shape, generator=gen, device=device, dtype=dtype)
+    k, v = [torch.randn(16, 16, 1, 256, generator=gen, device=device, dtype=dtype) for _ in range(2)]
+    indices = torch.randint(256, (total_q, 1, topk), generator=gen, device=device, dtype=torch.int32)
+    cu = torch.arange(total_q + 1, device=device, dtype=torch.int32)
+    cache = torch.zeros_like(cu[:-1])
+    cache[rows] = torch.tensor(lengths, device=device, dtype=torch.int32)
+    with _qsa_full_precision_matmul():
+        refs = [x.float().requires_grad_() for x in (q[rows], k, v)]
+        ref_out, ref_lse, _ = _qsa_differentiable_sparse_ref(
+            *refs, indices[rows], cu[:active_rows + 1], cache[rows], causal=True)
+        expected = torch.autograd.grad(ref_out, refs, dout[rows].float())
+    out = torch.zeros_like(q)
+    out[rows] = ref_out.detach().to(dtype)
+    lse = torch.full((heads, total_q), -torch.inf, device=device)
+    lse[:, rows] = ref_lse.detach()
+    dq, dk, dv = _qsa_native_backward(dout, q, k, v, out, lse, indices, cu, 1, cache=cache, causal=True)
+    assert torch.count_nonzero(dq[cache == 0]).item() == 0
+    for actual, ref in zip((dq[rows], dk, dv), expected):
+        assert (actual.float() - ref).norm() < 0.02 * ref.norm()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="QSA requires a CUDA-compatible device")
+@pytest.mark.parametrize("queries,kv_heads,deterministic", [
+    (2, 1, False), (10, 1, False), (10, 3, False), (10, 2, True),
+], ids=["2q", "10q", "10q-varlen", "10q-deterministic"])
+def test_qsa_backward_grouped_query_membership(monkeypatch, queries, kv_heads, deterministic):
+    _check_qsa_grouped_query_membership(monkeypatch, queries, kv_heads, deterministic, 2049, 1024)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="QSA requires a CUDA-compatible device")
+@pytest.mark.parametrize("deterministic", [False, True], ids=["fast", "deterministic"])
+def test_qsa_backward_grouped_query_short_narrow(monkeypatch, deterministic):
+    _check_qsa_grouped_query_membership(monkeypatch, 10, 1, deterministic, 513, 256)
+
+
+def _check_qsa_grouped_query_membership(monkeypatch, queries, kv_heads, deterministic, total_q, topk):
+    monkeypatch.delenv("FA3_QSA_BWD_2Q", raising=False)
+    if queries == 10:
+        monkeypatch.delenv("FA3_QSA_BWD_QUERY_GROUP", raising=False)
+    else:
+        monkeypatch.setenv("FA3_QSA_BWD_QUERY_GROUP", str(queries))
+    # Sparse active groups cover overlap, different valid lengths, unsorted
+    # duplicates, zero/singleton prefixes and an incomplete final group.
+    heads = 12 * kv_heads
+    device, dtype = "cuda", torch.bfloat16
+    gen = torch.Generator(device=device).manual_seed(614)
+    active = [0, 1, 2, 3, 5, 6, 7, total_q - 1]
+    lengths = [127, 145, 75, 130, 1, 65, 65, 131]
+    if kv_heads > 1 and not deterministic:
+        lengths[0] = lengths[1] - 1
+    offsets = [0, 41, 0, 11, 0, 0, 0, 128]
+    if queries == 10:
+        # Cover a full group of long overlapping rows and every query membership bit.
+        active.extend(range(10, 30))
+        lengths.extend([topk] * 10 + list(range(120, 130)))
+        offsets.extend([0] * 10 + [9 * i for i in range(10)])
+    rows = torch.tensor(active, device=device)
+    q = torch.randn(total_q, heads, 256, generator=gen, device=device, dtype=dtype)
+    dout = torch.randn(q.shape, generator=gen, device=device, dtype=dtype)
+    pool = 2048 if deterministic else 512
+    k, v = [torch.randn(pool // 16, 16, kv_heads, 256, generator=gen, device=device, dtype=dtype) for _ in range(2)]
+    ids = torch.zeros((total_q, 1, topk), dtype=torch.int32, device=device)
+    if deterministic:
+        # Bridge tables have sorted unique valid prefixes, followed by zero padding.
+        order = torch.arange(pool, device=device, dtype=torch.int32)
+        for row, count, offset in zip(active, lengths, offsets):
+            ids[row, 0, :count] = order[offset:offset + count]
+    else:
+        order = torch.randperm(pool, generator=gen, device=device, dtype=torch.int32)
+        for row, offset in zip(active, offsets):
+            ids[row, 0, :192] = order[offset:offset + 192]
+        ids[2, 0, 1:4] = ids[2, 0, 0].item()
+    cu = torch.arange(total_q + 1, dtype=torch.int32, device=device)
+    cache = torch.zeros_like(cu[:-1])
+    cache[rows] = torch.tensor(lengths, dtype=torch.int32, device=device)
+    with _qsa_full_precision_matmul():
+        refs = [x.float().requires_grad_() for x in (q[rows], k, v)]
+        out_ref, lse_ref, _ = _qsa_differentiable_sparse_ref(
+            *refs, ids[rows], cu[:len(rows) + 1], cache[rows], causal=True)
+        expected = torch.autograd.grad(out_ref, refs, dout[rows].float())
+    out = torch.zeros_like(q)
+    out[rows] = out_ref.detach().to(dtype)
+    if queries == 10:
+        # The vectorized O·dO path also accepts O rows starting at odd BF16 offsets.
+        out = torch.nn.functional.pad(out, (1, 0))[..., 1:]
+    lse = torch.full((heads, total_q), -torch.inf, device=device)
+    lse[:, rows] = lse_ref.detach()
+    inactive_dq = cache <= 1
+    max_q = 1
+    if kv_heads > 1 and not deterministic:
+        # Rows 0 and 1 share a sequence. Causal masking gives row 0 one
+        # fewer key while exercising the general per-query length lookup.
+        cu = torch.cat((cu[:1], cu[2:]))
+        cache = cache[1:]
+        max_q = 2
+    def backward(indices, saved_out, saved_lse):
+        return _qsa_native_backward(dout, q, k, v, saved_out, saved_lse, indices, cu, max_q,
+                                    cache=cache, causal=True, deterministic=deterministic)
+
+    dq, dk, dv = backward(ids, out, lse)
+    assert torch.count_nonzero(dq[inactive_dq]).item() == 0
+    for actual, ref in zip((dq[rows], dk, dv), expected):
+        assert (actual.float() - ref).norm() < 0.02 * ref.norm()
+
+    if deterministic:
+        for actual, repeated in zip((dq, dk, dv), backward(ids, out, lse)):
+            _assert_bitwise_equal(actual, repeated)
+        # Reverse two entries or create an adjacent equal pair. Each condition
+        # independently selects the ordered single-query reduction.
+        for duplicate in (False, True):
+            changed = ids.clone()
+            changed[1, 0, :2] = ids[1, 0, [0, 0] if duplicate else [1, 0]]
+            changed_out, changed_lse, *_ = _qsa_training_interface().flash_attn_with_kvcache(
+                q, k, v, page_table=changed, cu_seqlens_q=cu, max_seqlen_q=max_q,
+                cache_seqlens=cache, causal=True, num_splits=1, deterministic=True, return_softmax_lse=True)
+            auto = backward(changed, changed_out, changed_lse)
+            with monkeypatch.context() as patch:
+                patch.setenv("FA3_QSA_BWD_2Q", "0")
+                single = backward(changed, changed_out, changed_lse)
+            for actual, reference in zip(auto, single):
+                _assert_bitwise_equal(actual, reference)
+
+    # Only row 1 in the first group selects this NaN. A union MMA would
+    # propagate it to row 0's dQ via a masked zero times NaN.
+    k.view(-1, kv_heads, 256)[order[160].long(), 0, 0] = torch.nan
+    grads = backward(ids, out, lse)
+    monkeypatch.setenv("FA3_QSA_BWD_2Q", "0")
+    single = backward(ids, out, lse)
+    assert torch.isfinite(grads[0][0]).all()
+    for actual, reference in zip(grads, single):
+        if deterministic:
+            _assert_bitwise_equal(actual, reference)
+        torch.testing.assert_close(actual, reference, atol=0.01, rtol=0.01, equal_nan=True)
 
 
 if __name__ == "__main__":
