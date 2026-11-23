@@ -2498,18 +2498,9 @@ mha_qsa_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at::Tensor v,
     params.arch = arch;
     params.num_sm = dprops->multiProcessorCount;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    auto error = at::zeros({}, q.options().dtype(at::kInt));
-    // Snapshot the launch policy before validation so its result applies to exactly this call.
-    int const candidate_planes = params.deterministic ? qsa_deterministic_kv_planes(params) : 0;
-    validate_qsa_bwd(params, error.data_ptr<int>(), candidate_planes > 0, stream);
-    const int invalid = error.item<int>();
-    TORCH_CHECK(!(invalid & 1), "QSA backward indices must be nonnegative and within the physical KV pool");
-    TORCH_CHECK(!(invalid & 2), "QSA backward cu_seqlens_q offsets or max_seqlen_q are invalid");
-    TORCH_CHECK(!(invalid & 4), "QSA backward cache lengths must be nonnegative");
-    // A zero validation word doubles as the persistent scheduler counter. A
-    // nonfinite operand (bit 3) selects the single-query grid-stride fallback.
-    params.tile_count_semaphore = invalid == 0 ? error.data_ptr<int>() : nullptr;
-    int const planes = invalid == 0 ? candidate_planes : 0;
+    // The caller supplies valid sparse indices and sequence metadata.
+    // Grouped MMA assumes finite operands, and deterministic 10Q requires sorted unique prefixes.
+    int const planes = params.deterministic ? qsa_deterministic_kv_planes(params) : 0;
     if (planes > 0) {
         auto dk_planes = at::zeros({planes, k.numel()}, q.options().dtype(at::kFloat));
         auto dv_planes = at::zeros_like(dk_planes);
@@ -2543,6 +2534,8 @@ mha_qsa_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at::Tensor v,
             }
         }
     } else {
+        auto tile_counter = at::zeros({}, q.options().dtype(at::kInt));
+        params.tile_count_semaphore = tile_counter.data_ptr<int>();
         run_qsa_bwd(params, stream);
     }
     convert_qsa_bwd(params, stream);

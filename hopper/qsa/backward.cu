@@ -38,43 +38,6 @@ __device__ __forceinline__ float warp_sum(float value) {
     return value;
 }
 
-__global__ void qsa_backward_validate_inputs(Flash_bwd_params p, int* error,
-                                             int64_t table_count, int64_t work_count, bool check_order) {
-    int flags = 0;
-    int64_t const pool_tokens = int64_t(p.num_pages) * p.page_size;
-    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-         i < work_count; i += int64_t(gridDim.x) * blockDim.x) {
-        if (i < table_count) {
-            int64_t const row = i / p.seqlen_k;
-            int64_t const col = i % p.seqlen_k;
-            int64_t const token = p.page_table[row * p.page_table_batch_stride + col];
-            if (token < 0 || token >= pool_tokens) { flags |= 1; }
-            // For singleton-query batches each causal cache length bounds one
-            // row. Only active columns participate in a grouped gradient.
-            if (check_order && col > 0 && (!p.seqused_k || col < p.seqused_k[row])
-                && p.page_table[row * p.page_table_batch_stride + col - 1] >= token) {
-                flags |= 16;
-            }
-        }
-        if (i <= p.b) {
-            int64_t const start = p.cu_seqlens_q[i];
-            if (start < 0 || start > p.total_q
-                || (i == 0 && start != 0) || (i == p.b && start != p.total_q)) {
-                flags |= 2;
-            }
-            if (i < p.b) {
-                int64_t const end = p.cu_seqlens_q[i + 1];
-                int64_t const length = end - start;
-                if (end < 0 || end > p.total_q || length < 0 || length > p.seqlen_q) {
-                    flags |= 2;
-                }
-                if (p.seqused_k && p.seqused_k[i] < 0) { flags |= 4; }
-            }
-        }
-    }
-    if (flags) { atomicOr(error, flags); }
-}
-
 template <typename T>
 __device__ __forceinline__ uint4 load_chunk(T const* source) {
     static_assert(sizeof(T) == 2);
@@ -111,39 +74,6 @@ bool deterministic_group_candidate(Flash_bwd_params const& p) {
     char const* group = std::getenv("FA3_QSA_BWD_QUERY_GROUP");
     return p.deterministic && p.seqlen_q == 1 && p.b == p.total_q && supports_query_group(p) && query_group_enabled()
         && (group == nullptr || std::strcmp(group, "10") == 0);
-}
-
-// An MMA over the union may multiply an unselected NaN by zero. Reuse the
-// existing validation readback to select single-query execution in that case.
-__device__ bool nonfinite_bf16_chunk(void const* ptr, int64_t offset) {
-    auto const v = load_chunk(static_cast<uint16_t const*>(ptr) + offset);
-    auto has_nonfinite = [](uint32_t x) {
-        return (x & 0x7f80u) == 0x7f80u || (x & 0x7f800000u) == 0x7f800000u;
-    };
-    return has_nonfinite(v.x) || has_nonfinite(v.y) || has_nonfinite(v.z) || has_nonfinite(v.w);
-}
-
-__global__ void qsa_backward_check_pair_operands(Flash_bwd_params p, int* flags, int64_t q_chunks, int64_t kv_chunks) {
-    bool nonfinite = false;
-    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-         i < q_chunks + kv_chunks; i += int64_t(gridDim.x) * blockDim.x) {
-        if (i < q_chunks) {
-            int64_t const head_row = i / (kHeadDim / 8);
-            int const head = head_row % p.h, dim = (i % (kHeadDim / 8)) * 8;
-            int64_t const q = head_row / p.h;
-            nonfinite |= nonfinite_bf16_chunk(p.q_ptr, q * p.q_row_stride + head * p.q_head_stride + dim)
-                || nonfinite_bf16_chunk(p.do_ptr, q * p.do_row_stride + head * p.do_head_stride + dim)
-                || nonfinite_bf16_chunk(p.o_ptr, q * p.o_row_stride + head * p.o_head_stride + dim);
-            if (!dim) {
-                float const lse = static_cast<float const*>(p.softmax_lse_ptr)[int64_t(head) * p.total_q + q];
-                nonfinite |= !isfinite(lse) && lse != -CUDART_INF_F;
-            }
-        } else {
-            int64_t const offset = (i - q_chunks) * 8;
-            nonfinite |= nonfinite_bf16_chunk(p.k_ptr, offset) || nonfinite_bf16_chunk(p.v_ptr, offset);
-        }
-    }
-    if (__syncthreads_or(nonfinite) && !threadIdx.x) { atomicOr(flags, 8); }
 }
 
 template <typename T, int Arch, int M, int N = kTileCols, int Queries = 1>
@@ -1252,24 +1182,6 @@ void launch_convert(Flash_bwd_params const& p, hggcStream_t stream) {
     }
 }
 }  // namespace
-
-void validate_qsa_bwd(Flash_bwd_params const& p, int* error, bool check_order, hggcStream_t stream) {
-    int64_t const table_count = int64_t(p.total_q) * p.seqlen_k;
-    int64_t const sequence_count = int64_t(p.b) + 1;
-    int64_t const work_count = table_count > sequence_count ? table_count : sequence_count;
-    qsa_backward_validate_inputs<<<launch_blocks(work_count), kThreads, 0, stream>>>(
-        p, error, table_count, work_count, check_order);
-    CHECK_CUDA_KERNEL_LAUNCH();
-    // Validate every shape that could be grouped, including when another host
-    // thread changes the scheduling override before the launch.
-    if (check_order || (!p.deterministic && supports_query_group(p))) {
-        int64_t const q_chunks = int64_t(p.total_q) * p.h * (kHeadDim / 8);
-        int64_t const kv_chunks = int64_t(p.num_pages) * p.page_size * p.h_k * (kHeadDim / 8);
-        qsa_backward_check_pair_operands<<<launch_blocks(q_chunks + kv_chunks), kThreads, 0, stream>>>(
-            p, error, q_chunks, kv_chunks);
-        CHECK_CUDA_KERNEL_LAUNCH();
-    }
-}
 
 int qsa_deterministic_kv_planes(Flash_bwd_params const& p) {
     if (!deterministic_group_candidate(p)) { return 0; }

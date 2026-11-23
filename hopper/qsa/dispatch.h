@@ -168,8 +168,6 @@ bool run_qsa_decode_combine(Flash_fwd_params const&, hggcStream_t);
 bool run_qsa_fp8(Flash_fwd_params&, hggcStream_t);
 #endif
 
-// error must initially be zero; validation only atomically ORs device bitflags.
-void validate_qsa_bwd(Flash_bwd_params const&, int* error, bool check_order, hggcStream_t);
 void run_qsa_bwd(Flash_bwd_params&, hggcStream_t);
 
 // A batch of consecutive (query, KV head, sparse tile) tasks in row-major order.
