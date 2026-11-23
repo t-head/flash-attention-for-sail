@@ -38,8 +38,8 @@ __device__ __forceinline__ float warp_sum(float value) {
     return value;
 }
 
-__global__ void validate_inputs(Flash_bwd_params p, int* error,
-                                int64_t table_count, int64_t work_count, bool check_order) {
+__global__ void qsa_backward_validate_inputs(Flash_bwd_params p, int* error,
+                                             int64_t table_count, int64_t work_count, bool check_order) {
     int flags = 0;
     int64_t const pool_tokens = int64_t(p.num_pages) * p.page_size;
     for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -123,7 +123,7 @@ __device__ bool nonfinite_bf16_chunk(void const* ptr, int64_t offset) {
     return has_nonfinite(v.x) || has_nonfinite(v.y) || has_nonfinite(v.z) || has_nonfinite(v.w);
 }
 
-__global__ void check_pair_operands(Flash_bwd_params p, int* flags, int64_t q_chunks, int64_t kv_chunks) {
+__global__ void qsa_backward_check_pair_operands(Flash_bwd_params p, int* flags, int64_t q_chunks, int64_t kv_chunks) {
     bool nonfinite = false;
     for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
          i < q_chunks + kv_chunks; i += int64_t(gridDim.x) * blockDim.x) {
@@ -371,8 +371,8 @@ __device__ void build_query_group(Storage& s, Flash_bwd_params const& p, int64_t
 
 template <typename T, int Arch, int M, int N, bool PrefetchKV, bool CacheOffsets,
           int Queries = 1, bool Deterministic = false, bool PrivateKV = false>
-__global__ void accumulate_backward_mma(Flash_bwd_params p, int64_t tile_groups,
-                                       int tile_group, int64_t work_count, QsaBackwardTileBatch batch) {
+__global__ void qsa_backward_mma(Flash_bwd_params p, int64_t tile_groups,
+                                 int tile_group, int64_t work_count, QsaBackwardTileBatch batch) {
     constexpr bool GroupQueries = Queries > 1;
     static_assert(!Deterministic || (!GroupQueries && !PrefetchKV && !CacheOffsets
                                      && N == QsaBackwardTileBatch::kCols));
@@ -1072,8 +1072,8 @@ __global__ void accumulate_backward_mma(Flash_bwd_params p, int64_t tile_groups,
 }
 
 template <typename T>
-__global__ void convert_accumulators(Flash_bwd_params p, int64_t q_count,
-                                     int64_t kv_count, int64_t work_count) {
+__global__ void qsa_backward_convert_accumulators(Flash_bwd_params p, int64_t q_count,
+                                                  int64_t kv_count, int64_t work_count) {
     for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
          i < work_count; i += int64_t(gridDim.x) * blockDim.x) {
         if (i < q_count) {
@@ -1089,7 +1089,7 @@ __global__ void convert_accumulators(Flash_bwd_params p, int64_t q_count,
 }
 
 // A single writer per query/head/dimension reduces sparse tiles in column order.
-__global__ void reduce_dq_tiles(Flash_bwd_params p, QsaBackwardTileBatch batch, int64_t tiles_per_row) {
+__global__ void qsa_backward_reduce_dq_tiles(Flash_bwd_params p, QsaBackwardTileBatch batch, int64_t tiles_per_row) {
     int const group = p.h / p.h_k;
     int64_t const row = batch.first / tiles_per_row + blockIdx.x / group;
     int const head = blockIdx.x % group;
@@ -1108,8 +1108,8 @@ __global__ void reduce_dq_tiles(Flash_bwd_params p, QsaBackwardTileBatch batch, 
 
 // Only the first warp in each sorted segment writes this KV token/head. Chunks
 // execute on one stream, so the global summation order is independent of CTA scheduling.
-__global__ void reduce_dkv_tiles(Flash_bwd_params p, QsaBackwardTileBatch batch,
-                                 int64_t const* keys, int64_t const* order) {
+__global__ void qsa_backward_reduce_dkv_tiles(Flash_bwd_params p, QsaBackwardTileBatch batch,
+                                              int64_t const* keys, int64_t const* order) {
     int const slot = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int const slots = batch.count * QsaBackwardTileBatch::kCols;
     if (slot >= slots) { return; }
@@ -1133,8 +1133,8 @@ __global__ void reduce_dkv_tiles(Flash_bwd_params p, QsaBackwardTileBatch batch,
     for (int i = 0; i < kHeadDim / 32; ++i) { out_k[32 * i] = dk[i]; out_v[32 * i] = dv[i]; }
 }
 
-__global__ void sum_qsa_kv_planes(Flash_bwd_params p, int planes, int64_t elements,
-                                   float const* dk, float const* dv) {
+__global__ void qsa_backward_sum_kv_planes(Flash_bwd_params p, int planes, int64_t elements,
+                                           float const* dk, float const* dv) {
     for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
          i < elements; i += int64_t(gridDim.x) * blockDim.x) {
         float k = 0.f, v = 0.f;
@@ -1156,7 +1156,7 @@ void launch_mma(Flash_bwd_params& p, hggcStream_t stream) {
         int64_t const tile_groups = (tiles + tile_group - 1) / tile_group;
         int64_t const work_count = int64_t(p.total_q) * p.h_k * tile_groups;
         if (work_count == 0) { return; }
-        auto kernel = accumulate_backward_mma<T, Arch, M, N, decltype(prefetch_kv)::value, decltype(cache_offsets)::value>;
+        auto kernel = qsa_backward_mma<T, Arch, M, N, decltype(prefetch_kv)::value, decltype(cache_offsets)::value>;
         constexpr int bytes = sizeof(typename Config::template SharedStorage<decltype(prefetch_kv)::value>);
         CHECK_CUDA(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
         int blocks = launch_blocks(work_count, 1);
@@ -1184,7 +1184,7 @@ void launch_mma(Flash_bwd_params& p, hggcStream_t stream) {
                 using GroupConfig = BackwardMma<T, Arch, Rows, Cols, Queries>;
                 constexpr int bytes = sizeof(typename GroupConfig::GroupStorage);
                 if (bytes > max_smem) { return false; }
-                auto kernel = accumulate_backward_mma<T, Arch, Rows, Cols, true, true, Queries>;
+                auto kernel = qsa_backward_mma<T, Arch, Rows, Cols, true, true, Queries>;
                 CHECK_CUDA(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
                 int64_t const jobs = ((int64_t(p.total_q) + Queries - 1) / Queries) * p.h_k;
                 int blocks = launch_blocks(jobs, 1);
@@ -1226,7 +1226,7 @@ void launch_backward(Flash_bwd_params& p, QsaBackwardTileBatch batch, hggcStream
     if (!batch.count) { launch_mma<T, Arch, M>(p, stream); return; }
     constexpr int cols = QsaBackwardTileBatch::kCols;
     using Config = BackwardMma<T, Arch, M, cols>;
-    auto kernel = accumulate_backward_mma<T, Arch, M, cols, false, false, 1, true>;
+    auto kernel = qsa_backward_mma<T, Arch, M, cols, false, false, 1, true>;
     constexpr int bytes = sizeof(typename Config::template SharedStorage<false>);
     CHECK_CUDA(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
     int64_t const tiles = (int64_t(p.seqlen_k) + cols - 1) / cols;
@@ -1246,7 +1246,7 @@ void launch_convert(Flash_bwd_params const& p, hggcStream_t stream) {
     int64_t const kv_count = int64_t(p.num_pages) * p.page_size * p.h_k * kHeadDim;
     int64_t const output_count = q_count + 2 * kv_count;
     if (output_count > 0) {
-        convert_accumulators<T><<<launch_blocks(output_count), kThreads, 0, stream>>>(
+        qsa_backward_convert_accumulators<T><<<launch_blocks(output_count), kThreads, 0, stream>>>(
             p, q_count, kv_count, output_count);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
@@ -1257,7 +1257,7 @@ void validate_qsa_bwd(Flash_bwd_params const& p, int* error, bool check_order, h
     int64_t const table_count = int64_t(p.total_q) * p.seqlen_k;
     int64_t const sequence_count = int64_t(p.b) + 1;
     int64_t const work_count = table_count > sequence_count ? table_count : sequence_count;
-    validate_inputs<<<launch_blocks(work_count), kThreads, 0, stream>>>(
+    qsa_backward_validate_inputs<<<launch_blocks(work_count), kThreads, 0, stream>>>(
         p, error, table_count, work_count, check_order);
     CHECK_CUDA_KERNEL_LAUNCH();
     // Validate every shape that could be grouped, including when another host
@@ -1265,7 +1265,7 @@ void validate_qsa_bwd(Flash_bwd_params const& p, int* error, bool check_order, h
     if (check_order || (!p.deterministic && supports_query_group(p))) {
         int64_t const q_chunks = int64_t(p.total_q) * p.h * (kHeadDim / 8);
         int64_t const kv_chunks = int64_t(p.num_pages) * p.page_size * p.h_k * (kHeadDim / 8);
-        check_pair_operands<<<launch_blocks(q_chunks + kv_chunks), kThreads, 0, stream>>>(
+        qsa_backward_check_pair_operands<<<launch_blocks(q_chunks + kv_chunks), kThreads, 0, stream>>>(
             p, error, q_chunks, kv_chunks);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
@@ -1286,7 +1286,7 @@ int qsa_deterministic_kv_planes(Flash_bwd_params const& p) {
 
 void run_qsa_bwd_planes(Flash_bwd_params const& p, int planes, float* dk, float* dv, hggcStream_t stream) {
     using Config = BackwardMma<cutlass::bfloat16_t, 89, 128, kTileCols, 10>;
-    auto kernel = accumulate_backward_mma<cutlass::bfloat16_t, 89, 128, kTileCols, true, true, 10, false, true>;
+    auto kernel = qsa_backward_mma<cutlass::bfloat16_t, 89, 128, kTileCols, true, true, 10, false, true>;
     constexpr int bytes = sizeof(typename Config::GroupStorage);
     CHECK_CUDA(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
     // Both the number of jobs and the static grid stride are multiples of Hkv:
@@ -1300,7 +1300,7 @@ void run_qsa_bwd_planes(Flash_bwd_params const& p, int planes, float* dk, float*
     kernel<<<planes * p.h_k, Config::kMmaThreads, bytes, stream>>>(private_params, 1, group_tiles, jobs, {});
     CHECK_CUDA_KERNEL_LAUNCH();
     int64_t const elements = int64_t(p.num_pages) * p.page_size * p.h_k * kHeadDim;
-    sum_qsa_kv_planes<<<launch_blocks(elements), kThreads, 0, stream>>>(p, planes, elements, dk, dv);
+    qsa_backward_sum_kv_planes<<<launch_blocks(elements), kThreads, 0, stream>>>(p, planes, elements, dk, dv);
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
@@ -1333,9 +1333,9 @@ void reduce_qsa_bwd_tiles(Flash_bwd_params const& p, QsaBackwardTileBatch batch,
     constexpr int cols = QsaBackwardTileBatch::kCols;
     int64_t const tiles = (int64_t(p.seqlen_k) + cols - 1) / cols;
     int const rows = (batch.first + batch.count - 1) / tiles - batch.first / tiles + 1;
-    reduce_dq_tiles<<<rows * (p.h / p.h_k), kHeadDim, 0, stream>>>(p, batch, tiles);
+    qsa_backward_reduce_dq_tiles<<<rows * (p.h / p.h_k), kHeadDim, 0, stream>>>(p, batch, tiles);
     CHECK_CUDA_KERNEL_LAUNCH();
-    reduce_dkv_tiles<<<launch_blocks(batch.count * cols, kThreads / 32), kThreads, 0, stream>>>(
+    qsa_backward_reduce_dkv_tiles<<<launch_blocks(batch.count * cols, kThreads / 32), kThreads, 0, stream>>>(
         p, batch, keys, order);
     CHECK_CUDA_KERNEL_LAUNCH();
 }
