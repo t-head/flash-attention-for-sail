@@ -6,27 +6,6 @@
 #pragma once
 
 #include <vector>
-#ifdef FLASHATTENTION_PPU_DENSE_HD64
-#include <cstdint>
-#include <cstring>
-
-namespace flash {
-inline bool should_use_ppu_dense_hd64(int arch, char const* device_name, bool is_bf16,
-                                     int d, int dv, int seqlen_q, int seqlen_k, int heads, int kv_heads,
-                                     int batch, int cu_count, int grid_tile) {
-    if (!is_bf16 || d != 64 || dv != 64 || heads != kv_heads
-        || seqlen_q != seqlen_k || seqlen_q < (arch == 80 ? 1024 : 512) || cu_count <= 0) {
-        return false;
-    }
-    bool const supported_device = arch == 80
-        ? (std::strcmp(device_name, "PPU-ZW810E") == 0 || std::strcmp(device_name, "ZW-810E") == 0)
-        : arch == 89 && std::strcmp(device_name, "ZW-M890P") == 0;
-    // Use the physical CU count even when the default scheduler uses a virtual count.
-    int const blocks = (seqlen_q + grid_tile - 1) / grid_tile;
-    return supported_device && int64_t(batch) * heads * blocks >= 2 * cu_count;
-}
-}
-#endif
 
 #ifdef USE_PPU
 inline bool should_pack_gqa(bool varlen_q, int seqlen_q, int num_qhead, int num_khead, int blockM_nopack, int blockM_pack, int num_SMs) {

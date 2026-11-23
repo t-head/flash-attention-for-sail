@@ -338,8 +338,8 @@ def _flash_attn_backward_fake(
     head_size_v = v.size(-1)
     head_size_rounded = round_up_headdim(max(head_size, head_size_v))
 
-    # PPU kBlockM: only depends on head_size_rounded
-    kBlockM = 128 if head_size_rounded <= 64 else 64
+    # PPU kBlockM: matches the hdim64/96 backward tiles in mha_bwd
+    kBlockM = 64
 
     num_heads = q.shape[-2]
     seqlen_q_rounded = round_multiple(seqlen_q, kBlockM)

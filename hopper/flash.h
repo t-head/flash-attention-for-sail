@@ -8,10 +8,6 @@
 #include <hggc.h>
 #include <vector>
 
-#if defined(USE_PPU) && USE_AIU && !defined(FLASHATTENTION_DISABLE_SM8x) && !defined(FLASHATTENTION_DISABLE_HDIM64) && !defined(FA3_HLLM_BUILD)
-#define FLASHATTENTION_PPU_DENSE_HD64
-#endif
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct Qkv_params {
@@ -174,9 +170,6 @@ struct Flash_fwd_params : public Qkv_params {
     bool use_kblockm_16;
     bool use_kblockm_128;
     bool use_kblockn_16;
-#ifdef FLASHATTENTION_PPU_DENSE_HD64
-    bool use_ppu_dense_hd64 = false;
-#endif
     bool is_qsa;
     // QSA only: the caller certifies that every 16-column-aligned group of the (total_q, topk)
     // table consists of 16 pool-contiguous tokens, the layout the AIU paged-KV bulk load

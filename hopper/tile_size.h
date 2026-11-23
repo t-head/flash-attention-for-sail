@@ -7,14 +7,6 @@
 
 #include <tuple>
 
-#ifdef FLASHATTENTION_PPU_DENSE_HD64
-namespace flash {
-inline constexpr std::tuple<int, int, int, int, bool> ppu_dense_hd64_fwd_tile{64, 96, 2, 1, false};
-inline constexpr int ppu_dense_hd64_bwd_m = 64;
-inline constexpr int ppu_dense_hd64_bwd_n = 128;
-}
-#endif
-
 // Return {kBlockM, kBlockN, MmaPV_is_RS, IntraWGOverlap}
 constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
         int headdim, int headdim_v, bool is_causal, bool is_local, int element_size=2,
@@ -111,13 +103,16 @@ constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_ppu(
             } else if (headdim_v == 256) {
                 return {64, vreg_strain ? 16 : 32, 4, 1, vreg_strain ? false : true};
             } else {
+                // 2-warp tiles keep Q in smem and spend the registers on FA4SkipRescaleO instead.
                 if (arch == 80 && !paged_kv && !varlen) {
-                    return {64, vreg_strain ? 64 : 96, 2, 1, vreg_strain ? false : true};
+                    return {64, vreg_strain ? 64 : 96, 2, 1, false};
                 }
                 if (!kBlockM128) {
                     return {64, 128, 4, 1, vreg_strain ? false : true};
+                } else if (!vreg_strain) {
+                    return {64, 96, 2, 1, false};
                 } else {
-                    return {128, vreg_strain ? 64 : 96, 4, 1, vreg_strain ? false : true};
+                    return {128, 64, 4, 1, false};
                 }
             }
         } else if (headdim <= 96) {

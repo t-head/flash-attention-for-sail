@@ -1148,6 +1148,20 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
     # pytorch_profiler(flash_attn_combine, out_partial, lse_partial)
     # pytorch_profiler(torch.sum, out_partial)
 
+@pytest.mark.skipif(DISABLE_BACKWARD, reason="backward is disabled")
+@pytest.mark.parametrize("d", [d for d in (64, 96) if d in COMPILED_HDIMS])
+@pytest.mark.parametrize("seqlen", [1, 113, 1153])
+def test_flash_attn_bwd_fake_shape(seqlen, d):
+    # torch.compile sizes the backward scratch from the fake op, so it must match mha_bwd's tile.
+    from flash_attn_interface import _flash_attn_backward_fake
+    q, k, v, out, dout = (torch.randn(2, seqlen, 4, d, device="cuda", dtype=torch.bfloat16) for _ in range(5))
+    lse = torch.randn(2, 4, seqlen, device="cuda", dtype=torch.float32)
+    dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    real = torch.ops.flash_attn_3.bwd(dout, q, k, v, out, lse, dq, dk, dv)[3]
+    fake = _flash_attn_backward_fake(dout, q, k, v, out, lse)
+    assert fake.shape == real.shape
+
+
 def test_flash3_bw_compatibility() -> None:
     # Let's try to always stay backward compatible! This will make life easier
     # for downstream libaries, users, and exported models.
