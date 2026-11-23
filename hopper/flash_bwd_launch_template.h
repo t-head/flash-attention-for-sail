@@ -355,8 +355,12 @@ template<int Arch, typename T, bool Has_softcap>
 void run_mha_bwd_hdim64(Flash_bwd_params &params, hggcStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
 #ifdef USE_PPU
-        // 64 x 128 keeps K/V in registers across the m_blocks (see KV_in_regs).
-        if constexpr (Arch == 80) {
+        // 64 x 128 keeps K/V in registers across the m_blocks (see KV_in_regs). Softcap keeps
+        // the 128 x 64 tile: at 64 x 128 its dtanh fragment hits the 256 VReg limit and spills,
+        // and the backward is 3-22% slower. mha_bwd and the fake op mirror this choice.
+        if constexpr (Has_softcap) {
+            run_mha_bwd_dispatch<Arch, T, 128, 64, 64, Is_causal, Is_local, Has_softcap, 1, 2, false, false, false, 2, 4, 4, 4, false>(params, stream);
+        } else if constexpr (Arch == 80) {
             run_mha_bwd_dispatch<Arch, T, 64, 128, 64, Is_causal, Is_local, Has_softcap, 1, 2, false, false, false, 2, 2, 4, 4, false>(params, stream);
         } else {
             run_mha_bwd_dispatch<Arch, T, 64, 128, 64, Is_causal, Is_local, Has_softcap, 2, 2, false, false, false, 2, 2, 4, 4, false>(params, stream);
