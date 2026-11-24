@@ -122,7 +122,7 @@ struct CollectiveMainloopFwdSm80 {
                   "D256 tuning requires the M256/N64/W16/S3 decoupled tile");
 #endif
 
-#if defined(USE_PPU) && USE_AIU && !defined(FA3_HLLM_BUILD)
+#if defined(USE_PPU) && USE_AIU && FA3_ENABLE_WARP_INTERLEAVE && !defined(FA3_HLLM_BUILD)
     static_assert(!UseWarpInterleave || (ArchTag::kMinComputeCapability == 89
         && cute::is_same_v<Element, cutlass::bfloat16_t>
         && kHeadDim == 192 && kHeadDimV == 128 && kStages == 1 && Q_in_regs
@@ -132,7 +132,7 @@ struct CollectiveMainloopFwdSm80 {
                     : !PagedKVAiu && !PackGQA && !Split)),
         "SM89 warp interleaving requires a supported BF16 one-stage AIU specialization");
 #else
-    static_assert(!UseWarpInterleave, "SM89 warp interleaving requires the PPU AIU backend");
+    static_assert(!UseWarpInterleave, "SM89 warp interleaving requires an enabled PPU AIU build");
 #endif
 #ifdef USE_PPU
     // Each warp executes QK. Give every warp the same valid score
@@ -1427,9 +1427,7 @@ struct CollectiveMainloopFwdSm80 {
                 sync();
             }
             auto load_V_next = [&] {
-#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
                 if constexpr (!UseDecoupled) {
-#endif
                 if constexpr (UseWarpInterleave) {
                     // NextTileReady protects V reuse. AIU pads the partial page.
                     wi_schedule.load_value([&] {
@@ -1452,9 +1450,7 @@ struct CollectiveMainloopFwdSm80 {
                     }
                 }
 #endif
-#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
                 }
-#endif
             };
             if constexpr (Is_QSA_FP8 && !Share_KV_Smem) { load_V_next(); }
             auto qk_prefetch = [&] {

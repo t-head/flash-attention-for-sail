@@ -91,6 +91,9 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
                   && kHeadDimV * QsaConfig::VParts == 256 && PackGQA),
                   "QSA configurations require packed hdim256 QSA");
 #endif
+#ifdef USE_PPU
+    static_assert(!(UseDecoupled && UseWarpInterleave), "Forward schedules are mutually exclusive");
+#endif
     static_assert(!(Is_causal && Is_local), "Causal and Local cannot be enabled at the same time");
     static_assert(!(AppendKV && V_colmajor), "AppendKV and V_colmajor cannot be enabled at the same time");
     static_assert(!(AppendKV && !Varlen), "AppendKV requires Varlen");
@@ -393,7 +396,7 @@ void run_mha_fwd_(Flash_fwd_params &params, hggcStream_t stream) {
     static_assert(sizeof(T) == 2 || sizeof(T) == 1, "Only 16bit and 8bit are supported");
     static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
     using T_out = std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>;
-#if defined(USE_PPU) && USE_AIU && !defined(FA3_HLLM_BUILD) && !defined(FLASHATTENTION_DISABLE_VARLEN)
+#if defined(USE_PPU) && USE_AIU && FA3_ENABLE_WARP_INTERLEAVE && !defined(FA3_HLLM_BUILD) && !defined(FLASHATTENTION_DISABLE_VARLEN)
     if constexpr (Arch == 89 && cute::is_same_v<T, cutlass::bfloat16_t>
         && kHeadDim == 192 && kHeadDimV == 128 && !Is_QSA && !Has_softcap
         && (PagedKVNonTMA || (!PackGQA && !Split))) {
