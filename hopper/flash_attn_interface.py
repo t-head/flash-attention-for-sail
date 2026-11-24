@@ -1115,6 +1115,7 @@ def flash_attn_with_kvcache(
             Pass (total_q, 1, topk) instead to select query-sparse attention (QSA), where each row
             holds the token indices selected for one unpadded query token. Requires head dim 256,
             cu_seqlens_q, no cache_batch_idx, and a build with FLASH_ATTENTION_ENABLE_QSA.
+            QSA with multiple queries per sequence uses the packed GQA layout.
             For QSA backward, token indices must be within the physical KV pool and
             sequence offsets and lengths must be valid. Grouped backward assumes
             finite Q/K/V/out/dout and finite LSE on active rows. Deterministic 10-query

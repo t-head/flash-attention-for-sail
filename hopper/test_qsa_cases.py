@@ -1165,6 +1165,34 @@ def test_qsa_backward_deterministic(case, dtype):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="QSA requires a CUDA-compatible device")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("pack_gqa", [None, False], ids=["auto-pack", "unpacked-request"])
+@pytest.mark.parametrize("global_determinism", [False, True], ids=["explicit-det", "global-det"])
+def test_qsa_backward_deterministic_mha_auto_splits(dtype, pack_gqa, global_determinism):
+    case = QsaBackwardCase("det-mha-auto", 1, 2, 17, causal=True, cache=(16, 0, 17), splits=0)
+    q, k, v, dout, indices, cu, cache = _qsa_backward_inputs(case, dtype)
+    ref, ref_lse, valid, ref_grads = _qsa_reference_gradients(
+        q, k, v, dout, indices, cu, cache, case, torch.float32)
+    lowp, lowp_lse, _, lowp_grads = _qsa_reference_gradients(
+        q, k, v, dout, indices, cu, cache, case, dtype)
+    kwargs = dict(page_table=indices, cu_seqlens_q=cu, max_seqlen_q=3, cache_seqlens=cache,
+                  causal=True, num_splits=0, pack_gqa=pack_gqa, return_softmax_lse=True,
+                  deterministic=not global_determinism)
+    with _qsa_deterministic_algorithms(global_determinism):
+        out, lse, out_partial, _ = _qsa_training_interface().flash_attn_with_kvcache(q, k, v, **kwargs)
+        direct_out, direct_lse, *_ = _fwd_direct(q, k, v, indices, cu, cache, 3,
+                                              num_splits=0, pack_gqa=pack_gqa,
+                                              deterministic=not global_determinism)
+        grads = torch.autograd.grad(out, (q, k, v), dout)
+    assert out_partial.numel() == 0
+    _assert_bitwise_equal(out, direct_out)
+    _assert_bitwise_equal(lse, direct_lse)
+    _qsa_check_error(out, ref, lowp, dtype, f"{case.name}/out")
+    _qsa_check_error(lse, ref_lse, lowp_lse, dtype, f"{case.name}/lse")
+    _qsa_check_gradients(grads, ref_grads, lowp_grads, (q, k, v), indices, valid, dtype, case.name)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="QSA requires a CUDA-compatible device")
 def test_qsa_backward_deterministic_high_contention():
     """All query rows target one dV address; cancellation exposes FP32 summation order."""
     rows = 1023

@@ -474,6 +474,7 @@ template <int Arch, int Split, bool PagedKVNonTMA, bool PackGQA, bool Has_softca
 void run_mha_fwd_qsa(Flash_fwd_params &params, hggcStream_t stream) {
 #ifndef FLASHATTENTION_DISABLE_HDIM256
     TORCH_CHECK(params.d == 256 && params.dv == 256, "QSA only supports head dim 256");
+    TORCH_CHECK(PackGQA || params.seqlen_q <= 1, "Multi-query QSA requires a packed GQA kernel");
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
     if constexpr (PagedKVNonTMA && PackGQA && !Has_softcap) {
         if (run_qsa(params, stream)) { return; }
@@ -1515,8 +1516,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     // Always enable PackGQA for Split, and get_pack_gqa requires params.num_splits to decide
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
 #ifdef USE_PPU
-    // QSA packs one query's GQA heads into each tile, including MHA (group 1).
-    if (params.is_qsa && params.is_e4m3) { params.pack_gqa = true; }
+    // QSA assigns one sparse table row to each query tile. The packed layout
+    // maps each tile to one query even when the GQA group size is one.
+    if (params.is_qsa && (params.is_e4m3 || params.seqlen_q > 1)) { params.pack_gqa = true; }
 #endif
 
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA) && defined(FLASHATTENTION_DISABLE_SM90) && !defined(FLASHATTENTION_DISABLE_SPLIT)
