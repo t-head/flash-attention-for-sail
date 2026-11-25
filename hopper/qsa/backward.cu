@@ -83,11 +83,9 @@ struct BackwardMma {
     static constexpr int kWarpCols = N / 16;
     static constexpr int kWarps = kWarpRows * kWarpCols;
     static constexpr int kMmaThreads = 32 * kWarps;
-    using Atom = MMA_Atom<std::conditional_t<Arch >= 89,
-        std::conditional_t<std::is_same_v<T, cutlass::half_t>,
-            PPU0015_16x16x16_F32F16F16F32_TN, PPU0015_16x16x16_F32BF16BF16F32_TN>,
-        std::conditional_t<std::is_same_v<T, cutlass::half_t>,
-            PPU0010_16x16x16_F32F16F16F32_TN, PPU0010_16x16x16_F32BF16BF16F32_TN>>>;
+    static_assert(Arch == 89);
+    using Atom = MMA_Atom<std::conditional_t<std::is_same_v<T, cutlass::half_t>,
+        PPU0015_16x16x16_F32F16F16F32_TN, PPU0015_16x16x16_F32BF16BF16F32_TN>>;
     using MmaSdP = TiledMMA<Atom, Layout<Shape<Int<kWarpRows>, Int<kWarpCols>, _1>>,
                             Tile<Int<16 * kWarpRows>, Int<16 * kWarpCols>, _16>>;
     using MmaDQ = MmaSdP;
@@ -303,6 +301,8 @@ template <typename T, int Arch, int M, int N, bool PrefetchKV, bool CacheOffsets
           int Queries = 1, bool Deterministic = false, bool PrivateKV = false>
 __global__ void qsa_backward_mma(Flash_bwd_params p, int64_t tile_groups,
                                  int tile_group, int64_t work_count, QsaBackwardTileBatch batch) {
+    // The backward API rejects PPU 1.0 before launching kernels.
+#if !defined(__HGGC_ARCH__) || __HGGC_ARCH__ >= 150
     constexpr bool GroupQueries = Queries > 1;
     static_assert(!Deterministic || (!GroupQueries && !PrefetchKV && !CacheOffsets
                                      && N == QsaBackwardTileBatch::kCols));
@@ -999,6 +999,7 @@ __global__ void qsa_backward_mma(Flash_bwd_params p, int64_t tile_groups,
         }
         __syncthreads();
     }
+#endif
 }
 
 template <typename T>
@@ -1220,12 +1221,10 @@ static void dispatch_qsa_bwd(Flash_bwd_params& p, QsaBackwardTileBatch batch, hg
     TORCH_CHECK(p.is_qsa && p.d == kHeadDim && p.dv == kHeadDim,
                 "QSA backward requires QSA with Q/K/V head dimension 256");
     if (p.is_bf16) {
-        if (p.arch >= 89) { launch_backward<cutlass::bfloat16_t, 89>(p, batch, stream); }
-        else { launch_backward<cutlass::bfloat16_t, 80>(p, batch, stream); }
+        launch_backward<cutlass::bfloat16_t, 89>(p, batch, stream);
     } else {
 #ifndef FLASHATTENTION_DISABLE_FP16
-        if (p.arch >= 89) { launch_backward<cutlass::half_t, 89>(p, batch, stream); }
-        else { launch_backward<cutlass::half_t, 80>(p, batch, stream); }
+        launch_backward<cutlass::half_t, 89>(p, batch, stream);
 #else
         TORCH_CHECK(false, "QSA backward FP16 support is disabled");
 #endif

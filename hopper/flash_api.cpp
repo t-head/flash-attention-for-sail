@@ -2396,7 +2396,7 @@ mha_qsa_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at::Tensor v,
     const at::cuda::CUDAGuard device_guard(q.device());
     auto dprops = at::cuda::getCurrentDeviceProperties();
     const int arch = dprops->major * 10 + dprops->minor;
-    TORCH_CHECK(arch == 80 || arch == 89, "QSA backward requires PPU0010 or PPU0015");
+    TORCH_CHECK(arch == 89, "QSA backward requires PPU 1.5 (SM89), got SM", arch);
     const auto dtype = q.scalar_type();
     TORCH_CHECK(dtype == at::kBFloat16 || dtype == at::kHalf,
                 "QSA backward requires BF16 or FP16 inputs");
