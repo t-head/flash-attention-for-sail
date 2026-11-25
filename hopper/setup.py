@@ -194,6 +194,8 @@ if not SKIP_CUDA_BUILD:
         sources += ["qsa/dispatch.cu"]
         if ENABLE_QSA_FP8:
             sources += ["qsa/fp8.cu"]
+        if not DISABLE_BACKWARD and not DISABLE_HDIM256 and not DISABLE_SM8x and not FA3_HLLM_BUILD:
+            sources += ["qsa/backward.cu"]
 
     include_dirs = [
         str(Path(this_dir)),

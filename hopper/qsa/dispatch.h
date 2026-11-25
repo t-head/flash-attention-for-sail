@@ -167,3 +167,23 @@ bool run_qsa_decode_combine(Flash_fwd_params const&, hggcStream_t);
 #ifdef FLASHATTENTION_QSA_FP8
 bool run_qsa_fp8(Flash_fwd_params&, hggcStream_t);
 #endif
+
+void run_qsa_bwd(Flash_bwd_params&, hggcStream_t);
+
+// A batch of consecutive (query, KV head, sparse tile) tasks in row-major order.
+struct QsaBackwardTileBatch {
+    static constexpr int kCols = 64;
+    int64_t first;
+    int count;
+    int64_t* keys;
+    float* dq;
+    float* dk;
+    float* dv;
+};
+
+void compute_qsa_bwd_tiles(Flash_bwd_params&, QsaBackwardTileBatch, hggcStream_t);
+void reduce_qsa_bwd_tiles(Flash_bwd_params const&, QsaBackwardTileBatch,
+                          int64_t const* keys, int64_t const* order, hggcStream_t);
+int qsa_deterministic_kv_planes(Flash_bwd_params const&);
+void run_qsa_bwd_planes(Flash_bwd_params const&, int planes, float* dk, float* dv, hggcStream_t);
+void convert_qsa_bwd(Flash_bwd_params const&, hggcStream_t);
