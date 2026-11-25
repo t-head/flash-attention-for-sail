@@ -64,11 +64,6 @@ on:
         required: false
         type: string
         default: pypi
-      runs_on:
-        description: 'Runner for all jobs: a single label or a JSON array of labels'
-        required: false
-        type: string
-        default: x86-ubuntu2404-64-256
       build_command:
         description: 'Custom Bash build command; leave empty to build FA3 from hopper/; only trusted configuration is accepted'
         required: false
@@ -105,8 +100,6 @@ jobs:
       torch_versions: ${{ inputs.torch_versions || '["2.13.0"]' }}
       sdk_versions: ${{ inputs.sdk_versions || '["2.2.1"]' }}
       branch: ${{ inputs.branch || '' }}
-      # FA3 compiles every SM90 instantiation; the default 4-core runner OOMs.
-      runs_on: ${{ inputs.runs_on || 'x86-ubuntu2404-64-256' }}
       package_version: ${{ inputs.package_version || '3.0.0b1' }}
       package_edition: ${{ inputs.package_edition || 'oe' }}
       package_type: ${{ inputs.package_type || 'pypi' }}
