@@ -1187,3 +1187,68 @@ def test_flash3_bw_compatibility() -> None:
         "int attention_chunk=0, bool has_softcap=False, int num_splits=0, bool? pack_gqa=None, "
         "int sm_margin=0) -> Tensor"
     ))
+
+
+@pytest.mark.skipif(
+    cuda_cap != 89 or DISABLE_HDIM192 or DISABLE_HDIMV
+    or os.getenv("FLASH_ATTENTION_DISABLE_VARLEN", "FALSE") == "TRUE",
+    reason="requires SM89 BF16 varlen D192/V128 support",
+)
+@pytest.mark.parametrize("layout,q_lens,k_lens,num_splits,pack_gqa", [
+    ("varlen", (4096, 4231), (8192, 12351), 1, None),
+    ("paged", (4096, 4231), (8192, 12351), 1, False),
+    ("paged", (5564,), (11128,), 1, True),
+    ("paged", (4096, 4231), (8192, 12351), 2, True),
+])
+def test_flash_attn_varlen_d192_v128(layout, q_lens, k_lens, num_splits, pack_gqa):
+    if layout == "paged" and (DISABLE_PAGEDKV or (DISABLE_PACKGQA and pack_gqa)):
+        pytest.skip("requires paged KV and the selected packing configuration")
+    if num_splits > 1 and DISABLE_SPLIT:
+        pytest.skip("requires split KV")
+    torch.random.manual_seed(0)
+    device, dtype = "cuda", torch.bfloat16
+    nheads, nheads_k = (6, 6) if layout == "varlen" else (16, 1)
+    q = torch.randn(sum(q_lens), nheads, 192, device=device, dtype=dtype)
+    cu_q = torch.tensor([0, *itertools.accumulate(q_lens)], device=device, dtype=torch.int32)
+    if layout == "varlen":
+        k = torch.randn(sum(k_lens), nheads_k, 192, device=device, dtype=dtype)
+        v = torch.randn(sum(k_lens), nheads_k, 128, device=device, dtype=dtype)
+        cu_k = torch.tensor([0, *itertools.accumulate(k_lens)], device=device, dtype=torch.int32)
+        out, lse = flash_attn_varlen_func(
+            q, k, v, cu_q, cu_k, max(q_lens), max(k_lens),
+            causal=True, num_splits=num_splits, return_attn_probs=True,
+        )
+    else:
+        k_ref, v_ref, page_table, k, v, _ = _generate_block_kvcache(
+            max(k_lens), 64, len(q_lens), nheads_k, 192, 128, device, dtype, torch.float32,
+        )
+        k, v = k.to(dtype), v.to(dtype)
+        out, lse, *_ = flash_attn_with_kvcache(
+            q, k, v, cache_seqlens=torch.tensor(k_lens, device=device, dtype=torch.int32),
+            cu_seqlens_q=cu_q, max_seqlen_q=max(q_lens), max_seqlen_k=max(k_lens),
+            page_table=page_table, causal=True, num_splits=num_splits, pack_gqa=pack_gqa,
+            return_softmax_lse=True,
+        )
+    q_offset = k_offset = 0
+    for batch, (sq, sk) in enumerate(zip(q_lens, k_lens)):
+        qb = q[q_offset:q_offset + sq].unsqueeze(0)
+        kb = (k[k_offset:k_offset + sk] if layout == "varlen" else k_ref[batch, :sk]).unsqueeze(0).to(dtype)
+        vb = (v[k_offset:k_offset + sk] if layout == "varlen" else v_ref[batch, :sk]).unsqueeze(0).to(dtype)
+        out_ref = attention_ref(qb, kb, vb, causal=True)[0].squeeze(0)
+        out_pt = attention_ref(qb, kb, vb, causal=True, upcast=False, reorder_ops=True)[0].squeeze(0)
+        error = (out[q_offset:q_offset + sq] - out_ref).abs()
+        control = (out_pt - out_ref).abs()
+        assert error.max() <= 2 * control.max() + 1e-5
+        assert error.mean() <= 2 * control.mean() + 1e-6
+        # LSE has no GQA head replication or low-precision output conversion.
+        # Check boundary and evenly spaced rows against independent FP32 scores.
+        rows = torch.linspace(0, sq - 1, 65, device=device).long().unique()
+        q_rows = qb[0, rows].float().transpose(0, 1)
+        k_heads = kb[0].float().repeat_interleave(nheads // nheads_k, dim=1).transpose(0, 1)
+        scores = (q_rows @ k_heads.transpose(-1, -2)) * (192 ** -0.5)
+        masked = torch.arange(sk, device=device)[None, :] > (sk - sq + rows)[:, None]
+        scores.masked_fill_(masked, -torch.inf)
+        lse_ref = torch.logsumexp(scores, dim=-1)
+        torch.testing.assert_close(lse[:, q_offset + rows], lse_ref, rtol=0, atol=3e-3)
+        q_offset += sq
+        k_offset += sk
