@@ -92,7 +92,7 @@ jobs:
       release_username: ${{ secrets.RELEASE_USERNAME }}
       release_token: ${{ secrets.RELEASE_TOKEN }}
     with:
-      runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on || 'x86-ubuntu2404-64-256' }}
+      runs_on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on || 'x86-ubuntu2404-64-256' }}
       # Scheduled runs carry no inputs; the pinned defaults below still apply.
       # Keep them aligned with the PR CI image: sdk2.2.0 / torch2.10.0 /
       # hggcrt3 / ubuntu24.04 / py312.
