@@ -16,10 +16,10 @@ on:
         required: true
         type: string
       matrix:
-        description: 'JSON list of runners, e.g. ["ZW-M890P"].'
+        description: 'JSON list of runners, e.g. ["ZW-810E","ZW-M890P"].'
         required: false
         type: string
-        default: '["ZW-M890P"]'
+        default: '["ZW-810E","ZW-M890P"]'
       source_mode:
         description: 'Source layout mode. Supported values: flash-attention, actlize0.8.0, actlize1.0.0.'
         required: false
@@ -48,10 +48,10 @@ on:
         type: string
         default: v2.8.2
       matrix:
-        description: 'JSON list of runners, e.g. ["ZW-M890P"].'
+        description: 'JSON list of runners, e.g. ["ZW-810E","ZW-M890P"].'
         required: false
         type: string
-        default: '["ZW-M890P"]'
+        default: '["ZW-810E","ZW-M890P"]'
       source_mode:
         description: 'Source layout mode. Supported values: flash-attention, actlize0.8.0, actlize1.0.0.'
         required: false
@@ -95,7 +95,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P"]') }}
+        runner: ${{ fromJson(inputs.matrix || '["ZW-810E","ZW-M890P"]') }}
         # v2.8.2 additionally tests FA3 and the standalone Holmes raw ABI; `variants` overrides the default set.
         variant: ${{ fromJson(inputs.variants || (inputs.version == 'v2.8.2' && '["fa2", "fa3", "holmes", "holmes-fa3"]' || '["fa2"]')) }}
     steps:
