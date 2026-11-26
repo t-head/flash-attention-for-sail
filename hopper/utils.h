@@ -605,13 +605,14 @@ CUTLASS_DEVICE void gemm_rs_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Ten
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
-// Overlap K loads with D256 QK MMAs using a four-fragment window while Q stays in registers.
+// Overlap K loads with D256 QK MMAs using a four-fragment window.
+// Preloading Q0 avoids keeping that Q fragment live across PV.
 template <typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
-          typename TiledMma, typename TiledCopyB, typename ThrCopyB, typename Hook>
+          typename TiledMma, typename TiledCopyB, typename ThrCopyB, typename TensorQ0>
 CUTLASS_DEVICE void gemm_sm80_d256_qk_prefetch4(
         Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const &tCsB,
         TiledMma tiled_mma, TiledCopyB smem_tiled_copy_B, ThrCopyB smem_thr_copy_B,
-        Hook fn) {
+        TensorQ0 const& q0_prefetched) {
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));
     CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));
     CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));
@@ -631,6 +632,8 @@ CUTLASS_DEVICE void gemm_sm80_d256_qk_prefetch4(
         cute::copy(smem_tiled_copy_B, tCsB(_, Int<in>{}, Int<ik>{}),
                    b_copy(_, Int<in>{}, Int<ik>{}));
     };
+    Tensor q0 = make_tensor_like(tCrA(_, _0{}, _0{}));
+    cute::copy(q0_prefetched, q0);
     #pragma hggc mmatiestrictly
     {
         for_each(make_int_sequence<Window>{}, [&](auto ij) { load(ij); });
@@ -639,10 +642,13 @@ CUTLASS_DEVICE void gemm_sm80_d256_qk_prefetch4(
             constexpr int j = decltype(ij)::value;
             constexpr int ik = j / NN;
             constexpr int in = j % NN;
-            if constexpr (j == 0 && !std::is_same_v<Hook, std::nullptr_t>) { fn(); }
             for_each(make_int_sequence<NM>{}, [&](auto im) {
-                cute::gemm(tiled_mma, tCrA(_, im, Int<ik>{}),
-                           tCrB(_, Int<in>{}, Int<ik>{}), acc(_, im, Int<in>{}));
+                if constexpr (ik == 0) {
+                    cute::gemm(tiled_mma, q0, tCrB(_, Int<in>{}, Int<ik>{}), acc(_, im, Int<in>{}));
+                } else {
+                    cute::gemm(tiled_mma, tCrA(_, im, Int<ik>{}),
+                               tCrB(_, Int<in>{}, Int<ik>{}), acc(_, im, Int<in>{}));
+                }
             });
             constexpr int next = j + Window;
             if constexpr (next < Total) {
@@ -921,13 +927,13 @@ CUTLASS_DEVICE void run_pv_schedule(
 // VSourceN is the AIU page height for paged V and the tile height otherwise.
 // A zero window uses one K16 slice at a time. A positive window reuses V atoms.
 template <int BlockN, int VSourceN, int BlockKSmem, int HeadDimV, int VWindow,
-          bool Scheduled, bool Check_inf, typename TensorS, typename SoftmaxT,
+          bool Scheduled, bool Check_inf, bool TrimVTail = false, typename TensorS, typename SoftmaxT,
           typename TensorP, typename TensorV, typename TensorCsV, typename TensorO,
           typename TiledMma, typename TiledCopy, typename ThrCopy>
 CUTLASS_DEVICE void gemm_rs_sm80_decoupled(
         TensorS &acc_s, SoftmaxT &softmax, TensorP &P, TensorV &V,
         TensorCsV const &CsV, TensorO &acc, TiledMma tiled_mma,
-        TiledCopy smem_tiled_copy, ThrCopy smem_thr_copy) {
+        TiledCopy smem_tiled_copy, ThrCopy smem_thr_copy, int valid_k = BlockN) {
     constexpr int NN = decltype(size<1>(V))::value;
     constexpr int NK = decltype(size<2>(P))::value;
     constexpr bool CrossPage = VSourceN != BlockN;
@@ -935,15 +941,17 @@ CUTLASS_DEVICE void gemm_rs_sm80_decoupled(
     constexpr int NAtomsPerCube = BlockKSmem / 16;
     static_assert(BlockN % VSourceN == 0 && VSourceN % 16 == 0 && NK == BlockN / 16);
     static_assert(BlockKSmem % 16 == 0 && HeadDimV % BlockKSmem == 0 && NN == HeadDimV / 16);
-    static_assert(!Scheduled || (!CrossPage && NN == 16 && NK == 4 && VWindow == 4));
+    static_assert(!Scheduled || ((!CrossPage || VSourceN == 16) && NN == 16 && NK == 4));
+    static_assert(!TrimVTail || !Scheduled);
     CUTE_STATIC_ASSERT_V(size<1>(P) == size<1>(acc));
     CUTE_STATIC_ASSERT_V(size<1>(V) == size<2>(acc));
     CUTE_STATIC_ASSERT_V(size<2>(P) == size<2>(V));
 
     auto v_source = [&](auto nn, auto kk, auto page, auto cube) {
         if constexpr (CrossPage) {
-            auto view = make_tensor(CsV.data() + page * (VSourceN * BlockKSmem)
-                + cube * (BlockN * BlockKSmem), CsV.layout());
+            constexpr int PageStride = VSourceN * BlockKSmem;
+            constexpr int CubeStride = BlockN * BlockKSmem;
+            auto view = make_tensor(CsV.data() + page * PageStride + cube * CubeStride, CsV.layout());
             return view(_, nn, kk);
         } else {
             return CsV(_, nn, kk);
@@ -959,6 +967,9 @@ CUTLASS_DEVICE void gemm_rs_sm80_decoupled(
                 #pragma unroll
                 for (int k = 0; k < KAtomsPerPage; ++k) {
                     int const kk = page * KAtomsPerPage + k;
+                    if constexpr (TrimVTail) {
+                        if (kk * 16 >= valid_k) { break; }
+                    }
                     if constexpr (CrossPage) {
                         #pragma unroll
                         for (int nn = 0; nn < NN; ++nn) {
@@ -976,6 +987,8 @@ CUTLASS_DEVICE void gemm_rs_sm80_decoupled(
         }
     } else {
         static_assert(VWindow > 0 && VWindow <= NN * NK);
+        // A nonempty first tile always provides the first K16 slice.
+        static_assert(!TrimVTail || VWindow <= NN);
         CUTE_STATIC_ASSERT_V(size<1>(P) == _1{});
         using ElementV = typename TensorV::value_type;
         Tensor v_storage = make_tensor<ElementV>(make_shape(shape<0>(V), Int<VWindow>{}, _1{}));
@@ -1006,13 +1019,31 @@ CUTLASS_DEVICE void gemm_rs_sm80_decoupled(
                 constexpr int ord = decltype(ordinal)::value;
                 cute::gemm(tiled_mma, P(_, _0{}, Int<ord / NN>{}),
                     v_storage(_, Int<ord % VWindow>{}, _0{}), acc(_, _0{}, Int<ord % NN>{}));
-                if constexpr (ord + VWindow < NN * NK) { load_v(Int<ord + VWindow>{}); }
+                constexpr int next = ord + VWindow;
+                if constexpr (next < NN * NK) {
+                    if constexpr (TrimVTail && next / NN != ord / NN) {
+                        if (next / NN * 16 < valid_k) { load_v(Int<next>{}); }
+                    } else {
+                        load_v(Int<next>{});
+                    }
+                }
             };
             if constexpr (Scheduled) {
                 decoupled_d256_detail::run_pv_schedule<Check_inf>(acc_s, softmax, P, prefill_v, mma_step);
             } else {
                 prefill_v();
-                for_each(make_int_sequence<NN * NK>{}, mma_step);
+                if constexpr (TrimVTail) {
+                    for_each(make_int_sequence<NK>{}, [&](auto k) {
+                        constexpr int kk = decltype(k)::value;
+                        if (kk * 16 < valid_k) {
+                            for_each(make_int_sequence<NN>{}, [&](auto n) {
+                                mma_step(Int<kk * NN + decltype(n)::value>{});
+                            });
+                        }
+                    });
+                } else {
+                    for_each(make_int_sequence<NN * NK>{}, mma_step);
+                }
             }
         }
     }

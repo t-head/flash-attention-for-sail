@@ -19,6 +19,9 @@
 #include "paged_kv.h"
 #include "rotary.h"
 #include "utils.h"
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+#include "paired_kv_fwd_sm80.hpp"
+#endif
 #ifdef FLASHATTENTION_QSA_FP8
 #include "qsa/fp8_mma.h"
 #endif
@@ -112,11 +115,18 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
 #if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+    static constexpr bool DecoupledAiu16 = UseDecoupled && PagedKVAiu && kBlockNPagedPerAiuLoad == 16;
     static constexpr bool DecoupledD256Tuning = UseDecoupled && !Is_FP8
         && kHeadDim == 256 && kHeadDimV == 256;
+    // Interleave adjacent D64 bands within each K and V tile in TSM.
+    static constexpr bool UseInterleavedKVLayout = DecoupledD256Tuning;
     static_assert(!DecoupledD256Tuning ||
                   (kBlockM == 256 && kBlockN == 64 && kNWarps == 16 && kStages == 3),
                   "D256 tuning requires the M256/N64/W16/S3 decoupled tile");
+#else
+    static constexpr bool DecoupledAiu16 = false;
+    static constexpr bool DecoupledD256Tuning = false;
+    static constexpr bool UseInterleavedKVLayout = false;
 #endif
 
 #ifdef USE_PPU
@@ -272,9 +282,14 @@ struct CollectiveMainloopFwdSm80 {
     using SmemLayoutAtomQKVSwizzle = SmemLayoutAtomQKV;
 #endif
 
-    using SmemLayoutQ = std::conditional_t<!PackGQA,
+    using SmemLayoutQDefault = std::conditional_t<!PackGQA,
         decltype(tile_to_shape(SmemLayoutAtomQKV{}, select<0, 2>(TileShape_MNK{}))),
         decltype(tile_to_shape(SmemLayoutAtomQKVSwizzle{}, select<0, 2>(TileShape_MNK{})))>;
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+    using SmemLayoutQ = std::conditional_t<DecoupledD256Tuning, D256PairedQLayout::Layout, SmemLayoutQDefault>;
+#else
+    using SmemLayoutQ = SmemLayoutQDefault;
+#endif
     using SmemLayoutK = std::conditional_t<!PagedKV || PagedKVAiu,
         decltype(tile_to_shape(SmemLayoutAtomQKV{}, make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{}))),
         decltype(tile_to_shape(SmemLayoutAtomQKVSwizzle{}, make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})))>;
@@ -321,14 +336,21 @@ struct CollectiveMainloopFwdSm80 {
         ArchTag::kMinComputeCapability >= 89,
         PPU0015_TSM_LD_SWZL<Element, kBlockM, kBlockKGmem, false, false, 1>,
         PPU0010_TSM_LD_SWZL<Element, kBlockM, kBlockKGmem, false, false>>;
-    using SmemCopyOpK = std::conditional_t<
+    using SmemCopyOpKDefault = std::conditional_t<
         ArchTag::kMinComputeCapability >= 89,
         PPU0015_TSM_LD_SWZL<Element, PagedKVAiu ? kBlockNPagedPerAiuLoad : kBlockN, kBlockKGmem, true, false, (PagedKVAiu ? kBlockN / kBlockNPagedPerAiuLoad : 1) * kHeadDim / kBlockKGmem>,
         PPU0010_TSM_LD_SWZL<Element, PagedKVAiu ? kBlockNPagedPerAiuLoad : kBlockN, kBlockKGmem, false, false, (PagedKVAiu ? kBlockN / kBlockNPagedPerAiuLoad : 1) * kHeadDim / kBlockKGmem>>;
-    using SmemCopyOpKVt = std::conditional_t<
+    using SmemCopyOpKVtDefault = std::conditional_t<
         ArchTag::kMinComputeCapability >= 89,
         PPU0015_TSM_LD_SWZL<Element, PagedKVAiu ? kBlockNPagedPerAiuLoad : kBlockN, kBlockKGmem, true, true, (PagedKVAiu ? kBlockN / kBlockNPagedPerAiuLoad : 1) * kHeadDimV / kBlockKGmem>,
         PPU0010_TSM_LD_SWZL<Element, PagedKVAiu ? kBlockNPagedPerAiuLoad : kBlockN, kBlockKGmem, false, true, (PagedKVAiu ? kBlockN / kBlockNPagedPerAiuLoad : 1) * kHeadDimV / kBlockKGmem>>;
+#if FLASHATTENTION_ENABLE_DECOUPLED
+    using SmemCopyOpK = std::conditional_t<UseInterleavedKVLayout, PPU0015_D256_PairedKVLoad<Element, false>, SmemCopyOpKDefault>;
+    using SmemCopyOpKVt = std::conditional_t<UseInterleavedKVLayout, PPU0015_D256_PairedKVLoad<Element, true>, SmemCopyOpKVtDefault>;
+#else
+    using SmemCopyOpK = SmemCopyOpKDefault;
+    using SmemCopyOpKVt = SmemCopyOpKVtDefault;
+#endif
     // TSM reads shared memory only; global QSA K/V loads remain cp.async.
     static constexpr bool QsaTsmQ = QsaConfig::TsmQ && Is_QSA && PackGQA;
     static constexpr bool QsaTsmKV = QsaConfig::TsmKV && Is_QSA && !PagedKVAiu;
@@ -477,12 +499,30 @@ struct CollectiveMainloopFwdSm80 {
         };
         alignas(4096) cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
     };
-    using TensorStorage = std::conditional_t<Is_QSA_FP8,
+    using TensorStorageBase = std::conditional_t<Is_QSA_FP8,
         std::conditional_t<Share_QV_Smem, QsaTensorStorageSharedQV,
             std::conditional_t<Share_KV_Smem, QsaTensorStorageSharedKV, TensorStorageSeparateQV>>,
         TensorStorageDefault>;
 #else
-    using TensorStorage = TensorStorageDefault;
+    using TensorStorageBase = TensorStorageDefault;
+#endif
+
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+    // V reuses the second D128 pair after Q1-Q15 have been loaded into registers.
+    struct CUTE_ALIGNAS(128) TensorStoragePairedQ {
+        union {
+            cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
+            struct {
+                cute::array_aligned<Element, D256PairedQLayout::ElementsPerPair> q_first_pair;
+                cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>> smem_v;
+            };
+        };
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
+    };
+    using TensorStorage = std::conditional_t<DecoupledD256Tuning, TensorStoragePairedQ, TensorStorageBase>;
+    static_assert(!DecoupledD256Tuning || (Q_in_regs && sizeof(TensorStorage) == 256 * 1024));
+#else
+    using TensorStorage = TensorStorageBase;
 #endif
 
     // Host side kernel arguments
@@ -792,6 +832,12 @@ struct CollectiveMainloopFwdSm80 {
         auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(thread_idx);
 #endif
         Tensor tSsQ = [&]() -> auto {
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+            if constexpr (DecoupledD256Tuning) {
+                // Paired Q addresses its swizzled storage directly.
+                return sQ;
+            } else
+#endif
             if constexpr (QsaTsmQ) {
                 return smem_thr_copy_Q.partition_S(make_mix_tensor_like(make_tensor(sQ.data(), make_layout(shape(sQ)))));
             } else if constexpr (!PackGQA) {
@@ -850,6 +896,46 @@ struct CollectiveMainloopFwdSm80 {
         // writing to smem_o.
         // If persistent, need to sync to make sure all threads have finished with smem_o before writing to smem_v
         if constexpr (Share_QV_Smem) { __syncthreads(); }
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+        if constexpr (DecoupledD256Tuning) {
+            auto* smem_q = cute::raw_pointer_cast(sQ.data());
+            auto load_q = [&](auto copy_row_group) {
+                #pragma unroll
+                for (int half = 0; half < 2; ++half) {
+                    copy_row_group(2 * warp_idx + half);
+                }
+            };
+            if constexpr (!PackGQA) {
+                load_q([&](int row_group) {
+                    int const row = m_block * kBlockM + row_group * D256PairedQLayout::CubeRows;
+                    D256PairedQLayout::copy_row_group(smem_q, cute::raw_pointer_cast(mQ.data()),
+                        gmem_tiled_copy_Q.desc_, row_group, row);
+                });
+            } else {
+                int const ratio = params.qhead_per_khead_divmod.divisor;
+                constexpr int QRowsPerCopy = D256PairedQLayout::CubeRows;
+                // Eight packed rows share one token when the head ratio is a multiple of eight.
+                if (ratio % QRowsPerCopy == 0) {
+                    cute::AiuDesc q_desc;
+                    q_desc.init(nullptr, QRowsPerCopy, kHeadDim, get<0, 0>(params.stride_Q_packed));
+                    load_q([&](int row_group) {
+                        int head;
+                        int const token = params.qhead_per_khead_divmod.divmod(
+                            head, m_block * kBlockM + row_group * QRowsPerCopy);
+                        bool const valid_token = token < seqlen_q;
+                        auto const* src = valid_token ? &mQ(make_coord(head, token), _0{})
+                            : cute::raw_pointer_cast(mQ.data());
+                        // The first out-of-bounds row makes AIU zero-fill this entire group.
+                        D256PairedQLayout::copy_row_group(smem_q, src, q_desc, row_group,
+                            valid_token ? 0 : QRowsPerCopy);
+                    });
+                } else {
+                    using PackGQAt = flash::PackGQAManager<kBlockM, kHeadDim, NumMmaThreads, Element, Is_QSA, QsaConfig>;
+                    PackGQAt::load_Q(mQ, sQ, params.qhead_per_khead_divmod, thread_idx, seqlen_q, m_block);
+                }
+            }
+        } else
+#endif
         if constexpr (!PackGQA) {
             Tensor tQgQ = gmem_thr_copy_Q.partition_S(gQ);
             Tensor tQsQ = gmem_thr_copy_Q.partition_D(sQ);
@@ -880,12 +966,21 @@ struct CollectiveMainloopFwdSm80 {
         }
         cute::cp_async_fence();
 
+        // With AIU16, all KV copies, including the masked V tail, are partitioned among the producer warps.
+        static constexpr int PagedKVThreads = DecoupledAiu16 ? 128 : NumMmaThreads;
+        int const paged_kv_thread_idx = DecoupledAiu16 ? thread_idx % PagedKVThreads : thread_idx;
 #if defined(USE_PPU) && USE_AIU
-        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumMmaThreads, Element, true /*KV_Same_Iter*/, 1 /*LoadsPerRow_LB*/, PagedKVAiu, kBlockNPagedPerAiuLoad, Is_QSA
+        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), PagedKVThreads, Element, true /*KV_Same_Iter*/, 1 /*LoadsPerRow_LB*/, PagedKVAiu, kBlockNPagedPerAiuLoad, Is_QSA
             , QsaConfig
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
             , ReuseTokens
 #endif
+#ifndef FA3_HLLM_BUILD
+            , /*UniformAiuPageIds=*/DecoupledAiu16 && kHeadDim == 192 && kHeadDimV == 128
+#else
+            , false /*UniformAiuPageIds*/
+#endif
+            , UseInterleavedKVLayout && PagedKV
             >;
 #else
         using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumMmaThreads, Element, true /*KV_Same_Iter*/, 1 /*LoadsPerRow_LB*/, Is_QSA
@@ -903,7 +998,7 @@ struct CollectiveMainloopFwdSm80 {
                     params.ptr_K, params.shape_K, params.stride_K,
                     ptr_V, params.headdim_v, params.stride_V,
                     params.page_size_divmod, params.page_size_divmod,
-                    bidb_kv, bidh_kv, thread_idx, Is_QSA ? std::min(seqlen_info.seqlen_k, int(get<1>(params.shape_pagetable))) : seqlen_info.seqlen_k, seqlen_info.leftpad_k,
+                    bidb_kv, bidh_kv, paged_kv_thread_idx, Is_QSA ? std::min(seqlen_info.seqlen_k, int(get<1>(params.shape_pagetable))) : seqlen_info.seqlen_k, seqlen_info.leftpad_k,
                     0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/,
                     seqlen_info.offset_q, m_block
                 );
@@ -913,7 +1008,7 @@ struct CollectiveMainloopFwdSm80 {
                     params.ptr_K, params.shape_K, params.stride_K,
                     ptr_V, params.headdim_v, params.stride_K,
                     params.page_size_divmod, params.page_size_divmod,
-                    bidb_kv, bidh_kv, thread_idx, Is_QSA ? std::min(seqlen_info.seqlen_k, int(get<1>(params.shape_pagetable))) : seqlen_info.seqlen_k, seqlen_info.leftpad_k,
+                    bidb_kv, bidh_kv, paged_kv_thread_idx, Is_QSA ? std::min(seqlen_info.seqlen_k, int(get<1>(params.shape_pagetable))) : seqlen_info.seqlen_k, seqlen_info.leftpad_k,
                     0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/,
                     seqlen_info.offset_q, m_block
                 );
@@ -926,7 +1021,7 @@ struct CollectiveMainloopFwdSm80 {
             ptr_V, params.headdim_v, params.stride_V,
             params.page_size_divmod,
             params.page_size_divmod /*blockN_per_page_size_divmod, not used since we don't use TMA*/,
-            bidb_kv, bidh_kv, thread_idx, Is_QSA ? std::min(seqlen_info.seqlen_k, int(get<1>(params.shape_pagetable))) : seqlen_info.seqlen_k, seqlen_info.leftpad_k,
+            bidb_kv, bidh_kv, paged_kv_thread_idx, Is_QSA ? std::min(seqlen_info.seqlen_k, int(get<1>(params.shape_pagetable))) : seqlen_info.seqlen_k, seqlen_info.leftpad_k,
             0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/,
             seqlen_info.offset_q, m_block
         );
@@ -939,8 +1034,17 @@ struct CollectiveMainloopFwdSm80 {
                 static constexpr bool EvenN = kBlockN % CUTE_STATIC_V(shape<0>(GmemLayoutAtom{})) == 0;
                 Tensor tKsK_cur = tKsK(_, _, _, smem_pipe_write);
 #if defined(USE_PPU) && USE_AIU
-                flash::copy</*Is_even_MN=*/true>(
-                    gmem_tiled_copy_K, tKgK(_, _, _, n_block), tKsK_cur, t0KcK, tKpK);
+#if FLASHATTENTION_ENABLE_DECOUPLED
+                if constexpr (UseInterleavedKVLayout) {
+                    PPU0015_D256_PairedKVLoad<Element, false>::copy_stage(
+                        cute::raw_pointer_cast(sK.data()), mK.data().get(), gmem_tiled_copy_K.desc_,
+                        n_block, smem_pipe_write, warp_idx);
+                } else
+#endif
+                {
+                    flash::copy</*Is_even_MN=*/true>(
+                        gmem_tiled_copy_K, tKgK(_, _, _, n_block), tKsK_cur, t0KcK, tKpK);
+                }
 #else
                 // Instead of passing in tKcK, we pass in t0KcK and subtract the offset from the limit
                 // (seqlen_k - n_block * kBlockN). This is because the entries of t0KcK are known at compile time.
@@ -972,8 +1076,17 @@ struct CollectiveMainloopFwdSm80 {
                 // to not overshot kBlockN when writing to smem.
                 Tensor tVgV_cur = tVgV(_, _, _, n_block);
 #if defined(USE_PPU) && USE_AIU
-                flash::copy</*Is_even_MN=*/true>(
-                    gmem_tiled_copy_V, tVgV_cur, tVsV_cur, t0VcV, tVpV);
+#if FLASHATTENTION_ENABLE_DECOUPLED
+                if constexpr (UseInterleavedKVLayout) {
+                    PPU0015_D256_PairedKVLoad<Element, true>::copy_stage(
+                        cute::raw_pointer_cast(sV.data()), gV.data().ptr_.get(), gmem_tiled_copy_V.desc_,
+                        n_block, smem_pipe_write, warp_idx);
+                } else
+#endif
+                {
+                    flash::copy</*Is_even_MN=*/true>(
+                        gmem_tiled_copy_V, tVgV_cur, tVsV_cur, t0VcV, tVpV);
+                }
 #else
                 int const seqlenk_row_limit = seqlen_info.seqlen_k - n_block * kBlockN - get<0>(tVcV(_0{}, _0{}, _0{}));
                 #pragma unroll
@@ -989,7 +1102,8 @@ struct CollectiveMainloopFwdSm80 {
                 }
 #endif
             } else {
-                paged_kv_manager.template load_V<Seqlenk_mask>(n_block, sV(_, _, smem_pipe_write));
+                paged_kv_manager.template load_V<Seqlenk_mask, Seqlenk_mask && UseDecoupled && PagedKVAiu>(
+                    n_block, sV(_, _, smem_pipe_write));
             }
         };
 
@@ -1027,7 +1141,8 @@ struct CollectiveMainloopFwdSm80 {
 
         auto preprocess_Q = [&] {
             if constexpr (!AppendKV) {
-                flash::cp_async_wait<Share_QV_Smem ? 1 : kStages * 2 - 1>();
+                // AIU16 consumers wait for Q without depending on a second commit from K.
+                flash::cp_async_wait<DecoupledAiu16 ? 0 : (Share_QV_Smem ? 1 : kStages * 2 - 1)>();
             } else {
                 if (get<1>(params.shape_rotary) > 0) {  // Apply rotary to Q
                     using Rotary_t = Rotary<kBlockM, kHeadDim, NumMmaThreads, Element, !(Is_causal || Is_local) /*FixedPosition*/>;
@@ -1064,17 +1179,21 @@ struct CollectiveMainloopFwdSm80 {
 
             if constexpr (Q_in_regs) {
                 __syncthreads();
-                Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
-                Tensor tSsQ_copy_view = [&]() -> auto {
-                    if constexpr (QsaTsmQ) {
-                        return smem_thr_copy_Q.partition_S(make_mix_tensor_like(make_tensor(sQ.data(), make_layout(shape(sQ)))));
-                    } else if constexpr (!PackGQA) {
-                        return smem_thr_copy_Q.partition_S(make_mix_tensor_like(sQ));
-                    } else {
-                        return smem_thr_copy_Q.partition_S(sQ);
-                    }
-                }();
-                cute::copy(smem_tiled_copy_Q, tSsQ_copy_view, tSrQ_copy_view);
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+                if constexpr (DecoupledD256Tuning) {
+                    auto const* smem_q = cute::raw_pointer_cast(sQ.data());
+                    // Q0 stays in the first D128 pair until each QK step needs it.
+                    cute::for_each(cute::make_int_sequence<15>{}, [&](auto i) {
+                        constexpr int atom = 1 + decltype(i)::value;
+                        auto q = tSrQ(_, _0{}, Int<atom>{});
+                        D256PairedQLayout::load_fragment<atom>(smem_q, warp_idx, q);
+                    });
+                } else
+#endif
+                {
+                    Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+                    cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
+                }
             }
         };
 
@@ -1083,8 +1202,13 @@ struct CollectiveMainloopFwdSm80 {
         // If !Share_QV, Smem, we load Q, load all stages of K & V, then (optionally) rotate Q.
 
         if constexpr (Share_QV_Smem) {
-            load_K(n_block, 0, cute::true_type{} /*Seqlenk_mask*/);
-            cute::cp_async_fence();
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+            if (!DecoupledAiu16 || warp_idx < PagedKVThreads / 32)
+#endif
+            {
+                load_K(n_block, 0, cute::true_type{} /*Seqlenk_mask*/);
+                cute::cp_async_fence();
+            }
             preprocess_Q();
             __syncthreads();  // Make sure all threads have read smem_q before loading V
         }
@@ -1104,15 +1228,10 @@ struct CollectiveMainloopFwdSm80 {
             }
         };
         if constexpr (UseDecoupled) {
-            // The paged V tail clear is partitioned across the full CTA.
-            bool const clear_v_tail = PagedKVAiu && kBlockN > kBlockNPagedPerAiuLoad
-                && seqlen_k - n_block * kBlockN <= kBlockN - kBlockNPagedPerAiuLoad;
-            if (c_ready_group == 0 || clear_v_tail) {
+            // First PV skips fully invalid V groups, so WG0 alone stages V.
+            if (c_ready_group == 0) {
                 load_V(n_block, 0, cute::true_type{} /*Seqlenk_mask*/);
                 cute::cp_async_fence();
-            }
-            if (clear_v_tail) { __syncthreads(); }
-            if (c_ready_group == 0) {
                 flash::cp_async_wait<0>();
                 __ppu_barrier_sync(14, 128, 15u);
                 publish_ready(0);
@@ -1219,6 +1338,15 @@ struct CollectiveMainloopFwdSm80 {
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
             clear(tSrS);
 #if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+            Tensor q0_prefetched = make_tensor_like(tSrQ(_, _0{}, _0{}));
+            if constexpr (DecoupledD256Tuning) {
+                // Q0 is independent of the next KV stage's readiness.
+                asm volatile("" ::: "memory");
+                D256PairedQLayout::load_fragment<0>(cute::raw_pointer_cast(sQ.data()), warp_idx, q0_prefetched);
+                __ppu_sched_bound();
+            }
+#endif
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
             if constexpr (UseDecoupled) {
                 if (c_ready_group == 0) {
                     if (n_block > n_block_min) {
@@ -1267,19 +1395,19 @@ struct CollectiveMainloopFwdSm80 {
             Tensor tSrQ_cur = cute::conditional_return<Q_in_regs>(tSrQ, thr_mma_qk.partition_fragment_A(sQ));
             Tensor tSrK = thr_mma_qk.partition_fragment_B(sK(_, _, _0{}));
 #ifdef USE_PPU
+#if USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+            if constexpr (DecoupledD256Tuning) {
+                flash::gemm_sm80_d256_qk_prefetch4(
+                    tSrS, tSrQ_cur, tSrK, tSsK(_, _, _, smem_pipe_read),
+                    tiled_mma_qk, smem_tiled_copy_K, smem_thr_copy_K, q0_prefetched);
+            } else
+#endif
             if constexpr (PagedKVAiu && (kBlockN != kBlockNPagedPerAiuLoad)) {
                 flash::gemm_sm80_kv_paged_aiu<kBlockN, kBlockNPagedPerAiuLoad, kHeadDim, kBlockKGmem, Q_in_regs>(
                     tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
                     tiled_mma_qk, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, qk_prefetch
                 );
             } else {
-#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
-                if constexpr (DecoupledD256Tuning) {
-                    flash::gemm_sm80_d256_qk_prefetch4(
-                        tSrS, tSrQ_cur, tSrK, tSsK(_, _, _, smem_pipe_read),
-                        tiled_mma_qk, smem_tiled_copy_K, smem_thr_copy_K, qk_prefetch);
-                } else
-#endif
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
                 flash::gemm_sm80<Q_in_regs, false, false,
                     Is_QSA && !QsaReplicateQK ? QsaConfig::PrefetchB : 1>(
@@ -1492,13 +1620,15 @@ struct CollectiveMainloopFwdSm80 {
             if constexpr (kStages == 1 && (kHeadDim <= 96 || (kHeadDim <= 128 && PagedKV))) { flash::cp_async_wait<kStages * 2 - 1>(); __syncthreads(); }
 #if USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
             if constexpr (UseDecoupled) {
-                constexpr int VSourceN = PagedKVAiu ? kBlockNPagedPerAiuLoad : kBlockN;
-                constexpr int VWindow = UseScheduledPv ? 4
+                constexpr int VSourceN = UseInterleavedKVLayout ? kBlockN
+                    : (PagedKVAiu ? kBlockNPagedPerAiuLoad : kBlockN);
+                constexpr int VWindow = (UseScheduledPv || (DecoupledAiu16 && !UseInterleavedKVLayout)) ? 4
                     : (PagedKVAiu && kHeadDim == 192 && kHeadDimV == 192 ? 2 : 0);
+                int const valid_k = Is_first_iter ? seqlen_k - n_block * kBlockN : kBlockN;
                 flash::gemm_rs_sm80_decoupled<kBlockN, VSourceN, kBlockKGmem, kHeadDimV,
-                        VWindow, UseScheduledPv, Check_inf>(
+                        VWindow, UseScheduledPv, Check_inf, Is_first_iter>(
                     tSrS, softmax, tOrP, tOrV, tOsVt(_, _, _, smem_pipe_read),
-                    tOrO, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+                    tOrO, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V, valid_k);
             } else
 #endif
 #ifdef FLASHATTENTION_QSA_FP8

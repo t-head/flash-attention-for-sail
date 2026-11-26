@@ -292,8 +292,9 @@ public:
                 // LSE coordinates always use the M-split mainloop TiledMma:
                 // softmax.row_sum is produced on the QK M-split layout even
                 // when TiledMmaEpilogue is N-split.
-                epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, TiledMmaEpilogue{},
-                               threadIdx.x, block_coord, TiledMma{});
+                epilogue.template store<CollectiveMainloop::UseInterleavedKVLayout>(
+                    params.epilogue, tOrO, softmax.row_sum, shared_storage, TiledMmaEpilogue{},
+                    threadIdx.x, block_coord, TiledMma{});
             } else {
                 // Write 0 to gO and -inf to gLSE.
                 epilogue.store_zero(params.epilogue, threadIdx.x, block_coord);
