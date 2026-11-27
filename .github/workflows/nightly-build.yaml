@@ -1,0 +1,305 @@
+name: flash-attention nightly build
+
+# Build and test flash-attention, then publish the fa2/fa3 wheels to the
+# temporary wheel directory so downstream jobs can install a dated build.
+# target_ref selects the source: PR number or URL, branch name, release tag
+# or commit id; empty builds the default branch. sail_image overrides the
+# container image pinned in the reusable workflow.
+# Publishing is gated on the UT suite; a failure keeps the wheel as an
+# artifact only. Requires RELEASE_USERNAME / RELEASE_TOKEN secrets
+# (TEMPLATE_TOKEN for private templates).
+on:
+  schedule:
+    - cron: '30 11 * * *'
+  workflow_call:
+    inputs:
+      matrix:
+        description: 'JSON array of PPU runner board types.'
+        required: false
+        type: string
+        default: '["ZW-M890P"]'
+      target_ref:
+        description: 'PR number or PR URL, branch name, release tag or commit id. Empty builds the default branch.'
+        required: false
+        type: string
+        default: ''
+      sail_image:
+        description: 'Container image for the build/test pod. Empty uses the default image pinned in the reusable workflow.'
+        required: false
+        type: string
+        default: ''
+      variants:
+        description: 'JSON array of build variants; only wheel-producing variants (fa2 / fa3) are safe to publish.'
+        required: false
+        type: string
+        default: '["fa2","fa3"]'
+      version:
+        description: 'Version key for job names and NAS paths (v2.7.2 / v2.7.4 / v2.8.2).'
+        required: false
+        type: string
+        default: v2.8.2
+    secrets:
+      RELEASE_USERNAME:
+        required: true
+      RELEASE_TOKEN:
+        required: true
+      TEMPLATE_TOKEN:
+        required: false
+  workflow_dispatch:
+    inputs:
+      matrix:
+        description: 'JSON array of PPU runner board types.'
+        required: false
+        type: string
+        default: '["ZW-M890P"]'
+      target_ref:
+        description: 'PR number or PR URL, branch name, release tag or commit id. Empty builds the default branch.'
+        required: false
+        type: string
+        default: ''
+      sail_image:
+        description: 'Container image for the build/test pod. Empty uses the default image pinned in the reusable workflow.'
+        required: false
+        type: string
+        default: ''
+      variants:
+        description: 'JSON array of build variants; only wheel-producing variants (fa2 / fa3) are safe to publish.'
+        required: false
+        type: string
+        default: '["fa2","fa3"]'
+      version:
+        description: 'Version key for job names and NAS paths (v2.7.2 / v2.7.4 / v2.8.2).'
+        required: false
+        type: string
+        default: v2.8.2
+
+permissions:
+  contents: read
+
+# Runs for different targets must not cancel each other.
+concurrency:
+  group: flash-attention-nightly-${{ inputs.target_ref || 'default' }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  resolve:
+    name: Resolve source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      checkout_ref: ${{ steps.target.outputs.checkout_ref }}
+      commit: ${{ steps.target.outputs.commit }}
+      branch: ${{ steps.target.outputs.branch }}
+      tag: ${{ steps.target.outputs.tag }}
+      source_repo: ${{ steps.target.outputs.source_repo }}
+      extra_info: ${{ steps.target.outputs.extra_info }}
+      display: ${{ steps.target.outputs.display }}
+    steps:
+      - name: Resolve target ref
+        id: target
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          TARGET_REF_INPUT: ${{ inputs.target_ref }}
+          IMAGE_INPUT: ${{ inputs.sail_image }}
+          VARIANTS_INPUT: ${{ inputs.variants || '["fa2","fa3"]' }}
+        run: |
+          set -euo pipefail
+          raw="${TARGET_REF_INPUT//[[:space:]]/}"
+          # Drop a pasted ?query/#fragment before validating.
+          raw="${raw%%[?#]*}"
+          repo="$REPO"
+          default_branch="${DEFAULT_BRANCH:-v2.8.2}"
+          kind=default
+          branch=''
+          tag=''
+          pr=''
+          source_repo="$repo"
+          if [[ -n "$raw" ]]; then
+            # Reject anything that is not a plausible ref; the resolved values
+            # are later interpolated into the build checkout.
+            if [[ ! "$raw" =~ ^[A-Za-z0-9][A-Za-z0-9._/@:+-]*$ ]]; then
+              echo "::error::Unsupported target_ref '$TARGET_REF_INPUT': expected a PR number or URL, branch name, release tag or commit id"
+              exit 1
+            fi
+            case "$raw" in
+              *'/pull/'*)
+                # PR URL: keep only the number, dropping /files and any suffix.
+                num="${raw#*/pull/}"
+                num="${num%%[!0-9]*}"
+                [[ "$num" =~ ^[0-9]+$ ]] || { echo "::error::Cannot read a PR number from '$raw'"; exit 1; }
+                kind=pr
+                pr="$num"
+                ;;
+              *)
+                if [[ "$raw" =~ ^[0-9]+$ ]] && [[ ${#raw} -eq 40 ]]; then
+                  kind=commit
+                elif [[ "$raw" =~ ^[0-9]+$ ]]; then
+                  # Bare numbers are PR numbers; a 40-digit SHA stays a commit.
+                  kind=pr
+                  pr="$raw"
+                elif [[ "$raw" =~ ^[0-9a-fA-F]{40}$ ]]; then
+                  kind=commit
+                else
+                  # Branch, tag or short commit id: decided against the repository.
+                  kind=auto
+                fi
+                ;;
+            esac
+          fi
+          case "$kind" in
+            default)
+              branch="$default_branch"
+              checkout_ref="$branch"
+              commit="$(gh api "repos/$repo/commits/$branch" --jq .sha)"
+              display="$branch (latest)"
+              ;;
+            pr)
+              pr_json="$(gh api "repos/$repo/pulls/$pr")" || { echo "::error::PR #$pr not found in $repo"; exit 1; }
+              commit="$(jq -r '.head.sha' <<<"$pr_json")"
+              source_repo="$(jq -r '.head.repo.full_name // empty' <<<"$pr_json")"
+              source_repo="${source_repo:-$repo}"
+              checkout_ref="refs/pull/$pr/head"
+              display="PR #$pr"
+              ;;
+            commit)
+              commit="$(gh api "repos/$repo/commits/$raw" --jq .sha)" || { echo "::error::Commit $raw not found in $repo"; exit 1; }
+              # Check out the canonical SHA, not the user-supplied abbreviation.
+              checkout_ref="$commit"
+              display="commit $raw"
+              ;;
+            auto)
+              if gh api "repos/$repo/git/ref/heads/$raw" > /dev/null 2>&1; then
+                branch="$raw"
+                checkout_ref="$raw"
+                commit="$(gh api "repos/$repo/commits/$raw" --jq .sha)"
+                display="branch $raw"
+              elif gh api "repos/$repo/git/ref/tags/$raw" > /dev/null 2>&1; then
+                tag="$raw"
+                checkout_ref="refs/tags/$raw"
+                commit="$(gh api "repos/$repo/commits/$raw" --jq .sha)"
+                display="tag $raw"
+              elif commit="$(gh api "repos/$repo/commits/$raw" --jq .sha 2>/dev/null)"; then
+                # Abbreviated commit id; check out the canonical SHA.
+                checkout_ref="$commit"
+                display="commit $raw"
+              else
+                echo "::error::'$raw' is not a PR, branch, tag or commit in $repo"
+                exit 1
+              fi
+              ;;
+          esac
+          if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Resolved commit '$commit' is not a full SHA"
+            exit 1
+          fi
+          variants_flat="$(tr -d '[]" ' <<<"$VARIANTS_INPUT")"
+          {
+            echo "checkout_ref=$checkout_ref"
+            echo "commit=$commit"
+            echo "branch=$branch"
+            echo "tag=$tag"
+            echo "source_repo=$source_repo"
+            echo "extra_info=image=${IMAGE_INPUT:-default};variants=${variants_flat};build_tool=setup.py"
+            echo "display=$display"
+          } >> "$GITHUB_OUTPUT"
+          echo "flash-attention target: $display -> $commit"
+
+  build-test:
+    name: Build & Test
+    needs: resolve
+    # The called workflow declares these scopes, so the caller must grant them.
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: write
+    uses: ./.github/workflows/pr-fa-test-ppu.yaml
+    with:
+      version: ${{ inputs.version || 'v2.8.2' }}
+      matrix: ${{ inputs.matrix || '["ZW-M890P"]' }}
+      variants: ${{ inputs.variants || '["fa2","fa3"]' }}
+      checkout_ref: ${{ needs.resolve.outputs.checkout_ref }}
+      sail_image: ${{ inputs.sail_image }}
+    secrets: inherit
+
+  upload-wheels:
+    name: Upload wheel (${{ matrix.runner }})
+    needs: build-test
+    # Keep the wheel even when the UT suite fails; publishing stays gated below.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P"]') }}
+    steps:
+      - name: Upload wheel (${{ matrix.runner }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: flash-attention-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}
+          path: /wl_nas/devops/flash-attention-ci/${{ inputs.version || 'v2.8.2' }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/*/*.whl
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 14
+
+  merge:
+    name: Merge board wheel artifacts
+    # Every board must pass its UT suite.
+    needs: [build-test, upload-wheels]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      artifact_name: ${{ steps.artifact-name.outputs.artifact_name }}
+    steps:
+      - name: Set merged artifact name
+        id: artifact-name
+        shell: bash
+        run: |
+          echo "artifact_name=flash-attention-wheels-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+
+      - name: Merge wheel artifacts
+        uses: actions/upload-artifact/merge@v4
+        with:
+          name: ${{ steps.artifact-name.outputs.artifact_name }}
+          pattern: flash-attention-wheel-${{ github.run_id }}-${{ github.run_attempt }}-*
+          compression-level: 0
+          delete-merged: false
+
+  push:
+    name: Call temporary wheel upload template
+    needs: [merge, resolve]
+    uses: t-head/ci-infra/.github/workflows/push-tmp-wheel.yml@main
+    with:
+      # run_attempt moves when only the publishing job is rerun.
+      artifact_name: ${{ needs.merge.outputs.artifact_name }}
+      repo: ${{ needs.resolve.outputs.source_repo }}
+      commit: ${{ needs.resolve.outputs.commit }}
+      branch: ${{ needs.resolve.outputs.branch }}
+      tag: ${{ needs.resolve.outputs.tag }}
+      extra_info: ${{ needs.resolve.outputs.extra_info }}
+      template_repository: t-head/ci-infra
+      template_ref: main
+    secrets:
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+      template_token: ${{ secrets.TEMPLATE_TOKEN }}
+
+  result:
+    name: Show batch directory URL
+    needs: [push, resolve]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write to logs and job summary
+        shell: bash
+        env:
+          UPLOAD_URL: ${{ needs.push.outputs.upload_url }}
+          TARGET_DISPLAY: ${{ needs.resolve.outputs.display }}
+        run: |
+          set -euo pipefail
+          printf 'Source: %s\n' "$TARGET_DISPLAY" | tee -a "$GITHUB_STEP_SUMMARY"
+          printf 'Batch directory: %s\n' "$UPLOAD_URL" | tee -a "$GITHUB_STEP_SUMMARY"
