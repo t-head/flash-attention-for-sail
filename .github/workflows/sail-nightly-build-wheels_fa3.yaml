@@ -1,9 +1,6 @@
 name: sail nightly build fa3
 
 on:
-  push:
-    branches:
-      - 'ci/add_nightly_build_fj'
   schedule:
     # Daily at 11:30 UTC (19:30 Beijing time).
     - cron: '30 11 * * *'
