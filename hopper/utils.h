@@ -320,7 +320,11 @@ CUTLASS_DEVICE void convert_type_out(Tensor<Engine, Layout> const &tensor, Tenso
 template <int N>
 CUTE_HOST_DEVICE
 void cp_async_wait() {
-#if defined(CUTE_ARCH_CP_ASYNC_SM80_ENABLED)
+#if defined(USE_PPU)
+#if defined(CUTE_ARCH_CP_ASYNC_PPU_ENABLED)
+    asm volatile("ppu.cp.async.wait_group %0;\n" :: "n"(N));
+#endif
+#elif defined(CUTE_ARCH_CP_ASYNC_SM80_ENABLED)
     asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
 #endif
 }

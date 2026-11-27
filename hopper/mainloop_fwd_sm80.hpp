@@ -209,8 +209,13 @@ struct CollectiveMainloopFwdSm80 {
                                         Step<_2, _1, _3>{})));
 #endif
 
+#if defined(USE_PPU)
+    using SmemCopyAtom = Copy_Atom<PPU_U32x4_LDSM_N, Element>;
+    using SmemCopyAtomTransposed = Copy_Atom<PPU_U16x8_LDSM_T, Element>;
+#else
     using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
     using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, Element>;
+#endif
 #if defined(USE_PPU) && USE_AIU
     using SmemCopyOpQ = std::conditional_t<
         ArchTag::kMinComputeCapability >= 89,
@@ -271,7 +276,11 @@ struct CollectiveMainloopFwdSm80 {
     // from the same address by the same threadblock. This is slightly faster.
     using GmemCopyAtom = Copy_Atom<std::conditional_t<
         Has_cp_async,
+#if defined(USE_PPU)
+        PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>,
+#else
         SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>,
+#endif
         AutoVectorizingCopyWithAssumedAlignment<128>
     >, Element>;
 

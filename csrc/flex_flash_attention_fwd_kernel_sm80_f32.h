@@ -213,12 +213,16 @@ public:
     };
 
     static Params to_underlying_arguments(Arguments const& args) {
-        int sm_count = args.hw_info.sm_count;
-        if (sm_count <= 0) {
-            sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
+#if defined(USE_PPU)
+        int multiprocessor_count = args.hw_info.cu_count;
+#else
+        int multiprocessor_count = args.hw_info.sm_count;
+#endif
+        if (multiprocessor_count <= 0) {
+            multiprocessor_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
                 args.hw_info.device_id);
         }
-        cutlass::KernelHardwareInfo hw_info{args.hw_info.device_id, sm_count};
+        cutlass::KernelHardwareInfo hw_info{args.hw_info.device_id, multiprocessor_count};
         return {
             CollectiveMainloop::to_underlying_arguments(args.mainloop),
             CollectiveEpilogue::to_underlying_arguments(args.epilogue),
@@ -231,14 +235,18 @@ public:
 
     static dim3 get_grid_shape(Params const& params) {
         return TileScheduler::get_grid_shape(
+#if defined(USE_PPU)
+            params.scheduler, params.hw_info.cu_count * MinBlocksPerMultiprocessor);
+#else
             params.scheduler, params.hw_info.sm_count * MinBlocksPerMultiprocessor);
+#endif
     }
 
 #ifdef USE_PPU
     static dim3 get_grid_shape(Params const& params, int blocks_per_sm) {
         return TileScheduler::get_grid_shape(
             params.scheduler,
-            params.hw_info.sm_count * (blocks_per_sm <= 1 ? MinBlocksPerMultiprocessor : blocks_per_sm));
+            params.hw_info.cu_count * (blocks_per_sm <= 1 ? MinBlocksPerMultiprocessor : blocks_per_sm));
     }
 #endif
 

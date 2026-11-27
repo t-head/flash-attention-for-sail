@@ -474,7 +474,11 @@ struct CollectiveMainloopBwdSm80 {
     using R2STiledCopydQaccum = decltype(make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{}, R2SLayoutAtomdQaccum{},
                                                          Layout<Shape < _1>>{}));  // Val layout, 1 vals per store
 
+#if defined(USE_PPU)
+    using SmemCopyAtom = Copy_Atom<PPU_U32x4_LDSM_N, Element>;
+#else
     using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
+#endif
 #if PPU1v0_R2S_SLICE_LAYOUT
     // we purpose to pre-transpose P in share memory and load in non-transpose fashion
     using SmemCopyAtomPdSt_AIU = Copy_Atom<PPU0010_TSM_LD_SWZL<Element, kBlockN, kBlockMGmem, false, false, kBlockM / kBlockMGmem>, Element>;
@@ -493,11 +497,23 @@ struct CollectiveMainloopBwdSm80 {
         PPU0015_TSM_LD_SWZL_CVT_LOCAL<Element, 8, 64, kBlockM, kBlockN_PdS_safe, dKV_swapAB, true, kBlockM / 8 * kBlockN_PdS_safe / 64, true, 128, 64>,
         PPU0015_TSM_LD_SWZL<Element, kBlockM, kBlockNGmem, dKV_swapAB, true, kBlockN / kBlockNGmem>>, Element>;
 #endif
+#if defined(USE_PPU)
+    using SmemCopyAtomTransposed = Copy_Atom<PPU_U16x8_LDSM_T, Element>;
+#else
     using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, Element>;
+#endif
     // For the case where the N dimension of MmaSdP is divisible by 8 but not by 16
+#if defined(USE_PPU)
+    using SmemCopyAtomHalf = Copy_Atom<PPU_U32x2_LDSM_N, Element>;
+#else
     using SmemCopyAtomHalf = Copy_Atom<SM75_U32x2_LDSM_N, Element>;
+#endif
     // For the case where the N dimension of MmadQ is divisible by 8 but not by 16
+#if defined(USE_PPU)
+    using SmemCopyAtomTransposedHalf = Copy_Atom<PPU_U16x4_LDSM_T, Element>;
+#else
     using SmemCopyAtomTransposedHalf = Copy_Atom<SM75_U16x4_LDSM_T, Element>;
+#endif
 #if defined(USE_PPU) && USE_AIU
     // The CVT copy ops always address a headdim tile padded to 128 elements.
     static constexpr int kHeadDimPadding = 128;
@@ -548,7 +564,11 @@ struct CollectiveMainloopBwdSm80 {
     // from the same address by the same threadblock. This is slightly faster.
     using GmemCopyStruct = std::conditional_t<
         Has_cp_async,
+#if defined(USE_PPU)
+        PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>,
+#else
         SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>,
+#endif
         AutoVectorizingCopyWithAssumedAlignment<128>
     >;
     using GmemCopyAtom = Copy_Atom<GmemCopyStruct, Element>;

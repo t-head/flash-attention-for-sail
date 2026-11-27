@@ -515,16 +515,32 @@ struct CollectiveMainloopBwdSm80 {
     // use plain elementized copies (one float per op), same as mainloop fwd.
     using SmemCopyAtom = std::conditional_t<sizeof(Element) == 4,
         Copy_Atom<UniversalCopy<uint32_t>, Element>,
+#if defined(USE_PPU)
+        Copy_Atom<PPU_U32x4_LDSM_N, Element>>;
+#else
         Copy_Atom<SM75_U32x4_LDSM_N, Element>>;
+#endif
     using SmemCopyAtomTransposed = std::conditional_t<sizeof(Element) == 4,
         Copy_Atom<UniversalCopy<uint32_t>, Element>,
+#if defined(USE_PPU)
+        Copy_Atom<PPU_U16x8_LDSM_T, Element>>;
+#else
         Copy_Atom<SM75_U16x8_LDSM_T, Element>>;
+#endif
     using SmemCopyAtomHalf = std::conditional_t<sizeof(Element) == 4,
         Copy_Atom<UniversalCopy<uint32_t>, Element>,
+#if defined(USE_PPU)
+        Copy_Atom<PPU_U32x2_LDSM_N, Element>>;
+#else
         Copy_Atom<SM75_U32x2_LDSM_N, Element>>;
+#endif
     using SmemCopyAtomTransposedHalf = std::conditional_t<sizeof(Element) == 4,
         Copy_Atom<UniversalCopy<uint32_t>, Element>,
+#if defined(USE_PPU)
+        Copy_Atom<PPU_U16x4_LDSM_T, Element>>;
+#else
         Copy_Atom<SM75_U16x4_LDSM_T, Element>>;
+#endif
 #if defined(USE_PPU) && USE_AIU
     // The CVT copy ops always address a headdim tile padded to 128 elements.
     static constexpr int kHeadDimPadding = 128;
@@ -633,7 +649,11 @@ struct CollectiveMainloopBwdSm80 {
     // from the same address by the same threadblock. This is slightly faster.
     using GmemCopyStruct = std::conditional_t<
         Has_cp_async,
+#if defined(USE_PPU)
+        PPU_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>,
+#else
         SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>,
+#endif
         AutoVectorizingCopyWithAssumedAlignment<128>
     >;
     using GmemCopyAtom = Copy_Atom<GmemCopyStruct, Element>;
