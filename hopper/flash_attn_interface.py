@@ -75,6 +75,7 @@ def _flash_attn_forward(
     sm_margin: int = 0,
     s_aux: Optional[torch.Tensor] = None,
     qsa_allow_aiu: bool = False,
+    deterministic: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
@@ -124,6 +125,7 @@ def _flash_attn_forward(
         sm_margin,
         s_aux,
         qsa_allow_aiu,
+        deterministic,
     )
     # rest may contain out_accum, softmax_lse_accum
     out_accum = rest[0] if len(rest) > 0 and rest[0] is not None else torch.tensor([], device=out.device)
@@ -169,6 +171,7 @@ def _flash_attn_forward_fake(
     sm_margin: int = 0,
     s_aux: Optional[torch.Tensor] = None,
     qsa_allow_aiu: bool = False,
+    deterministic: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Symbolic fake implementation of flash attention forward.
@@ -220,6 +223,9 @@ def _flash_attn_forward_fake(
     # TODO(guilhermeleobas): Implement "get_num_splits"
     # There's an heuristic to compute num_splits when "num_splits <= 0"
     # assert that num_splits is > 0 for now
+    if (num_splits <= 0 and page_table is not None and page_table.ndim == 3
+            and (deterministic or torch.are_deterministic_algorithms_enabled())):
+        num_splits = 1
     if num_splits <= 0:
         raise ValueError(f"tracing (torch.compile/torch.export) with num_splits <= 0 not supported. Got {num_splits=}")
 
@@ -358,6 +364,58 @@ def _flash_attn_backward_fake(
     return softmax_d
 
 
+@torch.library.custom_op("flash_attn_3_ops::_flash_attn_qsa_backward", mutates_args=(), device_types="cuda")
+def _flash_attn_qsa_backward(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    indices: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
+    seqused_k: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    deterministic: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dout, q, k, v, out, indices = [maybe_contiguous(x) for x in (dout, q, k, v, out, indices)]
+    return flash_attn_3_cuda.qsa_bwd(
+        dout, q, k, v, out, softmax_lse, indices, cu_seqlens_q.contiguous(),
+        max_seqlen_q, seqused_k.contiguous() if seqused_k is not None else None,
+        softmax_scale, causal, deterministic,
+    )
+
+
+@torch.library.register_fake("flash_attn_3_ops::_flash_attn_qsa_backward")
+def _flash_attn_qsa_backward_fake(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    indices: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
+    seqused_k: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    deterministic: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return tuple(torch.empty(x.shape, dtype=x.dtype, device=x.device) for x in (q, k, v))
+
+
+def _check_qsa_backward_options(window_size, attention_chunk, softcap, qsa_allow_aiu, unsupported_tensors):
+    if (window_size != (-1, -1) or attention_chunk != 0 or softcap != 0.0
+            or qsa_allow_aiu or any(x is not None for x in unsupported_tensors)):
+        raise RuntimeError(
+            "QSA backward only supports plain BF16/FP16 attention without local windows, "
+            "chunks, softcap, AIU bulk loads, rotary, append, qv, s_aux, or cache remapping"
+        )
+
+
 def setup_context(ctx, inputs, output):
     # inputs matches _flash_attn_forward's signature order
     # Tensor args: q=0, k=1, v=2, k_new=3, v_new=4, qv=5, out=6,
@@ -372,7 +430,19 @@ def setup_context(ctx, inputs, output):
     seqused_q = inputs[10]
     seqused_k = inputs[11]
     out, softmax_lse, _, _ = output
-    ctx.save_for_backward(q, k, v, out, softmax_lse)
+    page_table = inputs[14]
+    ctx.is_qsa = page_table is not None and page_table.ndim == 3
+    if ctx.is_qsa:
+        ctx.deterministic = inputs[36] or torch.are_deterministic_algorithms_enabled()
+        _check_qsa_backward_options(
+            (inputs[25], inputs[26]), inputs[27], inputs[28], inputs[35],
+            tuple(inputs[i] for i in (3, 4, 5, 6, 8, 9, 10, 15, 16, 17, 18, 19, 20, 21, 22, 34)),
+        )
+        ctx.save_for_backward(q, k, v, out, softmax_lse, page_table, cu_seqlens_q, seqused_k)
+        ctx.mark_non_differentiable(*output[1:])
+        ctx.set_materialize_grads(False)
+    else:
+        ctx.save_for_backward(q, k, v, out, softmax_lse)
     ctx.cu_seqlens_q = cu_seqlens_q
     ctx.cu_seqlens_k = cu_seqlens_k
     ctx.seqused_q = seqused_q
@@ -388,6 +458,18 @@ def setup_context(ctx, inputs, output):
 
 
 def _backward(ctx, dout, *grads):
+    ninputs = len(ctx.needs_input_grad)
+    if ctx.is_qsa:
+        if dout is None:
+            return (None,) * ninputs
+        if torch.is_grad_enabled():
+            raise RuntimeError("QSA backward does not support higher-order gradients")
+        q, k, v, out, softmax_lse, indices, cu_seqlens_q, seqused_k = ctx.saved_tensors
+        dq, dk, dv = _flash_attn_qsa_backward(
+            dout, q, k, v, out, softmax_lse, indices, cu_seqlens_q,
+            ctx.max_seqlen_q, seqused_k, ctx.softmax_scale, ctx.causal, ctx.deterministic,
+        )
+        return dq, dk, dv, *((None,) * (ninputs - 3))
     q, k, v, out, softmax_lse = ctx.saved_tensors
     dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
     _flash_attn_backward(
@@ -414,7 +496,7 @@ def _backward(ctx, dout, *grads):
         False,  # deterministic
         ctx.sm_margin,
     )
-    return dq, dk, dv, *((None,) * 32)
+    return dq, dk, dv, *((None,) * (ninputs - 3))
 
 
 _flash_attn_forward.register_autograd(_backward, setup_context=setup_context)
@@ -960,6 +1042,7 @@ def flash_attn_with_kvcache(
     max_seqlen_k: Optional[int] = None,
     s_aux=None,
     qsa_allow_aiu: bool = False,
+    deterministic: bool = False,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -1001,7 +1084,11 @@ def flash_attn_with_kvcache(
     will only attend to keys between
     [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
 
-    Note: Does not support backward pass.
+    Backward is supported only for PPU QSA with BF16/FP16, head dim 256, and
+    plain causal/noncausal attention using per-token gathers. Sparse indices
+    receive no gradients. The default backward uses FP32 atomic accumulation.
+    Other KV-cache modes, local windows, softcap, rotary, append, and AIU bulk
+    loads do not support backward. Higher-order gradients are unsupported.
 
     Arguments:
         q: (batch_size, seqlen, nheads, headdim)
@@ -1028,12 +1115,20 @@ def flash_attn_with_kvcache(
             Pass (total_q, 1, topk) instead to select query-sparse attention (QSA), where each row
             holds the token indices selected for one unpadded query token. Requires head dim 256,
             cu_seqlens_q, no cache_batch_idx, and a build with FLASH_ATTENTION_ENABLE_QSA.
+            QSA with multiple queries per sequence uses the packed GQA layout.
+            For QSA backward, token indices must be within the physical KV pool and
+            sequence offsets and lengths must be valid. Grouped backward assumes
+            finite Q/K/V/out/dout and finite LSE on active rows. Deterministic 10-query
+            grouping requires strictly increasing indices within each valid prefix.
         qsa_allow_aiu: bool. QSA only: certify that every 16-column-aligned group of the
             (total_q, 1, topk) table holds 16 pool-contiguous tokens, the layout the AIU
             paged-KV bulk load assumes (one table entry read per group, 16 contiguous
             tokens fetched). Defaults to False, which routes QSA through the per-column
             load that honors each entry individually. A scattered top-k list MUST keep
             this False or the kernel silently attends to the wrong K/V.
+        deterministic: bool. For QSA, use a fixed accumulation order in backward. Forward
+            uses one KV split when num_splits is automatic, or the requested count when
+            explicit. PyTorch deterministic algorithms also enable this mode.
         softmax_scale: float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
@@ -1057,11 +1152,26 @@ def flash_attn_with_kvcache(
     """
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+    is_qsa = page_table is not None and page_table.ndim == 3
+    if is_qsa:
+        deterministic = deterministic or torch.are_deterministic_algorithms_enabled()
+    if is_qsa and torch.is_grad_enabled() and any(x.requires_grad for x in (q, k_cache, v_cache)):
+        _check_qsa_backward_options(
+            window_size, attention_chunk, softcap, qsa_allow_aiu,
+            (k, v, qv, cu_seqlens_k_new, cache_batch_idx, cache_leftpad,
+             rotary_cos, rotary_sin, rotary_seqlens, q_descale, k_descale, v_descale, s_aux),
+        )
     if softmax_scale is None:
         softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
+        if is_qsa:
+            if cu_seqlens_q is None:
+                raise RuntimeError("QSA requires cu_seqlens_q")
+            cache_batch = cu_seqlens_q.numel() - 1
+        else:
+            cache_batch = k_cache.shape[0]
         cache_seqlens = torch.full(
-            (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
+            (cache_batch,), cache_seqlens, dtype=torch.int32, device=k_cache.device
         )
         cache_seqlens = maybe_contiguous(cache_seqlens)
     out, softmax_lse, *rest = _flash_attn_forward(
@@ -1098,6 +1208,7 @@ def flash_attn_with_kvcache(
         sm_margin,
         s_aux,
         qsa_allow_aiu,
+        deterministic,
     )
     # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out

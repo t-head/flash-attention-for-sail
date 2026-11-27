@@ -49,6 +49,8 @@ DISABLE_CLUSTER = os.getenv("FLASH_ATTENTION_DISABLE_CLUSTER", ("TRUE" if USE_PP
 # QSA (query-sparse attention) only adds head dim 256 paged-KV instantiations, so it is on by
 # default; set FLASH_ATTENTION_ENABLE_QSA=FALSE to leave them out.
 ENABLE_QSA = os.getenv("FLASH_ATTENTION_ENABLE_QSA", "TRUE") == "TRUE"
+# Opt in to the large-tile BF16 ready/free implementation.
+ENABLE_DECOUPLED = os.getenv("FLASH_ATTENTION_ENABLE_DECOUPLED", "FALSE") == "TRUE"
 DISABLE_HDIM64 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM64", "FALSE") == "TRUE"
 DISABLE_HDIM96 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM96", "FALSE") == "TRUE"
 DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE"
@@ -135,6 +137,7 @@ if not SKIP_CUDA_BUILD:
         + (["-DFLASHATTENTION_DISABLE_FP8"] if DISABLE_FP8 else [])
         + (["-DFLASHATTENTION_DISABLE_VARLEN"] if DISABLE_VARLEN else [])
         + (["-DFLASHATTENTION_ENABLE_QSA"] if ENABLE_QSA else [])
+        + (["-DFLASHATTENTION_ENABLE_DECOUPLED=1"] if ENABLE_DECOUPLED and not DISABLE_SM89 else [])
         + (["-DFLASHATTENTION_QSA_FP8"] if ENABLE_QSA_FP8 else [])
         + (["-DFLASHATTENTION_DISABLE_CLUSTER"] if DISABLE_CLUSTER else [])
         + (["-DFLASHATTENTION_DISABLE_HDIM64"] if DISABLE_HDIM64 else [])
@@ -191,6 +194,8 @@ if not SKIP_CUDA_BUILD:
         sources += ["qsa/dispatch.cu"]
         if ENABLE_QSA_FP8:
             sources += ["qsa/fp8.cu"]
+        if not DISABLE_BACKWARD and not DISABLE_HDIM256 and not DISABLE_SM8x and not FA3_HLLM_BUILD:
+            sources += ["qsa/backward.cu"]
 
     include_dirs = [
         str(Path(this_dir)),
@@ -256,8 +261,14 @@ def get_package_version():
 
 
 class CachedWheelsCommand(_bdist_wheel):
-    def run(self):
-        return super().run()
+    def egg2dist(self, egginfo_path, distinfo_path):
+        super().egg2dist(egginfo_path, distinfo_path)
+        if FA3_HOLMES_WHEEL:
+            # The license notices live at the repository root, above the wheel build directory.
+            license_dir = Path(distinfo_path) / "licenses"
+            license_dir.mkdir(exist_ok=True)
+            for filename in ("LICENSE", "AUTHORS"):
+                self.copy_file(str(Path(this_dir).parent / filename), str(license_dir / filename))
 
 
 class PerSourceBuildExtension(BuildExtension):
@@ -320,6 +331,7 @@ setup(
     py_modules=[] if FA3_HOLMES_WHEEL else ["flash_attn_interface"],
     author="Tri Dao",
     author_email="tri@tridao.me",
+    license="BSD-3-Clause" if FA3_HOLMES_WHEEL else None,
     description="Flash Attention 3: Fast and Memory-Efficient Exact Attention",
     long_description=open("../README.md", "r", encoding="utf-8").read(),
     long_description_content_type="text/markdown",

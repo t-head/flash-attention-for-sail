@@ -1,6 +1,6 @@
 // Copyright (c) 2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.
 #pragma once
-#include <mma.h>
+#include <hggc_mma.h>
 #include "cute/atom/mma_traits_ppu0010.hpp"
 namespace cute {
 struct QsaSM80_8x16x16_F32BF16BF16F32_TN {

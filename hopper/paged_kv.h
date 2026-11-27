@@ -11,6 +11,9 @@
 
 #include "utils.h"
 #include "qsa/dispatch.h"
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+#include "paired_kv_fwd_sm80.hpp"
+#endif
 
 namespace flash {
 
@@ -22,6 +25,8 @@ template <int kBlockN, int kHeadDim, int kHeadDimV, int NumThreads, typename Ele
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
           , bool ReuseQsaTokenIndex=false
 #endif
+          , bool UniformAiuPageIds=false
+          , bool PairedKV=false
           >
 #else
 template <int kBlockN, int kHeadDim, int kHeadDimV, int NumThreads, typename Element, bool KV_Same_Iter=false, int LoadsPerRow_LB=1, bool Is_QSA=false
@@ -186,6 +191,9 @@ struct PagedKVManager {
     int const warp_idx;
     static constexpr int kNAiuLoads = cute::ceil_div(kBlockN, kBlockNPagedPerAiuLoad);
     static constexpr int kPageEntryPerWarp = cute::ceil_div(kNAiuLoads, kNWarps);
+    static_assert(!UniformAiuPageIds || (PagedKVAiu && KV_Same_Iter && !Is_QSA
+        && kBlockNPagedPerAiuLoad == 16 && (kBlockN == 64 || kBlockN == 128) && kNWarps == 4));
+    std::conditional_t<UniformAiuPageIds, cute::array<cute::tuple<int, int>, kPageEntryPerWarp>, cute::tuple<>> uniform_page_offsets;
 #if !(defined(FA3_HLLM_BUILD) && defined(FA3_HLLM_USE_ADDR))
     using TensorPageOffsetAiu = cute::tuple<int, int>;
 #else
@@ -357,6 +365,24 @@ struct PagedKVManager {
     void load_page_table(const int n_block) {
 #if defined(__HGGC_ARCH__) &&  __HGGC_ARCH__ >= 100 && defined(USE_PPU) && USE_AIU
         if constexpr (PagedKVAiu) {
+#ifndef FA3_HLLM_BUILD
+            if constexpr (UniformAiuPageIds) {
+                // Each warp shares the page and offset of every AIU group it copies.
+                #pragma unroll
+                for (int i = 0; i < kPageEntryPerWarp; ++i) {
+                    int const group_idx = n_block * kNAiuLoads + warp_idx + i * kNWarps;
+                    int const row_idx = group_idx * kBlockNPagedPerAiuLoad;
+                    int page_idx = group_idx, page_offset = 0;
+                    if (page_size_divmod.divisor != kBlockNPagedPerAiuLoad) {
+                        page_idx = page_size_divmod.divmod(page_offset, row_idx);
+                    }
+                    int const page = !Seqlenk_mask || row_idx < seqlen_k
+                        ? __ld_smem(&mPageTable[page_idx]) : 0;
+                    uniform_page_offsets[i] = {page, page_offset};
+                }
+                return;
+            }
+#endif
             int const page_entry_idx = thread_idx % kPageEntryPerWarp;
             int const row = (page_entry_idx * kNWarps + warp_idx) * kBlockNPagedPerAiuLoad;
             int const row_idx = n_block * kBlockN + row;
@@ -609,6 +635,31 @@ struct PagedKVManager {
     }
 #endif
 
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ >= 150 && defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+    // A producer warp owns one logical stripe; its source may start anywhere
+    // within a physical page, while the paired destination is page-independent.
+    template <bool PadPartialStripe, bool Seqlenk_mask, typename StageTensor>
+    CUTLASS_DEVICE void load_paired_kv(int n_block, StageTensor const& stage,
+                                      TensorKVPtrAiu source, AiuDesc descriptor) {
+        using Copy = cute::PPU0015_D256_PairedKVLoad<Element, false>;
+        static_assert(PairedKV && PagedKVAiu && KV_Same_Iter && !UniformAiuPageIds);
+        static_assert(kBlockN == Copy::Rows && kHeadDim == 256 && kHeadDimV == 256
+            && kBlockNPagedPerAiuLoad == Copy::StripeRows && kNWarps == 4 && kPageEntryPerWarp == 1);
+        auto* destination = cute::raw_pointer_cast(stage.data());
+        if constexpr (Seqlenk_mask) {
+            int const valid_rows = std::min(Copy::StripeRows,
+                seqlen_k - (n_block * kBlockN + warp_idx * Copy::StripeRows));
+            // The first PV skips fully invalid stripes. AIU pads a partial V stripe.
+            if (valid_rows <= 0) { return; }
+            if constexpr (PadPartialStripe) { descriptor.dim_h = valid_rows; }
+        }
+        #pragma unroll
+        for (int band = 0; band < Copy::Bands; ++band) {
+            Copy::copy_stripe(destination, source, descriptor, warp_idx, band);
+        }
+    }
+#endif
+
     template <bool Seqlenk_mask=false,
 #if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA)
               bool PrefetchedTokens=false,
@@ -624,8 +675,16 @@ struct PagedKVManager {
         static_assert(!PrefetchedTokens || (Is_QSA && QsaConfig::DirectIndex));
 #endif
 #if defined(__HGGC_ARCH__) &&  __HGGC_ARCH__ >= 100 && defined(USE_PPU) && USE_AIU
+#if __HGGC_ARCH__ >= 150 && FLASHATTENTION_ENABLE_DECOUPLED
+        if constexpr (PairedKV) {
+            load_paired_kv<false, Seqlenk_mask>(n_block, sK, compute_K_ptr_aiu(),
+                                               gmem_tiled_copy_k_aiu.desc_);
+            return;
+        } else
+#endif
         if constexpr (PagedKVAiu) {
-            TensorKVPtrAiu tPrKPtrAiu = compute_K_ptr_aiu();
+            TensorKVPtrAiu tPrKPtrAiu = nullptr;
+            if constexpr (!UniformAiuPageIds) { tPrKPtrAiu = compute_K_ptr_aiu(); }
             Tensor tKsK = gmem_thr_copy_k_aiu.partition_D(sK);
             #pragma unroll
             for (int m = 0; m < kPageEntryPerWarp; m++) {
@@ -637,7 +696,10 @@ struct PagedKVManager {
                 }
                 // it's safe for load_K to read without predicate, thus no need to set AIU boundary.
                 Element* k_ptr;
-                if constexpr (kPageEntryPerWarp > 1) {
+                if constexpr (UniformAiuPageIds) {
+                    auto [page, page_offset] = uniform_page_offsets[m];
+                    k_ptr = &mK_paged(page_offset, _0{}, page);
+                } else if constexpr (kPageEntryPerWarp > 1) {
                     k_ptr = reinterpret_cast<Element*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrKPtrAiu), m));
                 } else {
                     k_ptr = tPrKPtrAiu;
@@ -750,16 +812,24 @@ struct PagedKVManager {
         }
     };
 
-    template <bool Seqlenk_mask=false, typename TensorV>
+    template <bool Seqlenk_mask=false, bool SkipFullVTailClear=false, typename TensorV>
     CUTLASS_DEVICE
     void load_V(const int n_block, TensorV &&sV) {
 #if defined(__HGGC_ARCH__) &&  __HGGC_ARCH__ >= 100 && defined(USE_PPU) && USE_AIU
+#if __HGGC_ARCH__ >= 150 && FLASHATTENTION_ENABLE_DECOUPLED
+        if constexpr (PairedKV) {
+            compute_V_ptr_aiu();
+            load_paired_kv<true, Seqlenk_mask>(n_block, sV, tPrVPtrAiu,
+                                              gmem_tiled_copy_v_aiu.desc_);
+            return;
+        } else
+#endif
         if constexpr (PagedKVAiu) {
-            if constexpr (KV_Same_Iter) { compute_V_ptr_aiu(); }
+            if constexpr (KV_Same_Iter && !UniformAiuPageIds) { compute_V_ptr_aiu(); }
             Tensor tVsV = gmem_thr_copy_v_aiu.partition_D(sV);
             if constexpr (!Seqlenk_mask) {
                 gmem_tiled_copy_v_aiu.desc_.dim_h = kBlockNPagedPerAiuLoad;
-            } else {
+            } else if constexpr (!SkipFullVTailClear) {
                 // Zero only the fully-trailing groups (rows past the group-aligned bound) through the cp.async-style partitioning
                 static constexpr bool EvenN_cp = kBlockN % CUTE_STATIC_V(shape<0>(GmemLayoutAtomKVCpAsync{})) == 0;
                 auto gmem_thr0_copy_kv = gmem_tiled_copy_kv.get_thread_slice(_0{});
@@ -787,11 +857,15 @@ struct PagedKVManager {
                 if (row_page >= kBlockN) { break; }
                 if constexpr (Seqlenk_mask) {
                     int row = n_block * kBlockN + row_page;
-                    if (row >= seqlen_k) { break; }   // trailing rows already zeroed above
+                    // Fully invalid groups are cleared above or skipped by the first PV.
+                    if (row >= seqlen_k) { break; }
                     gmem_tiled_copy_v_aiu.desc_.dim_h = std::min(kBlockNPagedPerAiuLoad, seqlen_k - row);
                 }
                 Element* v_ptr;
-                if constexpr (kPageEntryPerWarp > 1) {
+                if constexpr (UniformAiuPageIds) {
+                    auto [page, page_offset] = uniform_page_offsets[m];
+                    v_ptr = &mV_paged(page_offset, _0{}, page);
+                } else if constexpr (kPageEntryPerWarp > 1) {
                     v_ptr = reinterpret_cast<Element*>(__shfl_sync(0xffffffff, reinterpret_cast<uint64_t>(tPrVPtrAiu), m));
                 } else {
                     v_ptr = tPrVPtrAiu;

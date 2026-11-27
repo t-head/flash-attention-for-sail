@@ -78,6 +78,21 @@ constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_sm8x(
     }
 }
 
+#if defined(USE_PPU) && USE_AIU && FLASHATTENTION_ENABLE_DECOUPLED
+// An all-zero tile leaves this head on the generic dispatch path.
+constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_ppu_decoupled(
+        int headdim, int headdim_v) {
+    if ((headdim == 64 || headdim == 256) && headdim_v == 256) {
+        return {256, 64, 16, 3, true};
+    }
+    if (headdim == 192 && (headdim_v == 128 || headdim_v == 192)) {
+        return {256, 128, 16, headdim_v == 128 ? 3 : 2, true};
+    }
+    return {0, 0, 0, 0, false};
+}
+
+#endif
+
 #ifdef USE_PPU
 // Return {kBlockM, kBlockN, kNWarps, kStages, Q_in_regs}
 constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_ppu(

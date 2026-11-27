@@ -256,7 +256,8 @@ struct CollectiveEpilogueFwd {
     }
 
 #endif  // FLASHATTENTION_QSA_FP8
-    template <typename SharedStorage, typename FrgTensorO, typename FrgTensorLSE, typename TiledMma, typename TiledMmaLSE = TiledMma>
+    template <bool PairedVColumns = false, typename SharedStorage, typename FrgTensorO,
+              typename FrgTensorLSE, typename TiledMma, typename TiledMmaLSE = TiledMma>
     CUTLASS_DEVICE void
 #ifdef FLASHATTENTION_QSA_FP8
     store(Params const& original,
@@ -271,6 +272,7 @@ struct CollectiveEpilogueFwd {
           cute::tuple<int32_t, int32_t, int32_t, int32_t> const& block_coord,
           TiledMmaLSE tiled_mma_lse = {}
           ) {
+        static_assert(!PairedVColumns || (Use_smem && !Split && sizeof(Element) == 2));
 #ifdef FLASHATTENTION_QSA_FP8
         auto const& params = output_part_params(original);
 #endif
@@ -313,7 +315,27 @@ struct CollectiveEpilogueFwd {
                 Tensor taccOrO = smem_thr_copy_O.retile_S(tOrO_out);        // ((Atom,AtomNum), MMA_M, MMA_N)
                 Tensor taccOsO = smem_thr_copy_O.partition_D(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
                 // Tensor taccOsO = smem_thr_copy_O.partition_D(sO_pi);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
-                cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
+                if constexpr (PairedVColumns) {
+                    // The V layout used to eliminate group conflicts permutes the columns of O.
+                    // Undo the V permutation as O is written to shared memory.
+                    // Swapping column bits 3 and 6 preserves each adjacent BF16 pair.
+                    auto src = cute::recast<uint32_t>(taccOrO);
+                    auto dst = cute::recast<uint32_t>(taccOsO);
+                    static_assert(decltype(size<0>(src))::value == 4);
+                    static_assert(decltype(size<1>(src))::value == 1);
+                    static_assert(decltype(size<2>(src))::value == 16);
+                    cute::for_each(cute::make_int_sequence<16>{}, [&](auto n) {
+                        constexpr int col = decltype(n)::value;
+                        cute::for_each(cute::make_int_sequence<4>{}, [&](auto word) {
+                            constexpr int pair = decltype(word)::value;
+                            constexpr int source_pair = (pair & 1) | ((col & 4) >> 1);
+                            constexpr int source_col = (col & ~4) | ((pair & 2) << 1);
+                            dst(word, cute::_0{}, n) = src(cute::Int<source_pair>{}, cute::_0{}, cute::Int<source_col>{});
+                        });
+                    });
+                } else {
+                    cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
+                }
                 if constexpr (Use_TMA_O) {
                     cutlass::arch::fence_view_async_shared(); // ensure smem writes are visible to TMA
                     cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp,
