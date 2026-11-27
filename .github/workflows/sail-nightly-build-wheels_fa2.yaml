@@ -17,7 +17,7 @@ on:
         type: string
         default: torch
       python_versions:
-        description: 'JSON array; allowed values: 38, 310, 312'
+        description: 'JSON array; allowed values: 310, 312'
         required: true
         type: string
         default: '["312"]'
