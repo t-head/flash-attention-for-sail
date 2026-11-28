@@ -49,8 +49,8 @@ DISABLE_CLUSTER = os.getenv("FLASH_ATTENTION_DISABLE_CLUSTER", ("TRUE" if USE_PP
 # QSA (query-sparse attention) only adds head dim 256 paged-KV instantiations, so it is on by
 # default; set FLASH_ATTENTION_ENABLE_QSA=FALSE to leave them out.
 ENABLE_QSA = os.getenv("FLASH_ATTENTION_ENABLE_QSA", "TRUE") == "TRUE"
-# Opt in to the large-tile BF16 ready/free implementation.
-ENABLE_DECOUPLED = os.getenv("FLASH_ATTENTION_ENABLE_DECOUPLED", "FALSE") == "TRUE"
+# Set FLASH_ATTENTION_ENABLE_DECOUPLED=FALSE to disable the large-tile BF16 path.
+ENABLE_DECOUPLED = os.getenv("FLASH_ATTENTION_ENABLE_DECOUPLED", "TRUE") == "TRUE"
 DISABLE_HDIM64 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM64", "FALSE") == "TRUE"
 DISABLE_HDIM96 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM96", "FALSE") == "TRUE"
 DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE"
