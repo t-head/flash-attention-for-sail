@@ -2103,7 +2103,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     // either unless it is a multiple of the real tile, e.g. round_multiple(203, 128) = 256
     // is smaller than round_multiple(203, 96) = 288.  So mirror the kernel exactly:
     //   headdim   Arch == 80 (M,N)   Arch >= 89 (M,N)
-    //       64      128,  64           128,  64
+    //       64       64, 128            64, 128   (softcap: 128, 64)
     //       96       64, 128            64, 128
     //      128       64,  96            48, 128
     //      192       64,  64           128, 128
@@ -2115,11 +2115,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
     // at runtime to the Arch == 80 tile, so mirror that fallback here too.
     bool const is_arch80 = arch == 80;
     bool const use_cvt_tiles = !is_arch80 && head_size == head_size_rounded && head_size_v == head_size_rounded;
-    int const kBlockM = head_size_rounded <= 64 ? 128
+    bool const hdim64_softcap = softcap > 0.0;
+    int const kBlockM = head_size_rounded <= 64 ? (hdim64_softcap ? 128 : 64)
         : (head_size_rounded <= 96 ? 64
            : (head_size_rounded <= 128 ? (use_cvt_tiles ? 48 : 64)
               : (head_size_rounded <= 192 ? (is_arch80 ? 64 : 128) : 64)));
-    int const kBlockN = head_size_rounded <= 64 ? 64
+    int const kBlockN = head_size_rounded <= 64 ? (hdim64_softcap ? 64 : 128)
         : (head_size_rounded <= 96 ? 128
            : (head_size_rounded <= 128 ? (use_cvt_tiles ? 128 : 96)
               : (head_size_rounded <= 192 ? (is_arch80 ? 64 : 128)

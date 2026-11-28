@@ -118,11 +118,16 @@ constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_ppu(
             } else if (headdim_v == 256) {
                 return {64, vreg_strain ? 16 : 32, 4, 1, vreg_strain ? false : true};
             } else {
+                // 2-warp tiles keep Q in smem and spend the registers on FA4SkipRescaleO instead.
+                // Causal keeps the upstream forward tiles: with 64x96 it is 2-6% slower at
+                // seqlen 512-4096 (SM80 at 512, SM89 at 1024-4096).
                 if (arch == 80 && !paged_kv && !varlen) {
-                    return {64, vreg_strain ? 64 : 96, 2, 1, vreg_strain ? false : true};
+                    return {64, vreg_strain ? 64 : 96, 2, 1, is_causal && !vreg_strain};
                 }
                 if (!kBlockM128) {
                     return {64, 128, 4, 1, vreg_strain ? false : true};
+                } else if (!vreg_strain && !is_causal) {
+                    return {64, 96, 2, 1, false};
                 } else {
                     return {128, vreg_strain ? 64 : 96, 4, 1, vreg_strain ? false : true};
                 }

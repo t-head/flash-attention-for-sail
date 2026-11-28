@@ -144,9 +144,10 @@ struct CollectiveMainloopFwdSm80 {
 #endif
 
 #ifdef USE_PPU
-    // Keep SM80 QSA on the standard online-softmax rescale path.
+    // Keep SM80 QSA on the standard online-softmax rescale path. SM80 hdim64 local keeps it too:
+    // with FA4SkipRescaleO it is 1-4% slower on windowed training shapes.
     static constexpr bool FA4SkipRescaleO = !Is_FP8 && !(Is_QSA && ArchTag::kMinComputeCapability == 80) && (
-        (kBlockM >  16 && (ArchTag::kMinComputeCapability >= 89 || (kHeadDim != 64 && kHeadDim != 192))) ||   // prefill
+        (kBlockM >  16 && (ArchTag::kMinComputeCapability >= 89 || (kHeadDim != 64 && kHeadDim != 192) || (kHeadDim == 64 && kHeadDimV == 64 && kNWarps == 2 && !Q_in_regs && !Is_local))) ||   // prefill
         (kBlockM == 16 && (ArchTag::kMinComputeCapability >= 89 && kHeadDim == 256))  // decode
     );
 #endif
